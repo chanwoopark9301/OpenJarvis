@@ -84,6 +84,9 @@ def test_completed_exchange_event_extracts_and_stores(tmp_path):
             "I like jazz",
             "Noted.",
             source="test",
+            exchange_id="personal-exchange-1",
+            agent_id="agent-1",
+            session_id="session-1",
         )
         assert _wait_until(lambda: svc.fact_count() == 1)
         assert extractor.calls == [("I like jazz", "Noted.")]

@@ -242,6 +242,9 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 app_config=config,
                 bus=getattr(request.app.state, "bus", None),
                 memory_service=getattr(request.app.state, "memory_service", None),
+                personal_memory_service=getattr(
+                    request.app.state, "personal_memory_service", None
+                ),
             )
         if agent is not None and getattr(agent, "_tools", None):
             return await _handle_agent_stream(
@@ -252,6 +255,9 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 trace_store=getattr(request.app.state, "trace_store", None),
                 bus=getattr(request.app.state, "bus", None),
                 memory_service=getattr(request.app.state, "memory_service", None),
+                personal_memory_service=getattr(
+                    request.app.state, "personal_memory_service", None
+                ),
             )
         return await _handle_stream(
             engine,
@@ -262,6 +268,9 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             app_config=config,
             bus=getattr(request.app.state, "bus", None),
             memory_service=getattr(request.app.state, "memory_service", None),
+            personal_memory_service=getattr(
+                request.app.state, "personal_memory_service", None
+            ),
         )
 
     # Non-streaming: use agent if available, otherwise direct engine call.
@@ -309,6 +318,7 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     # Hand the completed exchange to the background memory service.
     _remember_exchange(
         getattr(request.app.state, "memory_service", None),
+        getattr(request.app.state, "personal_memory_service", None),
         query_text_for_complexity,
         response,
         bus=getattr(request.app.state, "bus", None),
@@ -328,6 +338,7 @@ def _response_content(response) -> str:
 
 def _record_completed_exchange(
     memory_service,
+    personal_memory_service,
     user_text: str,
     assistant_text: str,
     *,
@@ -338,26 +349,26 @@ def _record_completed_exchange(
     if not user_text:
         return
     try:
-        if bus is not None:
-            from openjarvis.memory import publish_completed_exchange
+        from openjarvis.memory import record_and_publish_completed_exchange
 
-            publish_completed_exchange(
-                bus,
-                user_text,
-                assistant_text,
-                source=source,
-            )
-        elif memory_service is not None:
+        record_and_publish_completed_exchange(
+            bus,
+            personal_memory_service,
+            user_text,
+            assistant_text,
+            source=source,
+        )
+        if bus is None and memory_service is not None:
             memory_service.submit(user_text, assistant_text)
     except Exception:  # noqa: BLE001 — memory is best-effort, never fail a reply
         logging.getLogger("openjarvis.server").debug(
-            "Memory submit failed",
-            exc_info=True,
+            "Memory completion handoff failed",
         )
 
 
 def _remember_exchange(
     memory_service,
+    personal_memory_service,
     user_text: str,
     response,
     *,
@@ -367,6 +378,7 @@ def _remember_exchange(
     """Record a completed non-streaming exchange."""
     _record_completed_exchange(
         memory_service,
+        personal_memory_service,
         user_text,
         _response_content(response),
         bus=bus,
@@ -593,6 +605,7 @@ async def _handle_agent_stream(
     trace_store=None,
     bus=None,
     memory_service=None,
+    personal_memory_service=None,
 ):
     """Run the configured agent and return its result as an SSE response.
 
@@ -678,6 +691,7 @@ async def _handle_agent_stream(
 
         _record_completed_exchange(
             memory_service,
+            personal_memory_service,
             query_text,
             content,
             bus=bus,
@@ -701,6 +715,7 @@ async def _handle_stream_tools(
     app_config=None,
     bus=None,
     memory_service=None,
+    personal_memory_service=None,
 ):
     """Stream a raw OpenAI-compat function-calling response via SSE.
 
@@ -808,6 +823,7 @@ async def _handle_stream_tools(
         if full_content:
             _record_completed_exchange(
                 memory_service,
+                personal_memory_service,
                 query_text,
                 full_content,
                 bus=bus,
@@ -832,6 +848,7 @@ async def _handle_stream(
     app_config=None,
     bus=None,
     memory_service=None,
+    personal_memory_service=None,
 ):
     """Stream response using SSE format.
 
@@ -973,6 +990,7 @@ async def _handle_stream(
         if full_content:
             _record_completed_exchange(
                 memory_service,
+                personal_memory_service,
                 query_text,
                 full_content,
                 bus=bus,

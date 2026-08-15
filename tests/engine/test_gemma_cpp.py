@@ -375,7 +375,8 @@ class TestGemmaCppLive:
     """Integration tests — require pygemma and downloaded Gemma weights.
 
     Set GEMMA_CPP_MODEL_PATH, GEMMA_CPP_TOKENIZER_PATH, and
-    GEMMA_CPP_MODEL_TYPE env vars before running.
+    GEMMA_CPP_MODEL_TYPE env vars before running with
+    OPENJARVIS_RUN_LIVE_TESTS=1.
     """
 
     def _make_engine(self):

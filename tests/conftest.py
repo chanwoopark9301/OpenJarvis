@@ -29,6 +29,33 @@ from openjarvis.core.registry import (
     TTSRegistry,
 )
 
+_EXTERNAL_TEST_MARKERS = {
+    "cloud": "OPENJARVIS_RUN_CLOUD_TESTS",
+    "hub": "OPENJARVIS_RUN_HUB_TESTS",
+    "live": "OPENJARVIS_RUN_LIVE_TESTS",
+}
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    """Keep the default suite local and deterministic.
+
+    Tests marked ``cloud``, ``hub``, or ``live`` require credentials,
+    a network download, or an installed model. They are only run when the
+    developer explicitly opts in with the marker's environment variable.
+    """
+    for item in items:
+        for marker, opt_in_var in _EXTERNAL_TEST_MARKERS.items():
+            if marker in item.keywords and os.environ.get(opt_in_var) != "1":
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason=f"requires explicit opt-in with {opt_in_var}=1",
+                    )
+                )
+                break
+
 
 @pytest.fixture(autouse=True)
 def _no_update_check(monkeypatch: pytest.MonkeyPatch) -> None:

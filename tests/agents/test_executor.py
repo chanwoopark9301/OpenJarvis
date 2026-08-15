@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,6 +12,38 @@ import pytest
 from openjarvis.agents._stubs import AgentResult
 from openjarvis.agents.errors import FatalError, RetryableError
 from openjarvis.core.events import EventBus, EventType
+
+
+class _PersonalMemorySpy:
+    def __init__(self) -> None:
+        self.archived: list[tuple[str, str, str]] = []
+
+    def archive_exchange(self, *, user_text, assistant_text, source, **kwargs):
+        self.archived.append((user_text, assistant_text, source))
+        return SimpleNamespace(id="managed-agent-exchange")
+
+    def enqueue_exchange(self, exchange_id: str) -> bool:
+        return True
+
+
+class _ReplyingAgent:
+    accepts_tools = False
+    supports_managed_tool_fallback = False
+
+    def __init__(self, engine, model, *, bus=None) -> None:
+        self._reply = "Start with 25 minutes."
+
+    def run(self, input_text, context=None):
+        return AgentResult(content=self._reply)
+
+
+class _EmptyToolkit:
+    instances = []
+    by_name = {}
+    mcp_clients = []
+
+    def close(self) -> None:
+        pass
 
 
 @pytest.fixture
@@ -163,3 +196,68 @@ def test_finalize_tick_reads_agent_result_metadata(tmp_path):
     assert updated["total_cost"] == 0.05
     assert updated["stall_retries"] == 0
     mgr.close()
+
+
+def _managed_executor(manager, event_bus, personal_memory_service):
+    from openjarvis.agents.executor import AgentExecutor
+
+    system = SimpleNamespace(
+        engine=object(),
+        memory_backend=None,
+        channel_backend=None,
+        knowledge_db_path=None,
+        config=SimpleNamespace(agent=SimpleNamespace(context_from_memory=False)),
+    )
+    return AgentExecutor(
+        manager,
+        event_bus,
+        system=system,
+        personal_memory_service=personal_memory_service,
+    )
+
+
+def test_successful_agent_turn_archives_its_pending_user_message(manager, event_bus):
+    """A successful managed reply must keep the exact user request as evidence."""
+    from openjarvis.agents import AgentRegistry
+
+    AgentRegistry.register_value("personal_memory_test_agent", _ReplyingAgent)
+    personal = _PersonalMemorySpy()
+    executor = _managed_executor(manager, event_bus, personal)
+    agent = manager.create_agent(
+        name="companion",
+        agent_type="personal_memory_test_agent",
+        config={"model": "test-model"},
+    )
+    manager.send_message(agent["id"], "Help me make a study plan.", mode="immediate")
+
+    with patch(
+        "openjarvis.agents.executor.resolve_agent_tools",
+        return_value=_EmptyToolkit(),
+    ):
+        executor.execute_tick(agent["id"])
+
+    assert personal.archived == [
+        ("Help me make a study plan.", "Start with 25 minutes.", "managed_agent")
+    ]
+
+
+def test_scheduled_tick_without_user_message_is_not_archived(manager, event_bus):
+    """A scheduled maintenance tick has no user conversation to archive."""
+    from openjarvis.agents import AgentRegistry
+
+    AgentRegistry.register_value("personal_memory_test_agent", _ReplyingAgent)
+    personal = _PersonalMemorySpy()
+    executor = _managed_executor(manager, event_bus, personal)
+    agent = manager.create_agent(
+        name="scheduled",
+        agent_type="personal_memory_test_agent",
+        config={"model": "test-model"},
+    )
+
+    with patch(
+        "openjarvis.agents.executor.resolve_agent_tools",
+        return_value=_EmptyToolkit(),
+    ):
+        executor.execute_tick(agent["id"])
+
+    assert personal.archived == []

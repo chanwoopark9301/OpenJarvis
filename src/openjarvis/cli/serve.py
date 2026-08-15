@@ -509,6 +509,24 @@ def serve(
         logger.debug("Memory service init failed: %s", exc)
         memory_service = None
 
+    personal_memory_service = None
+    try:
+        from openjarvis.memory import build_personal_memory_service
+
+        personal_memory_service = build_personal_memory_service(
+            config,
+            engine,
+            engine_key=engine_name,
+            default_model=model_name,
+            event_bus=bus,
+        )
+        if personal_memory_service is not None:
+            personal_memory_service.start()
+            console.print("  Personal memory: [cyan]active[/cyan]")
+    except Exception as exc:
+        logger.debug("Personal memory service init failed: %s", exc)
+        personal_memory_service = None
+
     # Set up agent manager
     agent_manager = None
     if config.agent_manager.enabled:
@@ -543,6 +561,7 @@ def serve(
                 manager=agent_manager,
                 event_bus=bus,
                 trace_store=_trace_store,
+                personal_memory_service=personal_memory_service,
             )
             # Reuse the components already built inline above instead of a
             # second full SystemBuilder.build() — the original double-build
@@ -687,6 +706,7 @@ def serve(
         memory_backend=memory_backend,
         own_memory_backend=memory_backend is not None,
         memory_service=memory_service,
+        personal_memory_service=personal_memory_service,
         speech_backend=speech_backend,
         agent_manager=agent_manager,
         agent_scheduler=agent_scheduler,

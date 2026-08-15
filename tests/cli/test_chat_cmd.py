@@ -264,6 +264,60 @@ class TestChatAgents:
         assert spy.stopped is True
         assert spy.submissions == [("hello", "simple ok")]
 
+    def test_chat_archives_completed_turn_with_personal_memory_service(self) -> None:
+        """The REPL must archive a finished turn before it announces completion."""
+
+        class _SpyPersonalMemoryService:
+            def __init__(self) -> None:
+                self.started = False
+                self.stopped = False
+                self.archived: list[tuple[str, str, str]] = []
+
+            def start(self) -> None:
+                self.started = True
+
+            def stop(self, timeout: float = 2.0) -> None:
+                self.stopped = True
+
+            def archive_exchange(self, *, user_text, assistant_text, source, **kwargs):
+                self.archived.append((user_text, assistant_text, source))
+                return type("Exchange", (), {"id": "personal-exchange-1"})()
+
+        spy: _SpyPersonalMemoryService | None = None
+
+        def _build_personal_memory_service(*args, **kwargs):
+            nonlocal spy
+            spy = _SpyPersonalMemoryService()
+            return spy
+
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        engine.generate.return_value = {"content": "saved reply"}
+        config = JarvisConfig()
+        config.intelligence.default_model = "test-model"
+
+        with (
+            patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+            patch("openjarvis.engine.get_engine", return_value=("ollama", engine)),
+            patch("openjarvis.intelligence.register_builtin_models"),
+            patch("openjarvis.memory.build_memory_service", return_value=None),
+            patch(
+                "openjarvis.memory.build_personal_memory_service",
+                side_effect=_build_personal_memory_service,
+            ),
+        ):
+            result = CliRunner().invoke(
+                chat,
+                ["--model", "test-model"],
+                input="remember this\n/quit\n",
+            )
+
+        assert result.exit_code == 0
+        assert spy is not None
+        assert spy.started is True
+        assert spy.stopped is True
+        assert spy.archived == [("remember this", "saved reply", "cli.chat")]
+
     def test_tool_agent_uses_legacy_agent_tools_and_prompts_confirmation(self) -> None:
         engine = MagicMock()
         engine.engine_id = "mock"

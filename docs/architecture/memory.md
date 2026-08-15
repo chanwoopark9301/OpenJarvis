@@ -2,6 +2,28 @@
 
 The Memory primitive provides **persistent, searchable storage** for documents and knowledge. It enables context injection -- retrieving relevant information from indexed documents and prepending it to prompts so the LLM can answer questions grounded in specific content.
 
+## Personal Memory Harness (local only)
+
+Personal conversation archiving is a separate system from document retrieval
+and automatic JSONL fact memory. When `[personal_memory]` is enabled, OpenJarvis
+first stores each completed chat exchange in `~/.openjarvis/personal_memory.db`.
+Only after the SQLite write succeeds does it publish the existing completion
+event and schedule candidate extraction.
+
+The database contains `conversation_exchanges` (the original user/assistant
+text and durable candidate-job state) and `memory_candidates` (provisional
+`fact` or `episode` suggestions with the exact supporting exchange, confidence,
+importance, engine ID, and extractor version). Candidate review status is
+independent of the worker-job state, so a failed model call cannot delete the
+raw conversation.
+
+Candidate extraction accepts only known engines configured with a loopback host
+(`localhost`, `127.0.0.1`, or `::1`), or an existing local `gemma_cpp` model
+path. Cloud, multi-engine, unknown, and network-host configurations are
+rejected without a fallback call. Candidates are **not** added to prompt
+context, Fact Memory, or document RAG in this release. Reflection, Pattern
+Memory, Core User Model, and promotion/deletion commands remain future work.
+
 ---
 
 ## MemoryBackend ABC

@@ -9,6 +9,17 @@ and configured via the ``[memory]`` section of ``config.toml``.
 from __future__ import annotations
 
 from openjarvis.memory.extractor import FactExtractor
+from openjarvis.memory.archive import PersonalMemoryArchive
+from openjarvis.memory.personal_models import (
+    CandidateDraft,
+    ConversationExchange,
+    MemoryCandidate,
+)
+from openjarvis.memory.personal_service import (
+    PersonalMemoryService,
+    build_personal_memory_service,
+    record_and_publish_completed_exchange,
+)
 from openjarvis.memory.service import (
     MemoryService,
     build_memory_service,
@@ -26,10 +37,17 @@ __all__ = [
     "Fact",
     "FactStore",
     "FactExtractor",
+    "CandidateDraft",
+    "ConversationExchange",
     "LocalFactStore",
+    "MemoryCandidate",
     "MemoryService",
+    "PersonalMemoryArchive",
+    "PersonalMemoryService",
     "build_memory_service",
+    "build_personal_memory_service",
     "create_fact_store",
     "load_configured_facts",
     "publish_completed_exchange",
+    "record_and_publish_completed_exchange",
 ]

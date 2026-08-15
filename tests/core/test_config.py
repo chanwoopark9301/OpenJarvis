@@ -44,6 +44,14 @@ class TestDefaults:
         assert ec.vllm_host == "http://localhost:8000"
         assert ec.lemonade_host == "http://localhost:13305"
 
+    def test_personal_memory_defaults_to_local_disabled(self) -> None:
+        """A fresh installation keeps personal conversation storage opt-in."""
+        cfg = JarvisConfig()
+
+        assert cfg.personal_memory.enabled is False
+        assert cfg.personal_memory.archive_path.endswith("personal_memory.db")
+        assert cfg.personal_memory.max_queue == 256
+
 
 class TestRecommendEngine:
     def test_no_gpu(self) -> None:
@@ -95,6 +103,26 @@ class TestTomlLoading:
         assert cfg.engine.default == "vllm"
         assert cfg.memory.default_backend == "faiss"
 
+    def test_personal_memory_toml_is_loaded_independently(self, tmp_path: Path) -> None:
+        """A personal-memory setting must not alter the legacy fact-memory settings."""
+        toml_file = tmp_path / "config.toml"
+        toml_file.write_text(
+            "[personal_memory]\n"
+            "enabled = true\n"
+            "archive_path = '/tmp/personal.db'\n"
+            "extraction_model = 'qwen3:8b'\n"
+            "max_queue = 4\n",
+            encoding="utf-8",
+        )
+
+        cfg = load_config(toml_file)
+
+        assert cfg.personal_memory.enabled is True
+        assert cfg.personal_memory.archive_path == "/tmp/personal.db"
+        assert cfg.personal_memory.extraction_model == "qwen3:8b"
+        assert cfg.personal_memory.max_queue == 4
+        assert cfg.memory.enabled is False
+
     def test_loads_nested_lemonade_host_override(self, tmp_path: Path) -> None:
         toml_file = tmp_path / "config.toml"
         toml_file.write_text(
@@ -139,6 +167,14 @@ class TestGenerateToml:
         assert "[engine]" in toml
         assert 'default = "vllm"' in toml
         assert "H100" in toml
+
+    def test_personal_memory_is_disabled_in_generated_config(self) -> None:
+        """A generated config must require an explicit opt-in for conversations."""
+        import tomllib
+
+        generated = tomllib.loads(generate_default_toml(HardwareInfo()))
+
+        assert generated["personal_memory"]["enabled"] is False
 
 
 class TestSecurityConfig:

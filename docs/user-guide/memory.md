@@ -11,6 +11,38 @@ Documents  -->  Chunking Pipeline  -->  Memory Backend  -->  Context Injection  
 
 ---
 
+## Personal conversation archive (local only)
+
+This optional feature keeps a local copy of completed user conversations before
+asking a local model for provisional memory candidates. It is separate from
+document search and the existing automatic Fact Memory. Candidates are not
+silently used in future prompts.
+
+Enable it in `~/.openjarvis/config.toml`:
+
+```toml
+[personal_memory]
+enabled = true
+extraction_model = "qwen3:8b"
+max_queue = 256
+```
+
+The archive lives at `~/.openjarvis/personal_memory.db` by default. It has one
+table for original exchanges and one table for candidate suggestions. Each
+candidate retains a link to the exact conversation that produced it.
+
+For privacy, the extraction engine must be a supported local engine with a
+loopback address such as `http://127.0.0.1:11434`. A cloud provider, a remote
+network address, or an unknown engine disables this feature instead of falling
+back to the internet. If candidate extraction fails or the queue is busy, the
+original local conversation remains stored for a later retry.
+
+This first version does **not** automatically accept candidates as facts,
+discover behavioral patterns, build a user model, or add candidates to prompts.
+Those features require a later review and promotion step.
+
+---
+
 ## MemoryBackend ABC
 
 All memory backends implement the `MemoryBackend` abstract base class.

@@ -14,7 +14,7 @@ from openjarvis.cli._tool_names import resolve_tool_names
 from openjarvis.core.config import load_config
 from openjarvis.core.events import EventBus
 from openjarvis.core.types import Message, Role
-from openjarvis.memory import publish_completed_exchange
+from openjarvis.memory import record_and_publish_completed_exchange
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +197,24 @@ def chat(
         console.print(f"[yellow]Memory service unavailable: {exc}[/yellow]")
         memory_service = None
 
+    personal_memory_service = None
+    try:
+        from openjarvis.memory import build_personal_memory_service
+
+        personal_memory_service = build_personal_memory_service(
+            config,
+            engine,
+            engine_key=engine_name,
+            default_model=model,
+            event_bus=bus,
+        )
+        if personal_memory_service is not None:
+            personal_memory_service.start()
+            console.print("[dim]  Personal memory: active[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]Personal memory unavailable: {exc}[/yellow]")
+        personal_memory_service = None
+
     # The document backend and automatic fact store are separate persistence
     # mechanisms. Context injection combines both at read time so facts from
     # previous sessions are immediately available without a manual index step.
@@ -334,8 +352,9 @@ def chat(
             console.print(Markdown(content))
             console.print()
 
-            publish_completed_exchange(
+            record_and_publish_completed_exchange(
                 bus,
+                personal_memory_service,
                 user_input,
                 content,
                 source="cli.chat",
@@ -347,6 +366,8 @@ def chat(
 
     if memory_service is not None:
         memory_service.stop()
+    if personal_memory_service is not None:
+        personal_memory_service.stop()
 
 
 __all__ = ["chat"]

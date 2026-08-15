@@ -219,6 +219,9 @@ def publish_completed_exchange(
     assistant_text: str = "",
     *,
     source: str = "",
+    exchange_id: str = "",
+    agent_id: str = "",
+    session_id: str = "",
 ) -> bool:
     """Publish a completed chat exchange for lifecycle subscribers."""
     if bus is None or not user_text or not user_text.strip():
@@ -229,6 +232,9 @@ def publish_completed_exchange(
             "user_text": user_text,
             "assistant_text": assistant_text or "",
             "source": source,
+            "exchange_id": exchange_id,
+            "agent_id": agent_id,
+            "session_id": session_id,
         },
     )
     return True

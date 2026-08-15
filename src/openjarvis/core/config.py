@@ -959,6 +959,18 @@ MemoryConfig = StorageConfig
 
 
 @dataclass(slots=True)
+class PersonalMemoryConfig:
+    """Local-only archive settings for provisional personal-memory candidates."""
+
+    enabled: bool = False
+    archive_path: str = field(
+        default_factory=lambda: str(get_config_dir() / "personal_memory.db")
+    )
+    extraction_model: str = ""
+    max_queue: int = 256
+
+
+@dataclass(slots=True)
 class MCPConfig:
     """MCP (Model Context Protocol) settings."""
 
@@ -1598,6 +1610,7 @@ class JarvisConfig:
     deep_research: DeepResearchConfig = field(default_factory=DeepResearchConfig)
     learning: LearningConfig = field(default_factory=LearningConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
+    personal_memory: PersonalMemoryConfig = field(default_factory=PersonalMemoryConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
@@ -1894,6 +1907,7 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
             "security",
             "channel",
             "tools",
+            "personal_memory",
             "sandbox",
             "scheduler",
             "workflow",
@@ -2077,6 +2091,13 @@ enabled = false               # set true to enable the memory service
 backend = "local"             # fact-store backend (local = on-disk JSONL)
 extraction_model = ""         # model for fact extraction ("" = active model)
 max_facts = 1000              # cap on stored facts
+
+# Local-only personal conversation archive. This is separate from [memory]
+# facts and does not add provisional candidates to prompts.
+[personal_memory]
+enabled = false
+# extraction_model = ""       # empty = active local model
+# max_queue = 256
 
 [tools.mcp]
 enabled = true

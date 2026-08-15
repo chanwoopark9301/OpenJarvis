@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -99,7 +100,96 @@ class _SpyMemoryService:
         pass
 
 
+class _SpyPersonalMemoryService:
+    """Captures archive-first handoffs without running a background worker."""
+
+    exchange_id = "personal-exchange-1"
+
+    def __init__(self) -> None:
+        self.archived: list[tuple[str, str, str]] = []
+        self.enqueued: list[str] = []
+
+    def archive_exchange(self, *, user_text, assistant_text, source, **kwargs):
+        self.archived.append((user_text, assistant_text, source))
+        return SimpleNamespace(id=self.exchange_id)
+
+    def enqueue_exchange(self, exchange_id: str) -> bool:
+        self.enqueued.append(exchange_id)
+        return True
+
+    def stop(self, timeout: float = 2.0) -> None:
+        pass
+
+
 class TestMemoryServiceWiring:
+    def test_non_streaming_completion_archives_before_publishing_event(self):
+        bus = EventBus(record_history=True)
+        engine = _make_engine(content="saved")
+        personal = _SpyPersonalMemoryService()
+        archive_state_seen_by_event_subscriber = []
+        bus.subscribe(
+            EventType.CHAT_EXCHANGE_COMPLETED,
+            lambda event: archive_state_seen_by_event_subscriber.append(
+                list(personal.archived)
+            ),
+        )
+        app = create_app(
+            engine,
+            "test-model",
+            bus=bus,
+            personal_memory_service=personal,
+            config=_test_config(),
+        )
+
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "remember me"}],
+            },
+        )
+
+        assert response.status_code == 200
+        assert personal.archived == [("remember me", "saved", "server.chat")]
+        assert archive_state_seen_by_event_subscriber == [personal.archived]
+        event = next(
+            event
+            for event in bus.history
+            if event.event_type is EventType.CHAT_EXCHANGE_COMPLETED
+        )
+        assert event.data["exchange_id"] == personal.exchange_id
+
+    def test_streaming_completion_archives_before_publishing_event(self):
+        bus = EventBus(record_history=True)
+        personal = _SpyPersonalMemoryService()
+        app = create_app(
+            _make_engine(),
+            "test-model",
+            bus=bus,
+            personal_memory_service=personal,
+            config=_test_config(),
+        )
+
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "stream remember"}],
+                "stream": True,
+            },
+        )
+
+        assert response.status_code == 200
+        assert personal.archived == [
+            ("stream remember", "Hello world", "server.chat.stream")
+        ]
+        event = next(
+            event
+            for event in bus.history
+            if event.event_type is EventType.CHAT_EXCHANGE_COMPLETED
+        )
+        assert event.data["exchange_id"] == personal.exchange_id
+
     def test_non_streaming_completion_feeds_memory(self):
         engine = _make_engine(content="remembered reply")
         spy = _SpyMemoryService()
@@ -165,6 +255,34 @@ class TestMemoryServiceWiring:
         assert len(events) == 1
         assert events[0].data["user_text"] == "publish this"
         assert events[0].data["assistant_text"] == "event reply"
+
+    def test_disabled_personal_memory_keeps_the_legacy_event_payload(self):
+        """Without the optional service, ordinary chat completion behavior is unchanged."""
+        bus = EventBus(record_history=True)
+        app = create_app(
+            _make_engine(content="legacy reply"),
+            "test-model",
+            bus=bus,
+            config=_test_config(),
+        )
+
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "legacy request"}],
+            },
+        )
+
+        assert response.status_code == 200
+        event = next(
+            event
+            for event in bus.history
+            if event.event_type is EventType.CHAT_EXCHANGE_COMPLETED
+        )
+        assert event.data["user_text"] == "legacy request"
+        assert event.data["assistant_text"] == "legacy reply"
+        assert event.data["exchange_id"] == ""
 
     def test_streaming_completion_feeds_memory_without_bus(self):
         engine = _make_engine()

@@ -75,11 +75,13 @@ class AgentExecutor:
         event_bus: EventBus,
         system: Any = None,
         trace_store: Any = None,
+        personal_memory_service: Any = None,
     ) -> None:
         self._system = system
         self._manager = manager
         self._bus = event_bus
         self._trace_store = trace_store
+        self._personal_memory_service = personal_memory_service
         self._toolkit_local = threading.local()
 
     def set_system(self, system: Any) -> None:
@@ -665,6 +667,10 @@ class AgentExecutor:
             result.turns,
             result.metadata.get("total_tokens", "?"),
         )
+        if pending:
+            result.metadata["_personal_memory_user_text"] = "\n".join(
+                str(message["content"]) for message in pending
+            )
         return result
 
     def _build_error_detail(self, error: AgentTickError) -> dict[str, Any]:
@@ -749,6 +755,27 @@ class AgentExecutor:
                     result.content,
                     tool_calls=_tool_calls_for_storage(result),
                 )
+
+                user_text = result.metadata.pop("_personal_memory_user_text", "")
+                if user_text and (result.content or "").strip():
+                    try:
+                        from openjarvis.memory import (
+                            record_and_publish_completed_exchange,
+                        )
+
+                        record_and_publish_completed_exchange(
+                            self._bus,
+                            self._personal_memory_service,
+                            user_text,
+                            result.content,
+                            source="managed_agent",
+                            agent_id=agent_id,
+                        )
+                    except Exception:  # noqa: BLE001 - never alter tick outcome
+                        logger.warning(
+                            "Managed-agent personal memory handoff failed",
+                            extra={"agent_id": agent_id},
+                        )
 
             # Budget enforcement (post-tick check)
             agent_data = self._manager.get_agent(agent_id)

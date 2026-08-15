@@ -156,6 +156,7 @@ def create_app(
     memory_backend=None,
     own_memory_backend: bool = False,
     memory_service=None,
+    personal_memory_service=None,
     speech_backend=None,
     agent_manager=None,
     agent_scheduler=None,
@@ -231,6 +232,7 @@ def create_app(
     app.state.memory_backend = memory_backend
     app.state._owns_memory_backend = bool(own_memory_backend)
     app.state.memory_service = memory_service
+    app.state.personal_memory_service = personal_memory_service
     app.state.speech_backend = speech_backend
     app.state.agent_manager = agent_manager
     app.state.agent_scheduler = agent_scheduler
@@ -419,6 +421,17 @@ def create_app(
         @app.on_event("shutdown")
         async def _shutdown_memory_service() -> None:
             svc = getattr(app.state, "memory_service", None)
+            if svc is not None:
+                try:
+                    svc.stop()
+                except Exception:
+                    pass
+
+    if personal_memory_service is not None:
+
+        @app.on_event("shutdown")
+        async def _shutdown_personal_memory_service() -> None:
+            svc = getattr(app.state, "personal_memory_service", None)
             if svc is not None:
                 try:
                     svc.stop()
