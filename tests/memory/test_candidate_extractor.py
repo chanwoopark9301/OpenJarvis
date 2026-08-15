@@ -124,3 +124,21 @@ def test_local_engine_guard_accepts_a_loopback_engine():
     )
 
     assert is_local_personal_memory_engine(config, "ollama") is True
+
+
+def test_local_engine_guard_accepts_ollamas_default_loopback_host(monkeypatch):
+    """An unconfigured Ollama engine uses its built-in local address."""
+    _, is_local_personal_memory_engine, _ = _extractor_api()
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    config = SimpleNamespace(engine=SimpleNamespace(ollama=SimpleNamespace(host="")))
+
+    assert is_local_personal_memory_engine(config, "ollama") is True
+
+
+def test_local_engine_guard_rejects_a_remote_ollama_environment_host(monkeypatch):
+    """Ollama's environment override must remain subject to the local-only rule."""
+    _, is_local_personal_memory_engine, _ = _extractor_api()
+    monkeypatch.setenv("OLLAMA_HOST", "http://192.168.1.10:11434")
+    config = SimpleNamespace(engine=SimpleNamespace(ollama=SimpleNamespace(host="")))
+
+    assert is_local_personal_memory_engine(config, "ollama") is False

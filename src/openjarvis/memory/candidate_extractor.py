@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -54,6 +55,10 @@ def is_local_personal_memory_engine(config: Any, engine_key: str) -> bool:
         return bool(model_path and Path(model_path).expanduser().exists())
 
     host = str(getattr(selected_config, "host", "") or "").strip()
+    if not host and key == "ollama":
+        # Match OllamaEngine: an omitted host means its loopback default unless
+        # an environment override explicitly points elsewhere.
+        host = os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
     if not host:
         return False
     try:
