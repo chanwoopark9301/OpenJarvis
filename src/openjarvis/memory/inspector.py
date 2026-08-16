@@ -8,10 +8,12 @@ from dataclasses import dataclass
 from openjarvis.memory.archive import PersonalMemoryArchive
 from openjarvis.memory.evaluator import MemoryEvaluator
 from openjarvis.memory.personal_models import (
+    AdaptationOperation,
     CandidateDraft,
     CandidateKind,
     EvidenceSource,
     PersonalClaim,
+    PersonalSchema,
 )
 
 DELETE_ALL_CONFIRMATION_TOKEN = "DELETE ALL PERSONAL MEMORY"
@@ -42,35 +44,72 @@ class PersonalMemoryInspector:
         self.archive = archive
 
     def list_subjects(self) -> tuple[MemorySubjectView, ...]:
-        """List atomic claims without unrelated archive records."""
-        return tuple(
+        """List claims and schemas without unrelated archive records."""
+        claims = tuple(
             self._claim_view(claim, include_evidence=False)
             for claim in self.archive.list_claims()
+        )
+        schemas = tuple(
+            self._schema_view(schema, include_evidence=False)
+            for schema in self.archive.list_schemas()
+        )
+        return tuple(
+            sorted((*claims, *schemas), key=lambda item: item.updated_at, reverse=True)
         )
 
     def explain(self, subject_id: str) -> MemorySubjectView | None:
         """Explain one claim using only evidence linked to that claim."""
         claim = self.archive.get_claim(subject_id)
-        return self._claim_view(claim, include_evidence=True) if claim else None
+        if claim is not None:
+            return self._claim_view(claim, include_evidence=True)
+        schema = self.archive.get_schema(subject_id)
+        return self._schema_view(schema, include_evidence=True) if schema else None
 
     def confirm(self, subject_id: str, user_text: str) -> PersonalClaim | None:
         """Confirm a claim by superseding it with user-confirmed evidence."""
         claim = self.archive.get_claim(subject_id)
-        if claim is None:
-            return None
-        return self.correct(subject_id, claim.content, user_text)
+        if claim is not None:
+            return self.correct(subject_id, claim.content, user_text)
+        schema = self.archive.get_schema(subject_id)
+        if schema is not None:
+            return self.correct(subject_id, schema.content, user_text)
+        return None
 
     def correct(
         self,
         subject_id: str,
         replacement_text: str,
         user_text: str,
-    ) -> PersonalClaim | None:
+    ) -> PersonalClaim | PersonalSchema | None:
         """Create a new confirmed correction; never rewrite prior evidence."""
         original = self.archive.get_claim(subject_id)
         replacement = replacement_text.strip()
-        if original is None or not replacement or not user_text.strip():
+        if not replacement or not user_text.strip():
             return None
+        if original is None:
+            schema = self.archive.get_schema(subject_id)
+            if schema is None:
+                return None
+            evidence = self.archive.record_user_confirmed_evidence(
+                user_text=user_text,
+                content=replacement,
+                subject=schema.subject_scope,
+            )
+            support_ids = tuple(
+                dict.fromkeys(
+                    (*self.archive.schema_evidence_ids(schema.id), evidence.id)
+                )
+            )
+            return self.archive.apply_schema_accommodation(
+                content=replacement,
+                operation=AdaptationOperation.ACCOMMODATE_REFINE,
+                support_evidence_ids=support_ids,
+                conditions=schema.conditions,
+                subject_scope=schema.subject_scope,
+                broad_interpretation=schema.broad_interpretation,
+                user_confirmed=True,
+                target_schema_id=schema.id,
+            )
         exchange_id = str(uuid.uuid4())
         self.archive.record_exchange(
             exchange_id=exchange_id,
@@ -111,11 +150,27 @@ class PersonalMemoryInspector:
 
     def suppress(self, subject_id: str, reason: str) -> bool:
         """Remove one claim from the next composed context without deletion."""
-        return self.archive.set_claim_state(subject_id, "suppressed", reason=reason)
+        if self.archive.get_claim(subject_id) is not None:
+            return self.archive.set_claim_state(
+                subject_id,
+                "suppressed",
+                reason=reason,
+            )
+        return self.archive.set_schema_state(
+            subject_id,
+            "suppressed",
+            reason=reason,
+        )
 
     def restore(self, subject_id: str) -> bool:
         """Restore a previously suppressed claim to response context."""
-        return self.archive.set_claim_state(
+        if self.archive.get_claim(subject_id) is not None:
+            return self.archive.set_claim_state(
+                subject_id,
+                "active",
+                reason="user restored",
+            )
+        return self.archive.set_schema_state(
             subject_id,
             "active",
             reason="user restored",
@@ -128,10 +183,12 @@ class PersonalMemoryInspector:
         include_raw_evidence: bool = False,
     ) -> dict[str, int]:
         """Delete one subject, retaining immutable raw evidence by default."""
-        return self.archive.delete_claim_subject(
-            subject_id,
-            include_raw_evidence=include_raw_evidence,
-        )
+        if self.archive.get_claim(subject_id) is not None:
+            return self.archive.delete_claim_subject(
+                subject_id,
+                include_raw_evidence=include_raw_evidence,
+            )
+        return self.archive.delete_schema_subject(subject_id)
 
     def deletion_preview(self) -> dict[str, int]:
         """Return affected row counts before a bulk delete is authorized."""
@@ -164,6 +221,36 @@ class PersonalMemoryInspector:
             created_at=claim.created_at,
             updated_at=claim.updated_at,
             supporting_evidence=evidence,
+        )
+
+    def _schema_view(
+        self,
+        schema: PersonalSchema,
+        *,
+        include_evidence: bool,
+    ) -> MemorySubjectView:
+        support = (
+            self.archive.schema_evidence_texts(schema.id, relation="support")
+            if include_evidence
+            else ()
+        )
+        counter = (
+            self.archive.schema_evidence_texts(schema.id, relation="counter")
+            if include_evidence
+            else ()
+        )
+        return MemorySubjectView(
+            id=schema.id,
+            subject_type="schema",
+            content=schema.content,
+            state=schema.state.value,
+            maturity=schema.maturity.value,
+            conditions=schema.conditions,
+            created_at=schema.created_at,
+            updated_at=schema.updated_at,
+            supporting_evidence=support,
+            opposing_evidence=counter,
+            previous_versions=self.archive.schema_previous_versions(schema.id),
         )
 
 

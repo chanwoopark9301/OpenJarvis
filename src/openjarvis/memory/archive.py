@@ -1307,6 +1307,157 @@ class PersonalMemoryArchive:
             user_confirmed=bool(row["user_confirmed"]),
         )
 
+    def list_schemas(self) -> list[PersonalSchema]:
+        """Return every versioned schema for user inspection."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM personal_schemas
+                WHERE current_version_id IS NOT NULL
+                ORDER BY updated_at DESC, id ASC
+                """
+            ).fetchall()
+        return [
+            schema
+            for row in rows
+            if (schema := self.get_schema(str(row["id"]))) is not None
+        ]
+
+    def schema_evidence_texts(
+        self,
+        schema_id: str,
+        *,
+        relation: str,
+    ) -> tuple[str, ...]:
+        """Return evidence attached to the current version of one schema."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT e.content FROM personal_schemas AS s
+                JOIN schema_evidence_links AS l
+                  ON l.schema_version_id = s.current_version_id
+                JOIN evidence_items AS e ON e.id = l.evidence_id
+                WHERE s.id = ? AND l.relation = ?
+                ORDER BY l.created_at ASC, e.id ASC
+                """,
+                (schema_id, relation),
+            ).fetchall()
+        return tuple(str(row["content"]) for row in rows)
+
+    def schema_evidence_ids(self, schema_id: str) -> tuple[str, ...]:
+        """Return current raw evidence links for version-preserving corrections."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT l.evidence_id FROM personal_schemas AS s
+                JOIN schema_evidence_links AS l
+                  ON l.schema_version_id = s.current_version_id
+                WHERE s.id = ? ORDER BY l.created_at ASC, l.evidence_id ASC
+                """,
+                (schema_id,),
+            ).fetchall()
+        return tuple(str(row["evidence_id"]) for row in rows)
+
+    def record_user_confirmed_evidence(
+        self,
+        *,
+        user_text: str,
+        content: str,
+        subject: str,
+    ) -> EvidenceItem:
+        """Record an explicit memory-control statement as new raw evidence."""
+        exchange_id = str(uuid.uuid4())
+        exchange = self.record_exchange(
+            exchange_id=exchange_id,
+            user_text=user_text,
+            assistant_text="",
+            source="user_memory_control",
+        )
+        evidence_id = str(uuid.uuid4())
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO evidence_items (
+                  id, exchange_id, source, content, temporal_scope,
+                  subject, session_id, created_at
+                ) VALUES (?, ?, 'user_confirmed', ?, 'until_changed', ?, '', ?)
+                """,
+                (evidence_id, exchange.id, content, subject, time.time()),
+            )
+        return self.evidence_items_by_id((evidence_id,))[0]
+
+    def set_schema_state(
+        self,
+        schema_id: str,
+        state: ClaimState | str,
+        *,
+        reason: str,
+    ) -> bool:
+        """Apply an auditable user-requested schema visibility transition."""
+        resolved = ClaimState(state)
+        if resolved not in {ClaimState.ACTIVE, ClaimState.SUPPRESSED}:
+            raise ValueError("unsupported user schema state")
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE personal_schemas SET state = ?, updated_at = ?
+                WHERE id = ? AND state IN ('active', 'suppressed')
+                """,
+                (resolved.value, now, schema_id),
+            )
+            if updated.rowcount != 1:
+                return False
+            connection.execute(
+                """
+                INSERT INTO memory_feedback (
+                  id, subject_id, action, user_text, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    schema_id,
+                    resolved.value,
+                    reason,
+                    now,
+                ),
+            )
+        return True
+
+    def delete_schema_subject(self, schema_id: str) -> dict[str, int]:
+        """Delete one derived schema while retaining its raw user evidence."""
+        counts = {"personal_schemas": 0, "schema_versions": 0}
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            version_rows = connection.execute(
+                "SELECT id FROM schema_versions WHERE schema_id = ?",
+                (schema_id,),
+            ).fetchall()
+            version_ids = [str(row["id"]) for row in version_rows]
+            connection.execute(
+                "DELETE FROM schema_conflicts WHERE schema_id = ?",
+                (schema_id,),
+            )
+            connection.execute(
+                "UPDATE personal_schemas SET current_version_id = NULL WHERE id = ?",
+                (schema_id,),
+            )
+            for version_id in version_ids:
+                connection.execute(
+                    "DELETE FROM schema_evidence_links WHERE schema_version_id = ?",
+                    (version_id,),
+                )
+            counts["schema_versions"] = connection.execute(
+                "DELETE FROM schema_versions WHERE schema_id = ?",
+                (schema_id,),
+            ).rowcount
+            counts["personal_schemas"] = connection.execute(
+                "DELETE FROM personal_schemas WHERE id = ?",
+                (schema_id,),
+            ).rowcount
+        return counts
+
     def apply_schema_accommodation(
         self,
         *,
@@ -1494,6 +1645,20 @@ class PersonalMemoryArchive:
                 (schema_id,),
             ).fetchone()
         return int(row["count"]) if row is not None else 0
+
+    def schema_previous_versions(self, schema_id: str) -> tuple[str, ...]:
+        """Return prior schema text without exposing unrelated versions."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT v.content FROM schema_versions AS v
+                JOIN personal_schemas AS s ON s.id = v.schema_id
+                WHERE v.schema_id = ? AND v.id != s.current_version_id
+                ORDER BY v.version_number DESC
+                """,
+                (schema_id,),
+            ).fetchall()
+        return tuple(str(row["content"]) for row in rows)
 
     def reject_candidate(self, candidate_id: str, *, reason_code: str) -> bool:
         """Reject one pending candidate and audit the reason atomically."""

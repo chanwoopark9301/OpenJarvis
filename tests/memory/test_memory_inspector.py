@@ -8,7 +8,11 @@ from openjarvis.memory.archive import PersonalMemoryArchive
 from openjarvis.memory.context_composer import ContextComposer
 from openjarvis.memory.evaluator import MemoryEvaluator
 from openjarvis.memory.inspector import PersonalMemoryInspector
-from openjarvis.memory.personal_models import CandidateDraft, CandidateKind
+from openjarvis.memory.personal_models import (
+    AdaptationOperation,
+    CandidateDraft,
+    CandidateKind,
+)
 
 
 def _accepted_claim(archive: PersonalMemoryArchive, content: str):
@@ -106,3 +110,39 @@ def test_delete_all_requires_exact_confirmation_token(tmp_path):
 
     assert removed["personal_claims"] == 1
     assert archive.get_active_claims() == []
+
+
+def test_schema_can_be_explained_suppressed_corrected_and_deleted(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    claim = _accepted_claim(archive, "Running improved my mood.")
+    schema = archive.apply_schema_accommodation(
+        content="Running often improves my mood.",
+        operation=AdaptationOperation.ACCOMMODATE_CREATE,
+        support_evidence_ids=claim.evidence_ids,
+        conditions=("when rested",),
+        subject_scope="running_and_mood",
+        user_confirmed=True,
+    )
+    assert schema is not None
+    inspector = PersonalMemoryInspector(archive)
+
+    detail = inspector.explain(schema.id)
+    assert detail is not None
+    assert detail.subject_type == "schema"
+    assert detail.supporting_evidence == ("Running improved my mood.",)
+    assert inspector.suppress(schema.id, "too broad")
+    assert ContextComposer(archive).compose("running").schemas == ()
+    assert inspector.restore(schema.id)
+
+    replacement = "Running improves my mood when I am rested."
+    corrected = inspector.correct(schema.id, replacement, replacement)
+
+    assert corrected is not None
+    assert corrected.id == schema.id
+    assert archive.schema_version_count(schema.id) == 2
+    explained = inspector.explain(schema.id)
+    assert explained.previous_versions == ("Running often improves my mood.",)
+    removed = inspector.delete_subject(schema.id)
+    assert removed["personal_schemas"] == 1
+    assert archive.get_schema(schema.id) is None
+    assert archive.get_exchange("original") is not None
