@@ -438,6 +438,31 @@ def test_query_planner_creates_structured_requirements():
     )
 
 
+def test_query_planner_recovers_only_one_missing_closing_array_bracket():
+    engine = _FakeEngine(
+        '[{"id":"R1","kind":"general","query":"대전 테미오래",'
+        '"required_terms":["대전","테미오래"]}'
+    )
+    search_tool = _FakeSearchTool()
+
+    result = AutoSearchPreflight(
+        engine,
+        "test-model",
+        search_tool,
+        local_planning_allowed=True,
+    ).prepare("대전 테미오래를 인터넷에서 찾아줘")
+
+    assert result.success is True
+    assert result.requirements == (
+        SearchRequirement(
+            "R1",
+            "general",
+            "대전 테미오래",
+            ("대전", "테미오래"),
+        ),
+    )
+
+
 def test_only_unmet_requirement_is_retried_with_public_context():
     raw_request = (
         "여친을 픽업해서 대전 테미오래와 한식 맛집, 소품샵을 찾아줘"
@@ -527,6 +552,106 @@ def test_unmet_requirement_retries_only_once_when_retry_is_still_unrelated():
         local_planning_allowed=True,
     ).prepare("대전 소품샵을 찾아줘")
 
-    assert result.success is True
+    assert result.success is False
     assert search_tool.queries == ["대전 소품샵", "대전 소품 상점 모음"]
     assert len(engine.inputs) == 2
+    assert result.evidence == ()
+
+
+def test_invalid_retry_query_uses_public_korean_fallback():
+    engine = _SequencedEngine(
+        [
+            '[{"id":"R1","kind":"official","query":"대전 테미오래 운영시간",'
+            '"required_terms":["테미오래","운영시간"]}]',
+            '{"query":"대전 테미오래 운영时间 안내"}',
+        ]
+    )
+    search_tool = _QuerySearchTool(
+        {
+            "대전 테미오래 운영시간": (
+                "### 관계없는 결과\nSource: https://example.com/one\n"
+                "Summary: 다른 지역 안내"
+            ),
+            "테미오래 운영시간 공식 누리집": (
+                "### 테미오래 공식 누리집\n"
+                "Source: https://temiorae.com/\n"
+                "Summary: 테미오래 운영시간 안내"
+            ),
+        }
+    )
+
+    result = AutoSearchPreflight(
+        engine,
+        "test-model",
+        search_tool,
+        local_planning_allowed=True,
+    ).prepare("테미오래 운영시간을 인터넷에서 찾아줘")
+
+    assert result.success is True
+    assert search_tool.queries == [
+        "대전 테미오래 운영시간",
+        "테미오래 운영시간 공식 누리집",
+    ]
+    assert all("时间" not in query for query in result.queries)
+
+
+def test_unrelated_search_results_are_not_exposed_as_evidence():
+    engine = _SequencedEngine(
+        [
+            '[{"id":"R1","kind":"shops","query":"대전 소품샵",'
+            '"required_terms":["대전","소품샵"]}]',
+            '{"query":"대전 소품샵 여러 곳 주소"}',
+        ]
+    )
+    search_tool = _QuerySearchTool(
+        {
+            "대전 소품샵": (
+                "### 무관한 계정\nSource: https://instagram.com/unrelated\n"
+                "Summary: 개인 사진\n\n---\n\n"
+                "### 대전 소품샵 모음\nSource: https://example.com/shops\n"
+                "Summary: 대전에서 둘러볼 소품샵"
+            )
+        }
+    )
+
+    result = AutoSearchPreflight(
+        engine,
+        "test-model",
+        search_tool,
+        local_planning_allowed=True,
+    ).prepare("대전 소품샵을 찾아줘")
+
+    assert result.success is True
+    assert [item.url for item in result.evidence] == ["https://example.com/shops"]
+
+
+def test_cross_city_result_is_rejected_when_query_has_a_place_anchor():
+    engine = _SequencedEngine(
+        [
+            '[{"id":"R1","kind":"shops","query":"테미오래 인근 소품샵",'
+            '"required_terms":["소품샵"]}]',
+            '{"query":"테미오래 소품샵 여러 곳 주소"}',
+        ]
+    )
+    search_tool = _QuerySearchTool(
+        {
+            "테미오래 인근 소품샵": (
+                "### 울산 소품샵 추천\nSource: https://example.com/ulsan\n"
+                "Summary: 울산에서 둘러볼 소품샵"
+            ),
+            "테미오래 소품샵 여러 곳 주소": (
+                "### 대전 테미오래 주변 소품샵\n"
+                "Source: https://example.com/daejeon\n"
+                "Summary: 테미오래에서 이동할 수 있는 소품샵 모음"
+            ),
+        }
+    )
+
+    result = AutoSearchPreflight(
+        engine,
+        "test-model",
+        search_tool,
+        local_planning_allowed=True,
+    ).prepare("테미오래 주변 소품샵을 찾아줘")
+
+    assert [item.url for item in result.evidence] == ["https://example.com/daejeon"]

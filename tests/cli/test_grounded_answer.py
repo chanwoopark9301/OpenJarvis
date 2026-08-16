@@ -35,6 +35,20 @@ def test_parse_itinerary_json_accepts_the_strict_item_shape():
     )
 
 
+def test_parse_and_validate_remove_ideographs_and_unnatural_english_check_text():
+    content = (
+        '{"items":[{"time":"도착 後","title":"테미오래 방문",'
+        '"detail":"천천히 둘러봐.","venue":"테미오래","address":"",'
+        '"hours":"","source_ids":[],"status":"needs_check",'
+        '"check_before_visit":"nearby 식당 확인 필요"}]}'
+    )
+
+    item = parse_itinerary_json(content)[0]
+    validated = validate_itinerary((item,), ())[0]
+
+    assert "後" not in validated.time
+    assert validated.check_before_visit == "방문 전에 최신 정보를 확인해 줘."
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -140,7 +154,7 @@ def test_validate_itinerary_keeps_general_steps_and_drops_unknown_source_ids():
     assert validated[0].source_ids == ()
     assert validated[0].status == "needs_check"
     assert "http" not in validated[0].detail
-    assert validated[0].detail == "가까운 가게부터 둘러봐. 지시."
+    assert validated[0].detail == "식사를 마친 뒤 가까운 소품샵부터 이어서 둘러봐."
 
 
 def test_validate_itinerary_downgrades_single_nonofficial_confirmation():
@@ -167,6 +181,103 @@ def test_validate_itinerary_downgrades_single_nonofficial_confirmation():
     )
 
     assert validate_itinerary((item,), evidence)[0].status == "partial"
+
+
+def test_validate_itinerary_drops_food_sources_from_shop_steps():
+    evidence = (
+        EvidenceSource(
+            "S1",
+            "R2",
+            "테미오래 근처 한식 맛집",
+            "https://example.com/food",
+            "대흥동에서 식사할 식당 안내",
+            "review",
+        ),
+    )
+    item = ItineraryItem(
+        "14:00",
+        "소품샵 둘러보기",
+        "가까운 소품샵을 둘러봐.",
+        "",
+        "",
+        "",
+        ("S1",),
+        "partial",
+        "",
+    )
+
+    validated = validate_itinerary((item,), evidence)[0]
+
+    assert validated.source_ids == ()
+    assert validated.status == "needs_check"
+
+
+def test_validate_rewrites_sourced_detail_and_unbacked_clock_time():
+    evidence = (
+        EvidenceSource(
+            "S1",
+            "R1",
+            "테미오래 안내",
+            "https://example.com/temi",
+            "대전 테미오래 관람 정보",
+            "official",
+        ),
+    )
+    item = ItineraryItem(
+        "12:30 ~ 14:00",
+        "테미오래 관람",
+        "국제 규모의 설치 작품이며 다른 명소도 함께 방문해.",
+        "테미오래",
+        "",
+        "",
+        ("S1",),
+        "confirmed",
+        "",
+    )
+
+    validated = validate_itinerary(
+        (item,), evidence, user_text="내일 10시에 출발해서 테미오래에 갈 거야"
+    )[0]
+
+    assert validated.time == "이전 일정 후"
+    assert validated.detail == "테미오래를 여유 있게 둘러봐."
+    assert "설치" not in validated.detail
+
+
+def test_validate_rejects_one_unbacked_half_hour_and_clears_unverified_detail():
+    item = ItineraryItem(
+        "내일 09:30",
+        "출발 준비",
+        "확인되지 않은 전시 장소로 바로 이동해.",
+        "",
+        "",
+        "",
+        (),
+        "needs_check",
+        "출발지만 확인",
+    )
+
+    validated = validate_itinerary(
+        (item,), (), user_text="내일 10시까지 만나기로 했어"
+    )[0]
+
+    assert validated.time == "이전 일정 후"
+    assert validated.detail == ""
+
+
+def test_validate_collapses_repeated_food_and_shop_steps():
+    items = (
+        ItineraryItem("", "한식 이동", "", "", "", "", (), "needs_check", ""),
+        ItineraryItem("", "한식 식사", "", "", "", "", (), "needs_check", ""),
+        ItineraryItem("", "소품샵 하나", "", "", "", "", (), "needs_check", ""),
+        ItineraryItem("", "소품샵 둘", "", "", "", "", (), "needs_check", ""),
+    )
+
+    validated = validate_itinerary(items, ())
+
+    assert len(validated) == 2
+    assert "한식" in validated[0].title
+    assert "소품샵" in validated[1].title
 
 
 def test_render_itinerary_is_practical_and_lists_only_used_sources():
@@ -236,3 +347,7 @@ def test_build_itinerary_prompt_keeps_request_and_numbered_evidence_local():
     assert "[S1] 테미오래 공식 자료" in prompt
     assert '"source_ids"' in prompt
     assert "Return only JSON" in prompt
+    assert "Keep relative day words" in prompt
+    assert "Never invent travel duration" in prompt
+    assert "Preserve the requested sequence" in prompt
+    assert "Prefer logistics over historical trivia" in prompt

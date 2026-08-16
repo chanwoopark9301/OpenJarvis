@@ -20,6 +20,28 @@ _REVIEW_DOMAINS = (
     "tistory.com",
     "youtube.com",
 )
+_KOREAN_REGION_NAMES = frozenset(
+    {
+        "서울",
+        "부산",
+        "대구",
+        "인천",
+        "광주",
+        "대전",
+        "울산",
+        "세종",
+        "경기",
+        "강원",
+        "충북",
+        "충남",
+        "전북",
+        "전남",
+        "경북",
+        "경남",
+        "제주",
+    }
+)
+_NEARBY_WORDS = frozenset({"근처", "인근", "주변"})
 
 
 @dataclass(frozen=True)
@@ -51,6 +73,43 @@ def _normalize(value: str) -> str:
 def _record_matches(requirement: SearchRequirement, record: EvidenceSource) -> bool:
     searchable = _normalize(f"{record.title} {record.summary} {record.url}")
     return all(_normalize(term) in searchable for term in requirement.required_terms)
+
+
+def _query_place_anchors(query: str) -> tuple[str, ...]:
+    tokens = re.findall(r"[가-힣]{2,}", query)
+    anchors: list[str] = [token for token in tokens if token in _KOREAN_REGION_NAMES]
+    for index, token in enumerate(tokens):
+        if token in _NEARBY_WORDS and index:
+            anchors.append(tokens[index - 1])
+    return tuple(dict.fromkeys(anchors))
+
+
+def record_is_relevant(
+    requirement: SearchRequirement,
+    record: EvidenceSource,
+) -> bool:
+    """Return whether a result mentions at least one requested public term."""
+    searchable = _normalize(f"{record.title} {record.summary} {record.url}")
+    term_matches = any(
+        normalized_term and normalized_term in searchable
+        for term in requirement.required_terms
+        if (normalized_term := _normalize(term))
+    )
+    anchors = _query_place_anchors(requirement.query)
+    anchor_matches = not anchors or any(
+        _normalize(anchor) in searchable for anchor in anchors
+    )
+    hostname = (urlparse(record.url).hostname or "").casefold()
+    social_domains = ("instagram.com", "tiktok.com", "youtube.com")
+    if any(domain in hostname for domain in social_domains):
+        title_text = _normalize(record.title)
+        title_matches = any(
+            _normalize(value) in title_text
+            for value in (*requirement.required_terms, *anchors)
+            if _normalize(value)
+        )
+        return term_matches and anchor_matches and title_matches
+    return term_matches and anchor_matches
 
 
 def _classify_source(
@@ -133,5 +192,6 @@ __all__ = [
     "EvidenceSource",
     "SearchRequirement",
     "parse_search_content",
+    "record_is_relevant",
     "requirement_is_met",
 ]

@@ -81,7 +81,11 @@ def _render_grounded_search_answer(content: str, search_result) -> str | None:
         return None
     if not items:
         return None
-    validated = validate_itinerary(items, search_result.evidence)
+    validated = validate_itinerary(
+        items,
+        search_result.evidence,
+        user_text=getattr(search_result, "request_text", ""),
+    )
     return render_itinerary(validated, search_result.evidence)
 
 

@@ -4,6 +4,7 @@ from openjarvis.cli._search_evidence import (
     EvidenceSource,
     SearchRequirement,
     parse_search_content,
+    record_is_relevant,
     requirement_is_met,
 )
 
@@ -153,3 +154,22 @@ def test_nonofficial_requirement_accepts_one_matching_record():
     )
 
     assert requirement_is_met(requirement, evidence) is True
+
+
+def test_generic_social_profile_is_not_relevant_from_snippet_only():
+    requirement = SearchRequirement(
+        id="R2",
+        kind="food",
+        query="대전 테미오래 근처 한식 맛집",
+        required_terms=("한식", "맛집"),
+    )
+    generic_profile = EvidenceSource(
+        "S1",
+        "R2",
+        "늘 하 (@example) - Instagram photos and videos",
+        "https://www.instagram.com/example/",
+        "대전 테미오래 근처 한식 맛집 검색 결과",
+        "review",
+    )
+
+    assert record_is_relevant(requirement, generic_profile) is False

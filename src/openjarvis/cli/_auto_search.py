@@ -11,6 +11,7 @@ from openjarvis.cli._search_evidence import (
     EvidenceSource,
     SearchRequirement,
     parse_search_content,
+    record_is_relevant,
     requirement_is_met,
 )
 from openjarvis.core.types import Message, Role
@@ -103,10 +104,22 @@ first. Ignore unrelated background. Never include names of people, relationships
 feelings, home details, phones, emails, gifts, or private context. Never answer the
 request."""
 _REQUIREMENT_KINDS = frozenset({"official", "food", "shops", "general"})
+_IDEOGRAPH_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _RETRY_SYSTEM_PROMPT = """Improve one public web-search query whose first results
 did not meet all required terms. Return only a JSON object with one string field:
 query. Use only the supplied public requirement. Do not add private context and do
 not answer the request."""
+
+
+def _load_requirement_array(content: str) -> Any:
+    """Recover only the observed single missing closing array bracket."""
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        stripped = content.strip()
+        if stripped.startswith("[") and stripped.endswith("}"):
+            return json.loads(f"{stripped}]")
+        raise
 
 
 @dataclass(frozen=True)
@@ -121,6 +134,7 @@ class AutoSearchResult:
     error: str = ""
     requirements: tuple[SearchRequirement, ...] = ()
     evidence: tuple[EvidenceSource, ...] = ()
+    request_text: str = ""
 
 
 class AutoSearchPreflight:
@@ -168,6 +182,8 @@ class AutoSearchPreflight:
                 continue
 
             retry_query = self._plan_retry_query(requirement)
+            if not retry_query:
+                retry_query = self._fallback_retry_query(requirement)
             if not retry_query or retry_query in executed_queries:
                 continue
             executed_queries.append(retry_query)
@@ -203,6 +219,7 @@ class AutoSearchPreflight:
             context=context,
             requirements=requirements,
             evidence=tuple(evidence),
+            request_text=user_text,
         )
 
     def _execute_requirement(
@@ -220,10 +237,13 @@ class AutoSearchPreflight:
             return ()
         if not tool_result.success or not tool_result.content.strip():
             return ()
-        return parse_search_content(
+        records = parse_search_content(
             requirement,
             tool_result.content,
             start_index=start_index,
+        )
+        return tuple(
+            record for record in records if record_is_relevant(requirement, record)
         )
 
     @staticmethod
@@ -260,7 +280,7 @@ class AutoSearchPreflight:
             else str(response)
         )
         try:
-            raw_requirements = json.loads(content)
+            raw_requirements = _load_requirement_array(content)
         except (TypeError, ValueError, json.JSONDecodeError):
             return ()
         if not isinstance(raw_requirements, list):
@@ -342,9 +362,21 @@ class AutoSearchPreflight:
             not isinstance(query, str)
             or not query.strip()
             or self._is_private_query(query)
+            or _IDEOGRAPH_PATTERN.search(query)
         ):
             return ""
         return query.strip()
+
+    @staticmethod
+    def _fallback_retry_query(requirement: SearchRequirement) -> str:
+        terms = " ".join(dict.fromkeys(requirement.required_terms))
+        suffix = {
+            "official": "공식 누리집",
+            "food": "식당 메뉴 주소",
+            "shops": "여러 곳 주소",
+            "general": "공식 안내",
+        }[requirement.kind]
+        return f"{terms} {suffix}".strip()
 
     @staticmethod
     def _is_private_query(query: str) -> bool:
