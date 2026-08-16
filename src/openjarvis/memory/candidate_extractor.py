@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from openjarvis.core.types import Message, Role
-from openjarvis.memory.personal_models import CandidateDraft, ConversationExchange
+from openjarvis.memory.personal_models import (
+    DIRECT_RULE_KINDS,
+    CandidateDraft,
+    CandidateKind,
+    ConversationExchange,
+)
 
 LOCAL_PERSONAL_MEMORY_ENGINE_KEYS = frozenset(
     {
@@ -29,11 +35,41 @@ LOCAL_PERSONAL_MEMORY_ENGINE_KEYS = frozenset(
 )
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _SYSTEM_PROMPT = (
-    "Extract only provisional personal-memory candidates from one conversation.\n"
-    "Return ONLY a JSON array. Each item must be an object with exactly these useful\n"
-    "fields: kind (fact or episode), content, importance (0 to 1),\n"
-    "confidence (0 to 1).\n"
-    "Include only durable user-related information. Return [] when nothing is useful."
+    "Extract atomic provisional personal-memory candidates from one conversation.\n"
+    "Only the user's own words are personal evidence. Never treat assistant text as "
+    "evidence, even when it contains a confident claim or suggestion.\n"
+    "Return ONLY a JSON array. Allowed fields are kind, content, importance, "
+    "confidence, temporal_scope, subject, and target_claim_id.\n"
+    "kind must be fact, episode, preference, constraint, correction, "
+    "role_preference, capability_boundary, or hypothesis.\n"
+    "Use current for a temporary state, dated for a specific event, persistent for "
+    "a recurring preference, until_changed for a direct rule, and unspecified only "
+    "when the user's time scope is genuinely absent.\n"
+    "Do not infer hidden psychology. Return [] when the user supplied no useful "
+    "personal evidence."
+)
+_ALLOWED_FIELDS = frozenset(
+    {
+        "kind",
+        "content",
+        "importance",
+        "confidence",
+        "temporal_scope",
+        "subject",
+        "target_claim_id",
+    }
+)
+_EXPLICIT_RULE_SIGNALS = (
+    "하지 마",
+    "기억해",
+    "틀렸어",
+    "할 수 없어",
+    "역할은",
+    "do not",
+    "don't",
+    "remember this",
+    "you cannot",
+    "your role is",
 )
 
 
@@ -115,8 +151,20 @@ class PersonalCandidateExtractor:
 
         content = result.get("content", "") if isinstance(result, dict) else str(result)
         drafts, error_code = self._parse(content)
+        if not error_code and self._has_explicit_rule_signal(exchange.user_text):
+            drafts = [
+                replace(draft, importance=1.0)
+                if draft.kind in DIRECT_RULE_KINDS
+                else draft
+                for draft in drafts
+            ]
         self.last_error_code = error_code
         return drafts
+
+    @staticmethod
+    def _has_explicit_rule_signal(user_text: str) -> bool:
+        normalized = user_text.casefold()
+        return any(signal in normalized for signal in _EXPLICIT_RULE_SIGNALS)
 
     @staticmethod
     def _parse(content: str) -> tuple[list[CandidateDraft], str]:
@@ -133,14 +181,34 @@ class PersonalCandidateExtractor:
         for item in raw:
             if not isinstance(item, dict):
                 continue
+            if not set(item).issubset(_ALLOWED_FIELDS):
+                continue
             kind = item.get("kind")
             content_value = item.get("content")
             importance = item.get("importance")
             confidence = item.get("confidence")
-            if kind not in ("fact", "episode") or not isinstance(content_value, str):
+            try:
+                candidate_kind = CandidateKind(kind)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(content_value, str):
                 continue
             clean_content = content_value.strip()
             if not clean_content or len(clean_content) > 500:
+                continue
+            temporal_scope = item.get("temporal_scope", "unspecified")
+            subject = item.get("subject", "user")
+            target_claim_id = item.get("target_claim_id", "")
+            if not all(
+                isinstance(value, str)
+                for value in (temporal_scope, subject, target_claim_id)
+            ):
+                continue
+            if (
+                len(temporal_scope) > 80
+                or len(subject) > 120
+                or len(target_claim_id) > 120
+            ):
                 continue
             if (
                 isinstance(importance, bool)
@@ -149,11 +217,19 @@ class PersonalCandidateExtractor:
                 or not isinstance(confidence, (int, float))
             ):
                 continue
-            key = (kind, clean_content.casefold())
+            key = (candidate_kind.value, clean_content.casefold())
             if key in seen:
                 continue
             try:
-                draft = CandidateDraft(kind, clean_content, importance, confidence)
+                draft = CandidateDraft(
+                    candidate_kind,
+                    clean_content,
+                    importance,
+                    confidence,
+                    temporal_scope=temporal_scope,
+                    subject=subject,
+                    target_claim_id=target_claim_id,
+                )
             except (TypeError, ValueError):
                 continue
             drafts.append(draft)

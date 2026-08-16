@@ -98,3 +98,37 @@ def test_completed_candidate_keeps_a_link_to_its_exact_conversation(tmp_path):
 
     assert candidates[0].exchange_id == "exchange-3"
     assert candidates[0].status == "pending"
+
+
+def test_completed_candidate_preserves_rule_provenance_and_scope(tmp_path):
+    """Losing direct-rule metadata would make later priority gates unsafe."""
+    PersonalMemoryArchive, CandidateDraft = _archive_api()
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    archive.record_exchange(
+        exchange_id="exchange-rule",
+        user_text="Do not mention timers unless I ask.",
+        assistant_text="Understood.",
+        source="cli.chat",
+    )
+    assert archive.claim_candidate_job("exchange-rule") is not None
+
+    candidates = archive.complete_candidate_job(
+        "exchange-rule",
+        [
+            CandidateDraft(
+                "constraint",
+                "Do not mention timers unless asked.",
+                1.0,
+                1.0,
+                temporal_scope="until_changed",
+                subject="assistant_behavior",
+            )
+        ],
+        engine_id="ollama",
+        extractor_version="v2",
+    )
+
+    assert candidates[0].kind == "constraint"
+    assert candidates[0].source == "user_direct"
+    assert candidates[0].temporal_scope == "until_changed"
+    assert candidates[0].subject == "assistant_behavior"

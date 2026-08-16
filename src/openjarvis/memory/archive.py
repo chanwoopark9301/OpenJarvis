@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
   status TEXT NOT NULL DEFAULT 'pending',
   engine_id TEXT NOT NULL,
   extractor_version TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'user_direct',
+  temporal_scope TEXT NOT NULL DEFAULT 'unspecified',
+  subject TEXT NOT NULL DEFAULT 'user',
+  target_claim_id TEXT NOT NULL DEFAULT '',
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL,
   UNIQUE(exchange_id, kind, content)
@@ -244,6 +248,23 @@ class PersonalMemoryArchive:
                     ADD COLUMN candidate_next_attempt_at REAL NOT NULL DEFAULT 0
                     """
                 )
+            candidate_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(memory_candidates)"
+                ).fetchall()
+            }
+            candidate_migrations = {
+                "source": "TEXT NOT NULL DEFAULT 'user_direct'",
+                "temporal_scope": "TEXT NOT NULL DEFAULT 'unspecified'",
+                "subject": "TEXT NOT NULL DEFAULT 'user'",
+                "target_claim_id": "TEXT NOT NULL DEFAULT ''",
+            }
+            for name, declaration in candidate_migrations.items():
+                if name not in candidate_columns:
+                    connection.execute(
+                        f"ALTER TABLE memory_candidates ADD COLUMN {name} {declaration}"
+                    )
             connection.execute(
                 """
                 INSERT INTO archive_metadata(key, value)
@@ -304,6 +325,10 @@ class PersonalMemoryArchive:
             extractor_version=str(row["extractor_version"]),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
+            source=str(row["source"]),
+            temporal_scope=str(row["temporal_scope"]),
+            subject=str(row["subject"]),
+            target_claim_id=str(row["target_claim_id"]),
         )
 
     @staticmethod
@@ -446,8 +471,9 @@ class PersonalMemoryArchive:
                     """
                     INSERT INTO memory_candidates (
                         id, exchange_id, kind, content, importance, confidence, status,
-                        engine_id, extractor_version, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                        engine_id, extractor_version, source, temporal_scope, subject,
+                        target_claim_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(exchange_id, kind, content) DO NOTHING
                     """,
                     (
@@ -459,6 +485,10 @@ class PersonalMemoryArchive:
                         draft.confidence,
                         engine_id,
                         extractor_version,
+                        draft.source,
+                        draft.temporal_scope,
+                        draft.subject,
+                        draft.target_claim_id,
                         now,
                         now,
                     ),

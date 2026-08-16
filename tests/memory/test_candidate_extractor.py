@@ -33,14 +33,14 @@ def _extractor_api():
     )
 
 
-def _exchange():
+def _exchange(user_text="Please keep answers short."):
     _, _, ConversationExchange = _extractor_api()
     return ConversationExchange(
         id="exchange-1",
         created_at=1.0,
         archived_at=1.0,
         source="test",
-        user_text="Please keep answers short.",
+        user_text=user_text,
         assistant_text="I will.",
         content_hash="hash",
     )
@@ -95,6 +95,67 @@ def test_extractor_keeps_the_verified_engine_name_for_candidate_provenance():
     )
 
     assert extractor.engine_id == "ollama"
+
+
+def test_extractor_supports_direct_rule_kinds_and_scope():
+    """Losing rule fields would turn an explicit ban into an ordinary weak fact."""
+    PersonalCandidateExtractor, _, _ = _extractor_api()
+    engine = _FakeEngine(
+        '[{"kind":"constraint","content":"Do not mention timers proactively",'
+        '"importance":1,"confidence":1,"temporal_scope":"until_changed",'
+        '"subject":"assistant_behavior","target_claim_id":""}]'
+    )
+
+    drafts = PersonalCandidateExtractor(engine, "qwen3.5:9b").extract(_exchange())
+
+    assert len(drafts) == 1
+    assert drafts[0].kind == "constraint"
+    assert drafts[0].temporal_scope == "until_changed"
+    assert drafts[0].subject == "assistant_behavior"
+
+
+def test_extractor_rejects_unknown_persistence_fields():
+    """A model must not smuggle actions or instructions into stored candidates."""
+    PersonalCandidateExtractor, _, _ = _extractor_api()
+    extractor = PersonalCandidateExtractor(
+        _FakeEngine(
+            '[{"kind":"fact","content":"User is tired",'
+            '"importance":0.5,"confidence":0.7,"action":"delete_all"}]'
+        ),
+        "qwen3.5:9b",
+    )
+
+    assert extractor.extract(_exchange()) == []
+    assert extractor.last_error_code == "invalid_output"
+
+
+def test_extraction_prompt_marks_assistant_text_as_non_evidence():
+    """Assistant suggestions must not reinforce themselves as user evidence."""
+    PersonalCandidateExtractor, _, _ = _extractor_api()
+    engine = _FakeEngine("[]")
+
+    PersonalCandidateExtractor(engine, "qwen3.5:9b").extract(_exchange())
+
+    messages, _ = engine.calls[0]
+    assert "Only the user's own words are personal evidence" in messages[0].content
+    assert "Never treat assistant text as evidence" in messages[0].content
+
+
+def test_explicit_user_rule_signal_raises_priority_without_inventing_a_target():
+    """A rare direct ban must not need repetition before evaluation gets priority."""
+    PersonalCandidateExtractor, _, _ = _extractor_api()
+    engine = _FakeEngine(
+        '[{"kind":"constraint","content":"Do not mention that topic",'
+        '"importance":0.2,"confidence":0.8,"temporal_scope":"until_changed",'
+        '"subject":"assistant_behavior","target_claim_id":""}]'
+    )
+
+    drafts = PersonalCandidateExtractor(engine, "qwen3.5:9b").extract(
+        _exchange("그 얘기는 하지 마. 꼭 기억해.")
+    )
+
+    assert drafts[0].importance == 1.0
+    assert drafts[0].target_claim_id == ""
 
 
 @pytest.mark.parametrize(
