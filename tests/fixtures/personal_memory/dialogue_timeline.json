@@ -1,0 +1,30 @@
+[
+  {
+    "id": "ban-topic",
+    "text": "Do not proactively mention the old coaching topic.",
+    "kind": "constraint",
+    "scope": "until_changed",
+    "subject": "topic:old_coaching"
+  },
+  {
+    "id": "ban-music",
+    "text": "Do not claim you can play background music.",
+    "kind": "capability_boundary",
+    "scope": "until_changed",
+    "subject": "assistant_capabilities"
+  },
+  {
+    "id": "fatigue",
+    "text": "I feel tired lately.",
+    "kind": "fact",
+    "scope": "current",
+    "subject": "energy"
+  },
+  {
+    "id": "running-goal",
+    "text": "I am working toward a faster three kilometer run.",
+    "kind": "fact",
+    "scope": "persistent",
+    "subject": "running_goal"
+  }
+]

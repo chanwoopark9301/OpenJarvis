@@ -69,6 +69,9 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
   UNIQUE(exchange_id, kind, content)
 );
 
+CREATE INDEX IF NOT EXISTS idx_exchanges_candidate_created
+ON conversation_exchanges(candidate_state, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS evidence_items (
   id TEXT PRIMARY KEY,
   exchange_id TEXT NOT NULL REFERENCES conversation_exchanges(id),
@@ -95,6 +98,9 @@ CREATE TABLE IF NOT EXISTS personal_claims (
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_claims_state_updated
+ON personal_claims(state, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS claim_evidence_links (
   claim_id TEXT NOT NULL REFERENCES personal_claims(id),
@@ -421,6 +427,12 @@ class PersonalMemoryArchive:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         return {str(row["name"]) for row in rows}
+
+    def integrity_check(self) -> str:
+        """Return SQLite's own archive integrity result."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute("PRAGMA integrity_check").fetchone()
+        return str(row[0]) if row is not None else "unknown"
 
     def record_exchange(
         self,
