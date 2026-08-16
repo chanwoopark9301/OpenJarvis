@@ -147,7 +147,8 @@ Add tests showing:
 
 - a non-triggered result preserves the existing single response-generation path;
 - a successful result places its external context in the real agent message list before the original user message;
-- a successful result whose model answer omits links gets a deterministic source list appended;
+- a successful result whose model answer cites none of the fetched URLs is replaced
+  by a deterministic fail-closed notice, the sanitized queries, and source list;
 - a failed triggered result prints the fixed failure text, makes no final response-generation call, and still archives that completed exchange;
 - existing personal-memory context and search context both reach the agent instead of one replacing the other.
 
@@ -212,7 +213,10 @@ Expected: a short companion reply without search, citations, or unrelated advice
 
 Enter the supplied request about 테미오래, Korean food, and clustered small-goods shops.
 
-Expected: the local planner removes relationship wording from external queries; DuckDuckGo returns sources; the answer contains a time-ordered plan and source URLs, and contains none of the previously fabricated names.
+Expected: the local planner removes relationship wording from external queries and
+DuckDuckGo returns sources. A grounded answer includes fetched URLs; an uncited
+answer is replaced by the safe query-and-source notice and exposes no fabricated
+places.
 
 - [ ] **Step 5: Verify memory completion**
 

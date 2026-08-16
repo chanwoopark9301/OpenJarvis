@@ -36,6 +36,51 @@ def _personal_memory_status(config, personal_mode: str) -> str:
     return "active"
 
 
+def _build_auto_search_preflight(config, engine, engine_key: str, model: str):
+    """Build the chat search preflight with a locally verified planner."""
+    from openjarvis.cli._auto_search import AutoSearchPreflight
+    from openjarvis.memory.candidate_extractor import (
+        is_local_personal_memory_engine,
+    )
+    from openjarvis.tools.web_search import WebSearchTool
+
+    return AutoSearchPreflight(
+        engine,
+        model,
+        WebSearchTool(max_results=3),
+        local_planning_allowed=is_local_personal_memory_engine(
+            config,
+            engine_key,
+        ),
+    )
+
+
+def _ground_search_answer(content: str, search_result) -> str:
+    """Fail closed when a generated search answer cites no fetched source."""
+    cited_sources = [
+        source for source in search_result.sources if source in content
+    ]
+    source_lines = "\n".join(f"- {source}" for source in search_result.sources)
+    if not cited_sources:
+        query_lines = "\n".join(f"- {query}" for query in search_result.queries)
+        query_section = (
+            f"\n\n검색한 내용:\n{query_lines}" if query_lines else ""
+        )
+        return (
+            "인터넷 자료는 찾았지만, 만든 답변의 장소나 시간을 아래 출처와 "
+            "직접 연결해 확인하지 못했어. 확인되지 않은 내용은 보여주지 않을게."
+            f"{query_section}\n\n확인한 출처:\n{source_lines}"
+        )
+
+    uncited_sources = [
+        source for source in search_result.sources if source not in cited_sources
+    ]
+    if uncited_sources:
+        extra_lines = "\n".join(f"- {source}" for source in uncited_sources)
+        return f"{content}\n\n추가로 확인한 출처:\n{extra_lines}"
+    return content
+
+
 @click.command()
 @click.option("-e", "--engine", "engine_key", default=None, help="Engine backend.")
 @click.option("-m", "--model", "model_name", default=None, help="Model to use.")
@@ -244,6 +289,13 @@ def chat(
 
         memory_backend = _get_memory_backend(config)
 
+    auto_search_preflight = _build_auto_search_preflight(
+        config,
+        engine,
+        engine_name,
+        model,
+    )
+
     # Conversation state
     if not system_prompt:
         from openjarvis.prompt.builder import SystemPromptBuilder
@@ -312,8 +364,9 @@ def chat(
         # Add user message
         history.append(Message(role=Role.USER, content=user_input))
 
+        auto_search_result = auto_search_preflight.prepare(user_input)
+        agent_context_messages: list[Message] = []
         generation_history = history
-        agent_context_message = None
         if config.agent.context_from_memory:
             try:
                 from openjarvis.memory import load_configured_facts
@@ -356,22 +409,39 @@ def chat(
                     ),
                 )
                 if agent is not None:
-                    if context_messages:
-                        agent_context_message = context_messages[0]
+                    agent_context_messages.extend(context_messages)
                 else:
                     generation_history = context_messages
             except Exception:
                 logger.debug("Failed to inject memory context", exc_info=True)
 
+        if auto_search_result.success:
+            search_context_message = Message(
+                role=Role.SYSTEM,
+                content=auto_search_result.context,
+                metadata={"external_search_context": True},
+            )
+            if agent is not None:
+                agent_context_messages.append(search_context_message)
+            else:
+                generation_history = [
+                    *generation_history[:-1],
+                    search_context_message,
+                    generation_history[-1],
+                ]
+
         # Generate response even when optional memory context is unavailable.
         try:
-            if agent is not None:
+            if auto_search_result.triggered and not auto_search_result.success:
+                content = auto_search_result.error
+            elif agent is not None:
                 agent_context = None
-                if agent_context_message is not None:
+                if agent_context_messages:
                     from openjarvis.agents._stubs import AgentContext
 
                     agent_context = AgentContext()
-                    agent_context.conversation.add(agent_context_message)
+                    for context_message in agent_context_messages:
+                        agent_context.conversation.add(context_message)
                 response = agent.run(user_input, context=agent_context)
                 content = (
                     response.content if hasattr(response, "content") else str(response)
@@ -383,6 +453,9 @@ def chat(
                     if isinstance(result, dict)
                     else str(result)
                 )
+
+            if auto_search_result.success:
+                content = _ground_search_answer(content, auto_search_result)
 
             history.append(Message(role=Role.ASSISTANT, content=content))
             console.print()
