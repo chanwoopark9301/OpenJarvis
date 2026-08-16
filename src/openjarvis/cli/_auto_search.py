@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
+from openjarvis.cli._search_evidence import (
+    EvidenceSource,
+    SearchRequirement,
+    parse_search_content,
+    requirement_is_met,
+)
 from openjarvis.core.types import Message, Role
 
 _PRIVATE_INTROSPECTION_SIGNALS = (
@@ -87,16 +93,20 @@ _FAILURE_MESSAGE = (
     "인터넷에서 필요한 정보를 확인하지 못했어. 확인되지 않은 장소나 운영 "
     "정보를 지어내지는 않을게. 잠시 뒤 다시 검색해 줘."
 )
-_QUERY_SYSTEM_PROMPT = """Create public web-search queries only for the user's
-requested task. Return only a JSON array of one to three strings. Preserve the
-exact spelling of named public places from the request. Ignore background details
-that are not needed to answer the final request. Do not add businesses, districts,
-or venue types that the user did not mention. When the user will visit a named
-public place, make the first query its official hours and access information.
-Do not include people's names,
-relationships, feelings, home details, phone numbers, email addresses, gifts, or
-other private context. Keep only public places, topics, dates, operating
-information, and recommendation criteria. Never answer the request."""
+_QUERY_SYSTEM_PROMPT = """Create one to three public-information requirements for
+the user's requested task. Return only a JSON array of objects with exactly these
+fields: id, kind, query, required_terms. IDs must be R1, R2, R3 in order. Kind must
+be official, food, shops, or general. required_terms must contain one to three
+public strings needed to recognize a relevant result. Preserve exact public place
+spelling. If a visit names a public place, put an official hours/access requirement
+first. Ignore unrelated background. Never include names of people, relationships,
+feelings, home details, phones, emails, gifts, or private context. Never answer the
+request."""
+_REQUIREMENT_KINDS = frozenset({"official", "food", "shops", "general"})
+_RETRY_SYSTEM_PROMPT = """Improve one public web-search query whose first results
+did not meet all required terms. Return only a JSON object with one string field:
+query. Use only the supplied public requirement. Do not add private context and do
+not answer the request."""
 
 
 @dataclass(frozen=True)
@@ -109,6 +119,8 @@ class AutoSearchResult:
     sources: tuple[str, ...] = ()
     context: str = ""
     error: str = ""
+    requirements: tuple[SearchRequirement, ...] = ()
+    evidence: tuple[EvidenceSource, ...] = ()
 
 
 class AutoSearchPreflight:
@@ -138,30 +150,36 @@ class AutoSearchPreflight:
         if not self._local_planning_allowed:
             return self._failure()
 
-        queries = self._plan_queries(user_text)
-        if not queries:
+        requirements = self._plan_requirements(user_text)
+        if not requirements:
             return self._failure()
 
-        result_parts: list[str] = []
-        sources: list[str] = []
-        for query in queries:
-            try:
-                tool_result = self._search_tool.execute(
-                    query=query,
-                    max_results=3,
-                )
-            except Exception:  # noqa: BLE001 - web lookup is best effort
+        evidence: list[EvidenceSource] = []
+        executed_queries: list[str] = []
+        seen_urls: set[str] = set()
+        for requirement in requirements:
+            executed_queries.append(requirement.query)
+            parsed = self._execute_requirement(
+                requirement,
+                start_index=len(evidence) + 1,
+            )
+            self._append_unique_evidence(evidence, seen_urls, parsed)
+            if requirement_is_met(requirement, tuple(evidence)):
                 continue
-            if not tool_result.success or not tool_result.content.strip():
-                continue
-            result_parts.append(f"Query: {query}\n{tool_result.content.strip()}")
-            for source in re.findall(r"https?://[^\s<>()]+", tool_result.content):
-                cleaned = source.rstrip(".,;:!?'\"")
-                if cleaned and cleaned not in sources:
-                    sources.append(cleaned)
 
-        if not result_parts or not sources:
-            return self._failure(queries=queries)
+            retry_query = self._plan_retry_query(requirement)
+            if not retry_query or retry_query in executed_queries:
+                continue
+            executed_queries.append(retry_query)
+            retry_requirement = replace(requirement, query=retry_query)
+            retry_evidence = self._execute_requirement(
+                retry_requirement,
+                start_index=len(evidence) + 1,
+            )
+            self._append_unique_evidence(evidence, seen_urls, retry_evidence)
+
+        if not evidence:
+            return self._failure(queries=tuple(executed_queries))
 
         context = (
             "UNTRUSTED WEB SEARCH RESULTS\n"
@@ -173,17 +191,57 @@ class AutoSearchPreflight:
             "places from the user's request. Do not substitute another city. "
             "Include useful source links, and say when evidence is missing or "
             "conflicting.\n\n"
-            + "\n\n---\n\n".join(result_parts)
+            + "\n\n---\n\n".join(
+                _format_evidence_context(record) for record in evidence
+            )
         )[: self._max_context_chars]
         return AutoSearchResult(
             triggered=True,
             success=True,
-            queries=queries,
-            sources=tuple(sources),
+            queries=tuple(executed_queries),
+            sources=tuple(record.url for record in evidence),
             context=context,
+            requirements=requirements,
+            evidence=tuple(evidence),
         )
 
-    def _plan_queries(self, user_text: str) -> tuple[str, ...]:
+    def _execute_requirement(
+        self,
+        requirement: SearchRequirement,
+        *,
+        start_index: int,
+    ) -> tuple[EvidenceSource, ...]:
+        try:
+            tool_result = self._search_tool.execute(
+                query=requirement.query,
+                max_results=3,
+            )
+        except Exception:  # noqa: BLE001 - web lookup is best effort
+            return ()
+        if not tool_result.success or not tool_result.content.strip():
+            return ()
+        return parse_search_content(
+            requirement,
+            tool_result.content,
+            start_index=start_index,
+        )
+
+    @staticmethod
+    def _append_unique_evidence(
+        evidence: list[EvidenceSource],
+        seen_urls: set[str],
+        records: tuple[EvidenceSource, ...],
+    ) -> None:
+        for record in records:
+            if record.url in seen_urls:
+                continue
+            seen_urls.add(record.url)
+            evidence.append(replace(record, id=f"S{len(evidence) + 1}"))
+
+    def _plan_requirements(
+        self,
+        user_text: str,
+    ) -> tuple[SearchRequirement, ...]:
         try:
             response = self._engine.generate(
                 [
@@ -202,23 +260,91 @@ class AutoSearchPreflight:
             else str(response)
         )
         try:
-            raw_queries = json.loads(content)
+            raw_requirements = json.loads(content)
         except (TypeError, ValueError, json.JSONDecodeError):
             return ()
-        if not isinstance(raw_queries, list):
+        if not isinstance(raw_requirements, list):
             return ()
 
-        queries: list[str] = []
-        for value in raw_queries:
-            if not isinstance(value, str):
-                continue
-            query = value.strip()
-            if not query or self._is_private_query(query) or query in queries:
-                continue
-            queries.append(query)
-            if len(queries) == self._max_queries:
-                break
-        return tuple(queries)
+        requirements: list[SearchRequirement] = []
+        seen_queries: set[str] = set()
+        for index, value in enumerate(raw_requirements[: self._max_queries], start=1):
+            if not isinstance(value, dict) or set(value) != {
+                "id",
+                "kind",
+                "query",
+                "required_terms",
+            }:
+                return ()
+            expected_id = f"R{index}"
+            query = value["query"]
+            kind = value["kind"]
+            terms = value["required_terms"]
+            if (
+                value["id"] != expected_id
+                or kind not in _REQUIREMENT_KINDS
+                or not isinstance(query, str)
+                or not query.strip()
+                or self._is_private_query(query)
+                or query.strip() in seen_queries
+                or not isinstance(terms, list)
+                or not 1 <= len(terms) <= 3
+                or any(not isinstance(term, str) or not term.strip() for term in terms)
+            ):
+                return ()
+            clean_query = query.strip()
+            seen_queries.add(clean_query)
+            requirements.append(
+                SearchRequirement(
+                    id=expected_id,
+                    kind=kind,
+                    query=clean_query,
+                    required_terms=tuple(term.strip() for term in terms),
+                )
+            )
+        return tuple(requirements)
+
+    def _plan_retry_query(self, requirement: SearchRequirement) -> str:
+        public_requirement = json.dumps(
+            {
+                "id": requirement.id,
+                "kind": requirement.kind,
+                "query": requirement.query,
+                "required_terms": requirement.required_terms,
+            },
+            ensure_ascii=False,
+        )
+        try:
+            response = self._engine.generate(
+                [
+                    Message(role=Role.SYSTEM, content=_RETRY_SYSTEM_PROMPT),
+                    Message(role=Role.USER, content=public_requirement),
+                ],
+                model=self._model,
+                temperature=0.0,
+                max_tokens=128,
+            )
+        except Exception:  # noqa: BLE001 - retry planning must fail closed
+            return ""
+        content = (
+            response.get("content", "")
+            if isinstance(response, dict)
+            else str(response)
+        )
+        try:
+            value = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+        if not isinstance(value, dict) or set(value) != {"query"}:
+            return ""
+        query = value["query"]
+        if (
+            not isinstance(query, str)
+            or not query.strip()
+            or self._is_private_query(query)
+        ):
+            return ""
+        return query.strip()
 
     @staticmethod
     def _is_private_query(query: str) -> bool:
@@ -237,6 +363,16 @@ class AutoSearchPreflight:
             queries=queries,
             error=_FAILURE_MESSAGE,
         )
+
+
+def _format_evidence_context(record: EvidenceSource) -> str:
+    return (
+        f"[{record.id}] requirement={record.requirement_id} "
+        f"kind={record.source_kind}\n"
+        f"Title: {record.title}\n"
+        f"Source: {record.url}\n"
+        f"Summary: {record.summary}"
+    )
 
 
 def needs_web_search(user_text: str) -> bool:

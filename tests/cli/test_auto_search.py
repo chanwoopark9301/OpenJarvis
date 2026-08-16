@@ -9,6 +9,7 @@ from openjarvis.cli._auto_search import (
     AutoSearchResult,
     needs_web_search,
 )
+from openjarvis.cli._search_evidence import SearchRequirement
 from openjarvis.core.types import ToolResult
 
 
@@ -22,6 +23,16 @@ class _FakeEngine:
         self.system_inputs.append(messages[0].content)
         self.inputs.append(messages[-1].content)
         return {"content": self.content}
+
+
+class _SequencedEngine:
+    def __init__(self, contents: list[str]):
+        self.contents = list(contents)
+        self.inputs: list[str] = []
+
+    def generate(self, messages, **kwargs):
+        self.inputs.append(messages[-1].content)
+        return {"content": self.contents.pop(0)}
 
 
 class _FakeSearchTool:
@@ -45,6 +56,22 @@ class _FakeSearchTool:
                 f"Source: https://example.com/{len(self.queries)}\n"
                 "Summary: verified public information"
             ),
+            success=True,
+            metadata={"engine": "test"},
+        )
+
+
+class _QuerySearchTool:
+    def __init__(self, content_by_query: dict[str, str]):
+        self.content_by_query = content_by_query
+        self.queries: list[str] = []
+
+    def execute(self, **params):
+        query = params["query"]
+        self.queries.append(query)
+        return ToolResult(
+            tool_name="web_search",
+            content=self.content_by_query.get(query, "No results found."),
             success=True,
             metadata={"engine": "test"},
         )
@@ -128,8 +155,14 @@ def test_query_planner_requires_strict_json_before_searching():
 
 def test_query_planner_limits_trims_and_deduplicates_queries():
     engine = _FakeEngine(
-        '[" 대전 테미오래 운영시간 ", "대전 테미오래 운영시간", '
-        '"대전 한식 맛집", "대전 소품샵"]'
+        '[{"id":"R1","kind":"general","query":" 대전 테미오래 운영시간 ",'
+        '"required_terms":["테미오래"]},'
+        '{"id":"R2","kind":"food","query":"대전 한식 맛집",'
+        '"required_terms":["대전","한식"]},'
+        '{"id":"R3","kind":"shops","query":"대전 소품샵",'
+        '"required_terms":["대전","소품샵"]},'
+        '{"id":"R4","kind":"general","query":"무시할 네 번째",'
+        '"required_terms":["무시"]}]'
     )
     search_tool = _FakeSearchTool()
 
@@ -161,7 +194,8 @@ def test_query_planner_limits_trims_and_deduplicates_queries():
 )
 def test_private_query_is_rejected_before_external_search(private_query):
     engine = _FakeEngine(
-        f'["{private_query}", "대전 테미오래 공식 운영시간"]'
+        f'[{{"id":"R1","kind":"food","query":"{private_query}",'
+        '"required_terms":["대전"]}]'
     )
     search_tool = _FakeSearchTool()
 
@@ -172,8 +206,9 @@ def test_private_query_is_rejected_before_external_search(private_query):
         local_planning_allowed=True,
     ).prepare("인터넷에서 대전 일정을 찾아줘")
 
-    assert result.queries == ("대전 테미오래 공식 운영시간",)
-    assert search_tool.queries == ["대전 테미오래 공식 운영시간"]
+    assert result.success is False
+    assert result.queries == ()
+    assert search_tool.queries == []
 
 
 def test_non_local_planner_never_receives_raw_user_text():
@@ -195,7 +230,10 @@ def test_non_local_planner_never_receives_raw_user_text():
 
 def test_external_search_receives_only_planned_public_queries():
     raw_request = "내 여자친구를 10시에 픽업해서 갈 대전 맛집을 검색해 줘"
-    engine = _FakeEngine('["대전 한식 맛집 운영시간"]')
+    engine = _FakeEngine(
+        '[{"id":"R1","kind":"food","query":"대전 한식 맛집 운영시간",'
+        '"required_terms":["대전","한식"]}]'
+    )
     search_tool = _FakeSearchTool()
 
     result = AutoSearchPreflight(
@@ -211,7 +249,10 @@ def test_external_search_receives_only_planned_public_queries():
 
 
 def test_query_planner_is_told_to_preserve_places_and_ignore_background():
-    engine = _FakeEngine('["대전 테미오래 운영시간"]')
+    engine = _FakeEngine(
+        '[{"id":"R1","kind":"general","query":"대전 테미오래 운영시간",'
+        '"required_terms":["테미오래"]}]'
+    )
     search_tool = _FakeSearchTool()
 
     AutoSearchPreflight(
@@ -222,14 +263,18 @@ def test_query_planner_is_told_to_preserve_places_and_ignore_background():
     ).prepare("꽃다발을 준비했어. 테미오래 운영시간을 검색해 줘")
 
     prompt = engine.system_inputs[0]
-    assert "exact spelling" in prompt
-    assert "background details" in prompt
-    assert "official hours and access" in prompt
+    assert "Preserve exact public place" in prompt
+    assert "Ignore unrelated background" in prompt
+    assert "official hours/access" in prompt
     assert engine.inputs == ["테미오래 운영시간을 검색해 줘"]
 
 
 def test_query_planner_keeps_immediately_preceding_trip_context():
-    engine = _FakeEngine('["대전 테미오래 근처 한식 맛집"]')
+    engine = _FakeEngine(
+        '[{"id":"R1","kind":"general",'
+        '"query":"대전 테미오래 근처 한식 맛집",'
+        '"required_terms":["대전","한식"]}]'
+    )
     search_tool = _FakeSearchTool()
 
     AutoSearchPreflight(
@@ -248,7 +293,11 @@ def test_query_planner_keeps_immediately_preceding_trip_context():
 
 
 def test_query_planner_keeps_multi_sentence_trip_request_without_small_talk():
-    engine = _FakeEngine('["대전 테미오래 근처 한식 맛집"]')
+    engine = _FakeEngine(
+        '[{"id":"R1","kind":"general",'
+        '"query":"대전 테미오래 근처 한식 맛집",'
+        '"required_terms":["대전","한식"]}]'
+    )
     search_tool = _FakeSearchTool()
 
     AutoSearchPreflight(
@@ -271,7 +320,12 @@ def test_query_planner_keeps_multi_sentence_trip_request_without_small_talk():
 
 
 def test_successful_search_builds_untrusted_context_and_unique_sources():
-    engine = _FakeEngine('["대전 테미오래", "대전 한식 맛집"]')
+    engine = _FakeEngine(
+        '[{"id":"R1","kind":"general","query":"대전 테미오래",'
+        '"required_terms":["대전","테미오래"]},'
+        '{"id":"R2","kind":"food","query":"대전 한식 맛집",'
+        '"required_terms":["대전","한식"]}]'
+    )
     search_tool = _FakeSearchTool()
 
     result = AutoSearchPreflight(
@@ -295,7 +349,10 @@ def test_successful_search_builds_untrusted_context_and_unique_sources():
 
 
 def test_all_failed_searches_return_fixed_error_without_context():
-    engine = _FakeEngine('["대전 테미오래 운영시간"]')
+    engine = _FakeEngine(
+        '[{"id":"R1","kind":"general","query":"대전 테미오래 운영시간",'
+        '"required_terms":["테미오래"]}]'
+    )
     search_tool = _FakeSearchTool(fail=True)
 
     result = AutoSearchPreflight(
@@ -324,7 +381,11 @@ def test_search_content_without_source_url_fails_closed():
             )
 
     result = AutoSearchPreflight(
-        _FakeEngine('["대전 테미오래 운영시간"]'),
+        _FakeEngine(
+            '[{"id":"R1","kind":"general",'
+            '"query":"대전 테미오래 운영시간",'
+            '"required_terms":["테미오래"]}]'
+        ),
         "test-model",
         _NoSourceSearchTool(),
         local_planning_allowed=True,
@@ -333,3 +394,139 @@ def test_search_content_without_source_url_fails_closed():
     assert result.success is False
     assert result.sources == ()
     assert "확인하지 못했어" in result.error
+
+
+def test_query_planner_creates_structured_requirements():
+    engine = _FakeEngine(
+        '[{"id":"R1","kind":"official",'
+        '"query":"대전 테미오래 공식 운영시간 접근",'
+        '"required_terms":["대전","테미오래"]},'
+        '{"id":"R2","kind":"food",'
+        '"query":"대전 테미오래 근처 한식 맛집",'
+        '"required_terms":["대전","한식"]},'
+        '{"id":"R3","kind":"shops",'
+        '"query":"대전 테미오래 주변 소품샵 여러 곳",'
+        '"required_terms":["대전","소품샵"]}]'
+    )
+
+    result = AutoSearchPreflight(
+        engine,
+        "test-model",
+        _FakeSearchTool(),
+        local_planning_allowed=True,
+    ).prepare("인터넷에서 대전 테미오래 일정을 찾아줘")
+
+    assert result.requirements == (
+        SearchRequirement(
+            "R1",
+            "official",
+            "대전 테미오래 공식 운영시간 접근",
+            ("대전", "테미오래"),
+        ),
+        SearchRequirement(
+            "R2",
+            "food",
+            "대전 테미오래 근처 한식 맛집",
+            ("대전", "한식"),
+        ),
+        SearchRequirement(
+            "R3",
+            "shops",
+            "대전 테미오래 주변 소품샵 여러 곳",
+            ("대전", "소품샵"),
+        ),
+    )
+
+
+def test_only_unmet_requirement_is_retried_with_public_context():
+    raw_request = (
+        "여친을 픽업해서 대전 테미오래와 한식 맛집, 소품샵을 찾아줘"
+    )
+    engine = _SequencedEngine(
+        [
+            '[{"id":"R1","kind":"official",'
+            '"query":"대전 테미오래 공식 운영시간 접근",'
+            '"required_terms":["대전","테미오래"]},'
+            '{"id":"R2","kind":"food",'
+            '"query":"대전 테미오래 근처 한식 맛집",'
+            '"required_terms":["대전","한식"]},'
+            '{"id":"R3","kind":"shops",'
+            '"query":"대전 테미오래 주변 소품샵 여러 곳",'
+            '"required_terms":["대전","소품샵"]}]',
+            '{"query":"대전 테미오래 인근 소품샵 모음 대흥동 은행동"}',
+        ]
+    )
+    search_tool = _QuerySearchTool(
+        {
+            "대전 테미오래 공식 운영시간 접근": (
+                "### 테미오래 공식 누리집\n"
+                "Source: https://temiorae.com/\n"
+                "Summary: 대전 테미오래 운영시간과 관람 안내"
+            ),
+            "대전 테미오래 근처 한식 맛집": (
+                "### 대전 한식 맛집\n"
+                "Source: https://www.diningcode.com/daejeon\n"
+                "Summary: 대전 지역 한식 식당 목록"
+            ),
+            "대전 테미오래 주변 소품샵 여러 곳": (
+                "### 서울 소품샵\n"
+                "Source: https://example.com/seoul\n"
+                "Summary: 서울 상점 목록"
+            ),
+            "대전 테미오래 인근 소품샵 모음 대흥동 은행동": (
+                "### 대전 소품샵 모음\n"
+                "Source: https://example.com/daejeon-shops\n"
+                "Summary: 대전 대흥동 소품샵 여러 곳"
+            ),
+        }
+    )
+
+    result = AutoSearchPreflight(
+        engine,
+        "test-model",
+        search_tool,
+        local_planning_allowed=True,
+    ).prepare(raw_request)
+
+    assert result.success is True
+    assert search_tool.queries == [
+        "대전 테미오래 공식 운영시간 접근",
+        "대전 테미오래 근처 한식 맛집",
+        "대전 테미오래 주변 소품샵 여러 곳",
+        "대전 테미오래 인근 소품샵 모음 대흥동 은행동",
+    ]
+    assert raw_request not in engine.inputs[1]
+    assert "여친" not in engine.inputs[1]
+
+
+def test_unmet_requirement_retries_only_once_when_retry_is_still_unrelated():
+    engine = _SequencedEngine(
+        [
+            '[{"id":"R1","kind":"shops","query":"대전 소품샵",'
+            '"required_terms":["대전","소품샵"]}]',
+            '{"query":"대전 소품 상점 모음"}',
+        ]
+    )
+    search_tool = _QuerySearchTool(
+        {
+            "대전 소품샵": (
+                "### 부산 소품샵\nSource: https://example.com/one\n"
+                "Summary: 부산 소품샵"
+            ),
+            "대전 소품 상점 모음": (
+                "### 서울 상점\nSource: https://example.com/two\n"
+                "Summary: 서울 상점"
+            ),
+        }
+    )
+
+    result = AutoSearchPreflight(
+        engine,
+        "test-model",
+        search_tool,
+        local_planning_allowed=True,
+    ).prepare("대전 소품샵을 찾아줘")
+
+    assert result.success is True
+    assert search_tool.queries == ["대전 소품샵", "대전 소품 상점 모음"]
+    assert len(engine.inputs) == 2
