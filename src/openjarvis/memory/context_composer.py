@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from openjarvis.memory.archive import PersonalMemoryArchive
@@ -138,20 +139,32 @@ def compose_configured_personal_context(
     personal = getattr(config, "personal_memory", None)
     if personal is None or not getattr(personal, "enabled", False):
         return None
-    if getattr(personal, "mode", "active") != "active":
+    mode = getattr(personal, "mode", "active")
+    if mode == "off":
         return None
     if not is_local_personal_memory_engine(config, engine_key):
         return None
     selected_archive = archive or PersonalMemoryArchive(
         getattr(personal, "archive_path", "")
     )
-    return ContextComposer(
+    started = time.perf_counter()
+    context = ContextComposer(
         selected_archive,
         max_constraints=getattr(personal, "context_constraints", 5),
         max_schemas=getattr(personal, "context_schemas", 8),
         max_episodes=getattr(personal, "context_episodes", 5),
         max_raw_evidence=getattr(personal, "context_raw_evidence", 3),
     ).compose(current_user_text)
+    if mode == "shadow":
+        selected_archive.record_shadow_composition(
+            latency_ms=(time.perf_counter() - started) * 1000,
+            constraint_count=len(context.constraints),
+            schema_count=len(context.schemas),
+            episode_count=len(context.episodes),
+            raw_evidence_count=len(context.raw_evidence),
+        )
+        return None
+    return context
 
 
 __all__ = [

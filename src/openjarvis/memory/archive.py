@@ -434,6 +434,93 @@ class PersonalMemoryArchive:
             row = connection.execute("PRAGMA integrity_check").fetchone()
         return str(row[0]) if row is not None else "unknown"
 
+    def get_metadata(self, key: str, default: str = "") -> str:
+        """Read one non-sensitive archive control value."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM archive_metadata WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return str(row["value"]) if row is not None else default
+
+    def set_metadata(self, key: str, value: str) -> None:
+        """Persist one non-sensitive archive control value."""
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO archive_metadata(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+
+    def record_shadow_composition(
+        self,
+        *,
+        latency_ms: float,
+        constraint_count: int,
+        schema_count: int,
+        episode_count: int,
+        raw_evidence_count: int,
+    ) -> None:
+        """Store aggregate shadow counters without retaining prompt text."""
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT value FROM archive_metadata WHERE key = 'shadow_metrics'"
+            ).fetchone()
+            try:
+                metrics = json.loads(str(row["value"])) if row is not None else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metrics = {}
+            metrics["compositions"] = int(metrics.get("compositions", 0)) + 1
+            metrics["latency_ms_total"] = float(
+                metrics.get("latency_ms_total", 0.0)
+            ) + max(0.0, float(latency_ms))
+            metrics["latency_ms_max"] = max(
+                float(metrics.get("latency_ms_max", 0.0)),
+                max(0.0, float(latency_ms)),
+            )
+            metrics["constraint_items"] = int(
+                metrics.get("constraint_items", 0)
+            ) + max(0, int(constraint_count))
+            metrics["schema_items"] = int(metrics.get("schema_items", 0)) + max(
+                0, int(schema_count)
+            )
+            metrics["episode_items"] = int(
+                metrics.get("episode_items", 0)
+            ) + max(0, int(episode_count))
+            metrics["raw_evidence_items"] = int(
+                metrics.get("raw_evidence_items", 0)
+            ) + max(0, int(raw_evidence_count))
+            payload = json.dumps(metrics, sort_keys=True, separators=(",", ":"))
+            connection.execute(
+                """
+                INSERT INTO archive_metadata(key, value)
+                VALUES ('shadow_metrics', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (payload,),
+            )
+            connection.execute(
+                """
+                INSERT INTO archive_metadata(key, value)
+                VALUES ('shadow_started_at', ?)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (str(now),),
+            )
+
+    def shadow_metrics(self) -> dict[str, int | float]:
+        """Return aggregate comparison counters only."""
+        raw = self.get_metadata("shadow_metrics", "{}")
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
     def record_exchange(
         self,
         *,

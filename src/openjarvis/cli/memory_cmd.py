@@ -338,6 +338,45 @@ def personal_delete_all(confirm_token: str) -> None:
     Console().print(f"[green]Deleted {sum(removed.values())} rows.[/green]")
 
 
+@memory.command(name="personal-import-legacy")
+@click.option("--path", "legacy_path", default=None)
+@click.option("--backup/--no-backup", default=True)
+def personal_import_legacy(legacy_path: str | None, backup: bool) -> None:
+    """Stage legacy facts as low-trust candidates, with a backup by default."""
+    from openjarvis.memory.legacy_import import LegacyFactImporter
+
+    config = load_config()
+    source = Path(legacy_path or config.memory.facts_path).expanduser()
+    importer = LegacyFactImporter(_get_personal_inspector().archive)
+    backup_path = importer.backup(source) if backup else None
+    result = importer.run(source)
+    console = Console()
+    if backup_path is not None:
+        console.print(f"[green]Backup:[/green] {backup_path}")
+    console.print(
+        f"[green]Imported {result.imported}; skipped {result.skipped}.[/green]"
+    )
+
+
+@memory.command(name="personal-rollout-status")
+@click.option("--backup-path", required=True)
+@click.option("--manual-override", is_flag=True, default=False)
+def personal_rollout_status(backup_path: str, manual_override: bool) -> None:
+    """Check whether legacy prompt injection may be disabled safely."""
+    from openjarvis.memory.legacy_import import evaluate_rollout_readiness
+
+    inspector = _get_personal_inspector()
+    result = evaluate_rollout_readiness(
+        inspector.archive,
+        backup_path=backup_path,
+        manual_override=manual_override,
+    )
+    if not result.ready:
+        failures = ", ".join(result.failing_gates)
+        raise click.ClickException(f"Rollout gates failed: {failures}")
+    Console().print("[green]Rollout gates passed.[/green]")
+
+
 @memory.command()
 @click.option(
     "--backend",

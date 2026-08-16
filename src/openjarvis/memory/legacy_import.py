@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,6 +23,14 @@ class LegacyImportResult:
 
     imported: int
     skipped: int
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutReadiness:
+    """Named gates that must pass before legacy prompt injection is disabled."""
+
+    ready: bool
+    failing_gates: tuple[str, ...]
 
 
 class LegacyFactImporter:
@@ -79,5 +89,48 @@ class LegacyFactImporter:
             imported += 1
         return LegacyImportResult(imported=imported, skipped=skipped)
 
+    @staticmethod
+    def backup(path: str | Path, destination: str | Path | None = None) -> Path:
+        """Create a recoverable copy before any legacy-memory transition."""
+        source = Path(path).expanduser()
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        target = (
+            Path(destination).expanduser()
+            if destination is not None
+            else source.with_name(f"{source.name}.backup-{int(time.time())}")
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        return target
 
-__all__ = ["LegacyFactImporter", "LegacyImportResult"]
+
+def evaluate_rollout_readiness(
+    archive: PersonalMemoryArchive,
+    *,
+    backup_path: str | Path | None,
+    manual_override: bool = False,
+    now: float | None = None,
+) -> RolloutReadiness:
+    """Require a backup and seven shadow days unless manually overridden."""
+    failures = []
+    backup = Path(backup_path).expanduser() if backup_path else None
+    if backup is None or not backup.is_file():
+        failures.append("legacy_backup_missing")
+    started_raw = archive.get_metadata("shadow_started_at", "0")
+    try:
+        started_at = float(started_raw)
+    except ValueError:
+        started_at = 0.0
+    elapsed = (time.time() if now is None else now) - started_at
+    if not manual_override and (started_at <= 0 or elapsed < 7 * 24 * 60 * 60):
+        failures.append("seven_shadow_days_incomplete")
+    return RolloutReadiness(not failures, tuple(failures))
+
+
+__all__ = [
+    "LegacyFactImporter",
+    "LegacyImportResult",
+    "RolloutReadiness",
+    "evaluate_rollout_readiness",
+]

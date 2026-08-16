@@ -177,6 +177,8 @@ def test_shadow_mode_never_injects_personal_context(tmp_path):
         )
         is None
     )
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    assert archive.shadow_metrics()["compositions"] == 1
 
 
 def test_confirmed_schema_is_rendered_with_conditions(tmp_path):
