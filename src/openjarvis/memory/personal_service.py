@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from openjarvis.core.events import Event, EventBus, EventType
 from openjarvis.memory.archive import PersonalMemoryArchive
@@ -14,11 +15,18 @@ from openjarvis.memory.candidate_extractor import (
     PersonalCandidateExtractor,
     is_local_personal_memory_engine,
 )
+from openjarvis.memory.evaluator import MemoryEvaluator
 from openjarvis.memory.personal_models import ConversationExchange
 from openjarvis.memory.service import publish_completed_exchange
 
 logger = logging.getLogger(__name__)
 _STOP = object()
+EXTRACT_CANDIDATES = "extract_candidates"
+EVALUATE_CANDIDATE = "evaluate_candidate"
+CHECK_CONSOLIDATION = "check_consolidation"
+REFLECT_CONFLICTS = "reflect_conflicts"
+VALIDATE_INSIGHT = "validate_insight"
+IMPORT_LEGACY = "import_legacy"
 
 
 class PersonalMemoryService:
@@ -31,10 +39,21 @@ class PersonalMemoryService:
         *,
         event_bus: EventBus | None = None,
         max_queue: int = 256,
+        evaluator: MemoryEvaluator | None = None,
+        chat_is_busy: Callable[[], bool] | None = None,
+        last_user_activity: Callable[[], float] | None = None,
+        idle_before_reflection_seconds: float = 30.0,
     ) -> None:
         self._archive = archive
         self._extractor = extractor
         self._event_bus = event_bus
+        self._evaluator = evaluator or MemoryEvaluator(archive)
+        self._chat_is_busy = chat_is_busy or (lambda: False)
+        self._last_user_activity = last_user_activity or (lambda: 0.0)
+        self._idle_before_reflection_seconds = max(
+            0.0,
+            float(idle_before_reflection_seconds),
+        )
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, max_queue))
         self._max_queue = max(1, max_queue)
         self._queued_ids: set[str] = set()
@@ -56,6 +75,8 @@ class PersonalMemoryService:
     def start(self) -> None:
         """Start one worker and recover work interrupted by a prior shutdown."""
         if self._running.is_set():
+            return
+        if self._thread is not None and self._thread.is_alive():
             return
         self._running.set()
         self._archive.release_in_progress_jobs()
@@ -84,7 +105,7 @@ class PersonalMemoryService:
         if thread is None or not thread.is_alive():
             with self._queue_lock:
                 self._queued_ids.clear()
-        self._thread = None
+            self._thread = None
         self._unsubscribe_events()
         logger.debug("Personal memory service stopped")
 
@@ -112,14 +133,24 @@ class PersonalMemoryService:
         """Schedule a durable exchange without blocking the chat response path."""
         if not self._running.is_set() or not exchange_id:
             return False
+        job = self._archive.enqueue_job(
+            job_type=EXTRACT_CANDIDATES,
+            subject_id=exchange_id,
+            idempotency_key=f"{EXTRACT_CANDIDATES}:{exchange_id}",
+            priority=100,
+        )
+        return self._enqueue_job(job.id)
+
+    def _enqueue_job(self, job_id: str) -> bool:
+        """Place a durable job ID in the bounded in-memory wake-up queue."""
         with self._queue_lock:
-            if exchange_id in self._queued_ids:
+            if job_id in self._queued_ids:
                 return True
             try:
-                self._queue.put_nowait(exchange_id)
+                self._queue.put_nowait(job_id)
             except queue.Full:
                 return False
-            self._queued_ids.add(exchange_id)
+            self._queued_ids.add(job_id)
         return True
 
     def _subscribe_events(self) -> None:
@@ -151,7 +182,14 @@ class PersonalMemoryService:
         if not self._running.is_set():
             return
         for exchange_id in self._archive.pending_exchange_ids(limit=self._max_queue):
-            if not self.enqueue_exchange(exchange_id):
+            self._archive.enqueue_job(
+                job_type=EXTRACT_CANDIDATES,
+                subject_id=exchange_id,
+                idempotency_key=f"{EXTRACT_CANDIDATES}:{exchange_id}",
+                priority=100,
+            )
+        for job_id in self._archive.pending_job_ids(limit=self._max_queue):
+            if not self._enqueue_job(job_id):
                 break
 
     def _loop(self) -> None:
@@ -166,12 +204,22 @@ class PersonalMemoryService:
             if job is _STOP:
                 self._queue.task_done()
                 return
-            exchange_id = str(job)
+            job_id = str(job)
             with self._queue_lock:
-                self._queued_ids.discard(exchange_id)
+                self._queued_ids.discard(job_id)
+            claimed_job = None
             try:
-                exchange = self._archive.claim_candidate_job(exchange_id)
-                if exchange is not None:
+                claimed_job = self._archive.claim_job(job_id)
+                if claimed_job is None:
+                    continue
+                if self._should_defer(claimed_job.job_type):
+                    self._archive.defer_job(claimed_job.id, retry_after=1.0)
+                    continue
+                if claimed_job.job_type == EXTRACT_CANDIDATES:
+                    exchange = self._archive.claim_candidate_job(claimed_job.subject_id)
+                    if exchange is None:
+                        self._archive.complete_job(claimed_job.id)
+                        continue
                     drafts = self._extractor.extract(exchange)
                     error_code = str(
                         getattr(self._extractor, "last_error_code", "") or ""
@@ -179,6 +227,11 @@ class PersonalMemoryService:
                     if error_code:
                         self._archive.fail_candidate_job(
                             exchange.id,
+                            error_code=error_code,
+                            retry_after=None,
+                        )
+                        self._archive.fail_job(
+                            claimed_job.id,
                             error_code=error_code,
                             retry_after=None,
                         )
@@ -190,27 +243,63 @@ class PersonalMemoryService:
                             },
                         )
                     else:
-                        self._archive.complete_candidate_job(
+                        candidates = self._archive.complete_candidate_job(
                             exchange.id,
                             drafts,
                             engine_id=getattr(self._extractor, "engine_id", "local"),
-                            extractor_version="personal-memory-v1",
+                            extractor_version="personal-memory-v2",
                         )
+                        for candidate in candidates:
+                            evaluation_job = self._archive.enqueue_job(
+                                job_type=EVALUATE_CANDIDATE,
+                                subject_id=candidate.id,
+                                idempotency_key=(
+                                    f"{EVALUATE_CANDIDATE}:{candidate.id}"
+                                ),
+                                priority=90,
+                            )
+                            self._enqueue_job(evaluation_job.id)
+                        self._archive.complete_job(claimed_job.id)
+                elif claimed_job.job_type == EVALUATE_CANDIDATE:
+                    self._evaluator.evaluate(claimed_job.subject_id)
+                    self._archive.complete_job(claimed_job.id)
+                else:
+                    self._archive.fail_job(
+                        claimed_job.id,
+                        error_code="unsupported_job_type",
+                        retry_after=60.0,
+                    )
             except Exception:  # noqa: BLE001 - a failed job must remain retryable
-                self._archive.fail_candidate_job(
-                    exchange_id,
-                    error_code="extract_failed",
-                    retry_after=None,
-                )
+                if claimed_job is not None:
+                    if claimed_job.job_type == EXTRACT_CANDIDATES:
+                        self._archive.fail_candidate_job(
+                            claimed_job.subject_id,
+                            error_code="extract_failed",
+                            retry_after=None,
+                        )
+                    self._archive.fail_job(
+                        claimed_job.id,
+                        error_code="job_failed",
+                        retry_after=None,
+                    )
                 logger.warning(
-                    "Personal memory candidate job failed",
-                    extra={"exchange_id": exchange_id},
+                    "Personal memory job failed",
+                    extra={"job_id": job_id},
                 )
             finally:
                 self._queue.task_done()
             self._refill_queue()
             if not self._running.is_set() and self._queue.empty():
                 return
+
+    def _should_defer(self, job_type: str) -> bool:
+        heavy_jobs = {CHECK_CONSOLIDATION, REFLECT_CONFLICTS, VALIDATE_INSIGHT}
+        if job_type not in heavy_jobs:
+            return False
+        if self._chat_is_busy():
+            return True
+        idle_for = time.time() - float(self._last_user_activity())
+        return idle_for < self._idle_before_reflection_seconds
 
 
 def build_personal_memory_service(
@@ -241,6 +330,11 @@ def build_personal_memory_service(
         extractor,
         event_bus=event_bus,
         max_queue=getattr(personal, "max_queue", 256),
+        idle_before_reflection_seconds=getattr(
+            personal,
+            "idle_before_reflection_seconds",
+            30.0,
+        ),
     )
 
 
@@ -289,7 +383,13 @@ def record_and_publish_completed_exchange(
 
 
 __all__ = [
+    "CHECK_CONSOLIDATION",
+    "EVALUATE_CANDIDATE",
+    "EXTRACT_CANDIDATES",
+    "IMPORT_LEGACY",
     "PersonalMemoryService",
+    "REFLECT_CONFLICTS",
+    "VALIDATE_INSIGHT",
     "build_personal_memory_service",
     "record_and_publish_completed_exchange",
 ]

@@ -99,6 +99,7 @@ class MemoryJobState(str, Enum):
     PENDING = "pending"
     PROCESSING = "processing"
     FAILED = "failed"
+    DEFERRED = "deferred"
     COMPLETE = "complete"
 
 

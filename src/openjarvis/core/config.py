@@ -968,6 +968,14 @@ class PersonalMemoryConfig:
     )
     extraction_model: str = ""
     max_queue: int = 256
+    worker_concurrency: int = 1
+    idle_before_reflection_seconds: float = 30.0
+    max_evidence_per_job: int = 12
+    external_reflection_mode: str = "ask"
+    context_constraints: int = 5
+    context_schemas: int = 8
+    context_episodes: int = 5
+    context_raw_evidence: int = 3
 
 
 @dataclass(slots=True)
@@ -2098,6 +2106,9 @@ max_facts = 1000              # cap on stored facts
 enabled = false
 # extraction_model = ""       # empty = active local model
 # max_queue = 256
+# idle_before_reflection_seconds = 30.0
+# max_evidence_per_job = 12
+# external_reflection_mode = "ask"
 
 [tools.mcp]
 enabled = true

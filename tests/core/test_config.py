@@ -51,6 +51,14 @@ class TestDefaults:
         assert cfg.personal_memory.enabled is False
         assert cfg.personal_memory.archive_path.endswith("personal_memory.db")
         assert cfg.personal_memory.max_queue == 256
+        assert cfg.personal_memory.worker_concurrency == 1
+        assert cfg.personal_memory.idle_before_reflection_seconds == 30.0
+        assert cfg.personal_memory.max_evidence_per_job == 12
+        assert cfg.personal_memory.external_reflection_mode == "ask"
+        assert cfg.personal_memory.context_constraints == 5
+        assert cfg.personal_memory.context_schemas == 8
+        assert cfg.personal_memory.context_episodes == 5
+        assert cfg.personal_memory.context_raw_evidence == 3
 
 
 class TestRecommendEngine:

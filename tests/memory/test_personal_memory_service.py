@@ -52,6 +52,15 @@ def _candidate_job_state(archive, exchange_id: str) -> str:
     return row[0] if row is not None else ""
 
 
+def _memory_job_state(archive, subject_id: str) -> str:
+    with sqlite3.connect(archive.path) as connection:
+        row = connection.execute(
+            "SELECT state FROM memory_jobs WHERE subject_id = ?",
+            (subject_id,),
+        ).fetchone()
+    return row[0] if row is not None else ""
+
+
 def _service_api():
     try:
         from openjarvis.memory.archive import PersonalMemoryArchive
@@ -72,13 +81,21 @@ def _service_api():
     )
 
 
-def _service(tmp_path: Path, bus: EventBus, extractor, *, max_queue: int = 8):
+def _service(
+    tmp_path: Path,
+    bus: EventBus,
+    extractor,
+    *,
+    max_queue: int = 8,
+    **kwargs,
+):
     PersonalMemoryArchive, _, PersonalMemoryService, _, _ = _service_api()
     return PersonalMemoryService(
         PersonalMemoryArchive(tmp_path / "personal.db"),
         extractor,
         event_bus=bus,
         max_queue=max_queue,
+        **kwargs,
     )
 
 
@@ -183,6 +200,7 @@ def test_invalid_candidate_output_remains_failed_without_a_hot_retry_loop(tmp_pa
             time.sleep(0.01)
 
         assert _candidate_job_state(service.archive, exchange.id) == "failed"
+        assert _memory_job_state(service.archive, exchange.id) == "failed"
         assert extractor.second_call.wait(timeout=0.1) is False
     finally:
         service.stop()
@@ -208,3 +226,101 @@ def test_cloud_engine_cannot_build_a_personal_memory_service(tmp_path):
         )
         is None
     )
+
+
+def test_extraction_is_followed_by_durable_candidate_evaluation(tmp_path):
+    """Stopping after extraction would leave an explicit rule unusable forever."""
+    _, CandidateDraft, _, _, _ = _service_api()
+    bus = EventBus()
+    service = _service(
+        tmp_path,
+        bus,
+        _FakeExtractor(
+            [
+                CandidateDraft(
+                    "constraint",
+                    "Do not mention timers unless I ask.",
+                    1.0,
+                    1.0,
+                    temporal_scope="until_changed",
+                    subject="topic:timers",
+                )
+            ]
+        ),
+    )
+    service.start()
+    try:
+        exchange = service.archive_exchange(
+            user_text="Do not mention timers unless I ask.",
+            assistant_text="Understood.",
+            source="test",
+        )
+        assert service.enqueue_exchange(exchange.id) is True
+        deadline = time.time() + 2.0
+        claims = []
+        while time.time() < deadline:
+            claims = service.archive.get_active_claims()
+            if claims:
+                break
+            time.sleep(0.01)
+
+        assert len(claims) == 1
+        assert claims[0].kind == "constraint"
+        assert claims[0].content == "Do not mention timers unless I ask."
+    finally:
+        service.stop()
+
+
+def test_stopping_during_a_slow_job_does_not_allow_a_second_worker(tmp_path):
+    """A timed-out stop must not permit overlapping local model calls on restart."""
+    gate = threading.Event()
+    extractor = _FakeExtractor(gate=gate)
+    service = _service(tmp_path, EventBus(), extractor)
+    service.start()
+    exchange = service.archive_exchange(
+        user_text="slow memory",
+        assistant_text="reply",
+        source="test",
+    )
+    assert service.enqueue_exchange(exchange.id) is True
+    assert extractor.started.wait(timeout=1.0)
+
+    service.stop(timeout=0.01)
+    original_thread = service._thread
+    service.start()
+
+    assert service._thread is original_thread
+    gate.set()
+    original_thread.join(timeout=1.0)
+
+
+def test_chat_busy_defers_reflection_without_running_the_extractor(tmp_path):
+    """Heavy reflection work must yield while the user is actively chatting."""
+    extractor = _FakeExtractor()
+    service = _service(
+        tmp_path,
+        EventBus(),
+        extractor,
+        chat_is_busy=lambda: True,
+        last_user_activity=lambda: time.time(),
+        idle_before_reflection_seconds=30.0,
+    )
+    job = service.archive.enqueue_job(
+        job_type="reflect_conflicts",
+        subject_id="schema-1",
+        idempotency_key="reflect_conflicts:schema-1:v1",
+    )
+
+    service.start()
+    try:
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            state = service.archive.get_job(job.id).state
+            if state == "deferred":
+                break
+            time.sleep(0.01)
+
+        assert service.archive.get_job(job.id).state == "deferred"
+        assert extractor.started.is_set() is False
+    finally:
+        service.stop()

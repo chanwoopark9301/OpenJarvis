@@ -947,12 +947,46 @@ class PersonalMemoryArchive:
                 SELECT id FROM memory_jobs
                 WHERE state = 'pending'
                    OR (state = 'failed' AND next_attempt_at <= ?)
+                   OR (state = 'deferred' AND next_attempt_at <= ?)
                 ORDER BY priority DESC, created_at ASC, id ASC
                 LIMIT ?
                 """,
-                (now, count),
+                (now, now, count),
             ).fetchall()
         return [str(row["id"]) for row in rows]
+
+    def get_job(self, job_id: str) -> MemoryJob | None:
+        """Return one durable job in any lifecycle state."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM memory_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._job_from_row(row) if row is not None else None
+
+    def claim_job(self, job_id: str) -> MemoryJob | None:
+        """Atomically claim a specific queued job after an in-memory wake-up."""
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE memory_jobs
+                SET state = 'processing', attempts = attempts + 1,
+                    error_code = '', claimed_at = ?, next_attempt_at = 0,
+                    updated_at = ?
+                WHERE id = ? AND (
+                  state = 'pending'
+                  OR (state = 'failed' AND next_attempt_at <= ?)
+                  OR (state = 'deferred' AND next_attempt_at <= ?)
+                )
+                """,
+                (now, now, job_id, now, now),
+            )
+            if updated.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM memory_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._job_from_row(row) if row is not None else None
 
     def claim_next_job(
         self,
@@ -964,7 +998,7 @@ class PersonalMemoryArchive:
         allowed = tuple(str(value).strip() for value in (job_types or ()) if value)
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            params: list[Any] = [now]
+            params: list[Any] = [now, now]
             type_clause = ""
             if allowed:
                 placeholders = ",".join("?" for _ in allowed)
@@ -974,7 +1008,8 @@ class PersonalMemoryArchive:
                 f"""
                 SELECT id FROM memory_jobs
                 WHERE (state = 'pending'
-                   OR (state = 'failed' AND next_attempt_at <= ?))
+                   OR (state = 'failed' AND next_attempt_at <= ?)
+                   OR (state = 'deferred' AND next_attempt_at <= ?))
                   {type_clause}
                 ORDER BY priority DESC, created_at ASC, id ASC
                 LIMIT 1
@@ -990,7 +1025,7 @@ class PersonalMemoryArchive:
                 SET state = 'processing', attempts = attempts + 1,
                     error_code = '', claimed_at = ?, next_attempt_at = 0,
                     updated_at = ?
-                WHERE id = ? AND state IN ('pending', 'failed')
+                WHERE id = ? AND state IN ('pending', 'failed', 'deferred')
                 """,
                 (now, now, job_id),
             )
@@ -1013,6 +1048,20 @@ class PersonalMemoryArchive:
                 WHERE id = ? AND state = 'processing'
                 """,
                 (now, job_id),
+            )
+
+    def defer_job(self, job_id: str, *, retry_after: float = 1.0) -> None:
+        """Yield heavy work without recording a failure or hot-looping."""
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE memory_jobs
+                SET state = 'deferred', error_code = '', claimed_at = 0,
+                    next_attempt_at = ?, updated_at = ?
+                WHERE id = ? AND state = 'processing'
+                """,
+                (now + max(0.1, float(retry_after)), now, job_id),
             )
 
     def fail_job(
