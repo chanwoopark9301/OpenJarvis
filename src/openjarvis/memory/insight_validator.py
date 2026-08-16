@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Set
+from typing import TYPE_CHECKING, Set
 
 from openjarvis.memory.reflection import ReflectionProposal
+
+if TYPE_CHECKING:
+    from openjarvis.memory.archive import PersonalMemoryArchive
+    from openjarvis.memory.personal_models import PersonalSchema
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +75,41 @@ class InsightValidator:
             overgeneralized=overgeneralized,
             user_confirmation=user_confirmation,
             may_enter_probation=may_enter_probation,
+        )
+
+    def accommodate(
+        self,
+        archive: PersonalMemoryArchive,
+        proposal: ReflectionProposal,
+        *,
+        available_evidence_ids: Set[str] | set[str],
+        conflict_evidence_ids: Set[str] | set[str],
+        user_relevant: bool,
+        broad_interpretation: bool,
+        user_confirmation: str = "pending",
+        target_schema_id: str = "",
+    ) -> PersonalSchema | None:
+        """Persist one validated accommodation or leave all schema state unchanged."""
+        result = self.validate(
+            proposal,
+            available_evidence_ids=available_evidence_ids,
+            conflict_evidence_ids=conflict_evidence_ids,
+            user_relevant=user_relevant,
+            broad_interpretation=broad_interpretation,
+            user_confirmation=user_confirmation,
+        )
+        if not result.may_enter_probation:
+            return None
+        return archive.apply_schema_accommodation(
+            content=proposal.content,
+            operation=proposal.operation,
+            support_evidence_ids=proposal.support_evidence_ids,
+            counter_evidence_ids=proposal.counter_evidence_ids,
+            conditions=proposal.uncertainties,
+            subject_scope=proposal.scope,
+            broad_interpretation=broad_interpretation,
+            user_confirmed=user_confirmation == "confirmed",
+            target_schema_id=target_schema_id,
         )
 
 

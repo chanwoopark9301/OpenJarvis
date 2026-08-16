@@ -8,7 +8,11 @@ from openjarvis.memory.context_composer import (
     compose_configured_personal_context,
 )
 from openjarvis.memory.evaluator import MemoryEvaluator
-from openjarvis.memory.personal_models import CandidateDraft, CandidateKind
+from openjarvis.memory.personal_models import (
+    AdaptationOperation,
+    CandidateDraft,
+    CandidateKind,
+)
 
 
 def _accept_claim(
@@ -172,4 +176,35 @@ def test_shadow_mode_never_injects_personal_context(tmp_path):
             engine_key="ollama",
         )
         is None
+    )
+
+
+def test_confirmed_schema_is_rendered_with_conditions(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    for index in range(3):
+        _accept_claim(
+            archive,
+            index=index,
+            kind=CandidateKind.FACT,
+            content=f"Running experience {index} improved my mood.",
+        )
+    evidence_ids = tuple(
+        evidence_id
+        for claim in archive.get_active_claims()
+        for evidence_id in claim.evidence_ids
+    )
+    schema = archive.apply_schema_accommodation(
+        content="Running often improves my mood.",
+        operation=AdaptationOperation.ACCOMMODATE_CREATE,
+        support_evidence_ids=evidence_ids,
+        conditions=("when fatigue is manageable",),
+        subject_scope="running_and_mood",
+        user_confirmed=True,
+    )
+    assert schema is not None
+
+    context = ContextComposer(archive).compose("How has running felt?")
+
+    assert context.schemas == (
+        "Running often improves my mood. (conditions: when fatigue is manageable)",
     )

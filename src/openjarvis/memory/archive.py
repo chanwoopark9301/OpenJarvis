@@ -17,10 +17,13 @@ from openjarvis.memory.personal_models import (
     CandidateKind,
     ClaimState,
     ConversationExchange,
+    EvidenceMass,
     EvidenceSource,
     MemoryCandidate,
     MemoryJob,
     PersonalClaim,
+    PersonalSchema,
+    SchemaMaturity,
 )
 
 _SCHEMA_VERSION = 2
@@ -949,6 +952,246 @@ class PersonalMemoryArchive:
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 "SELECT COUNT(*) AS count FROM personal_schemas WHERE state = 'active'"
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def get_active_schemas(self) -> list[PersonalSchema]:
+        """Return response-eligible stable schemas with their current versions."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT s.*, v.content AS version_content, v.conditions_json,
+                       v.support_mass, v.counter_mass, v.stability, v.plasticity,
+                       v.scope_fit, v.source_quality, v.temporal_validity
+                FROM personal_schemas AS s
+                JOIN schema_versions AS v ON v.id = s.current_version_id
+                WHERE s.state = 'active'
+                  AND s.maturity NOT IN ('tentative', 'challenged', 'retired')
+                  AND (s.maturity = 'stable' OR s.user_confirmed = 1)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM schema_conflicts AS c
+                    WHERE c.schema_id = s.id
+                      AND c.resolution_state = 'unresolved'
+                  )
+                ORDER BY s.updated_at DESC, s.id ASC
+                """
+            ).fetchall()
+        schemas = []
+        for row in rows:
+            schemas.append(
+                PersonalSchema(
+                    id=str(row["id"]),
+                    content=str(row["version_content"]),
+                    maturity=SchemaMaturity(str(row["maturity"])),
+                    state=ClaimState(str(row["state"])),
+                    current_version_id=str(row["current_version_id"]),
+                    evidence_mass=EvidenceMass(
+                        support_mass=float(row["support_mass"]),
+                        counter_mass=float(row["counter_mass"]),
+                        stability=float(row["stability"]),
+                        plasticity=float(row["plasticity"]),
+                        scope_fit=float(row["scope_fit"]),
+                        source_quality=float(row["source_quality"]),
+                        temporal_validity=float(row["temporal_validity"]),
+                    ),
+                    created_at=float(row["created_at"]),
+                    updated_at=float(row["updated_at"]),
+                    conditions=tuple(json.loads(str(row["conditions_json"]))),
+                    subject_scope=str(row["subject_scope"]),
+                    broad_interpretation=bool(row["broad_interpretation"]),
+                    user_confirmed=bool(row["user_confirmed"]),
+                )
+            )
+        return schemas
+
+    def apply_schema_accommodation(
+        self,
+        *,
+        content: str,
+        operation: AdaptationOperation | str,
+        support_evidence_ids: Sequence[str],
+        counter_evidence_ids: Sequence[str] = (),
+        conditions: Sequence[str] = (),
+        subject_scope: str = "user",
+        broad_interpretation: bool = False,
+        user_confirmed: bool = False,
+        target_schema_id: str = "",
+    ) -> PersonalSchema | None:
+        """Atomically create or version one evidence-grounded schema."""
+        resolved = AdaptationOperation(operation)
+        allowed = {
+            AdaptationOperation.ACCOMMODATE_CREATE,
+            AdaptationOperation.ACCOMMODATE_REFINE,
+            AdaptationOperation.ACCOMMODATE_SPLIT,
+            AdaptationOperation.ACCOMMODATE_SUPERSEDE,
+        }
+        if resolved not in allowed or not support_evidence_ids:
+            return None
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cited_ids = tuple(
+                dict.fromkeys((*support_evidence_ids, *counter_evidence_ids))
+            )
+            placeholders = ",".join("?" for _ in cited_ids)
+            existing = connection.execute(
+                f"SELECT id FROM evidence_items WHERE id IN ({placeholders})",
+                cited_ids,
+            ).fetchall()
+            if {str(row["id"]) for row in existing} != set(cited_ids):
+                return None
+
+            create_new = resolved in {
+                AdaptationOperation.ACCOMMODATE_CREATE,
+                AdaptationOperation.ACCOMMODATE_SPLIT,
+                AdaptationOperation.ACCOMMODATE_SUPERSEDE,
+            }
+            if not create_new:
+                target = connection.execute(
+                    "SELECT * FROM personal_schemas WHERE id = ? AND state = 'active'",
+                    (target_schema_id,),
+                ).fetchone()
+                if target is None:
+                    return None
+                schema_id = target_schema_id
+                version_number = int(
+                    connection.execute(
+                        """
+                        SELECT COALESCE(MAX(version_number), 0) + 1 AS number
+                        FROM schema_versions WHERE schema_id = ?
+                        """,
+                        (schema_id,),
+                    ).fetchone()["number"]
+                )
+            else:
+                schema_id = str(uuid.uuid4())
+                version_number = 1
+                maturity = (
+                    SchemaMaturity.STABLE
+                    if user_confirmed
+                    else SchemaMaturity.EMERGING
+                )
+                connection.execute(
+                    """
+                    INSERT INTO personal_schemas (
+                      id, content, state, maturity, subject_scope,
+                      broad_interpretation, user_confirmed, created_at, updated_at
+                    ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        schema_id,
+                        content,
+                        maturity.value,
+                        subject_scope,
+                        int(broad_interpretation),
+                        int(user_confirmed),
+                        now,
+                        now,
+                    ),
+                )
+                if (
+                    resolved is AdaptationOperation.ACCOMMODATE_SUPERSEDE
+                    and target_schema_id
+                ):
+                    connection.execute(
+                        """
+                        UPDATE personal_schemas
+                        SET state = 'retired', maturity = 'retired', updated_at = ?
+                        WHERE id = ? AND state = 'active'
+                        """,
+                        (now, target_schema_id),
+                    )
+
+            version_id = str(uuid.uuid4())
+            support_mass = min(1.0, len(set(support_evidence_ids)) / 3.0)
+            counter_mass = min(1.0, len(set(counter_evidence_ids)) / 3.0)
+            connection.execute(
+                """
+                INSERT INTO schema_versions (
+                  id, schema_id, version_number, content, conditions_json,
+                  support_mass, counter_mass, stability, plasticity, scope_fit,
+                  source_quality, temporal_validity, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    version_id,
+                    schema_id,
+                    version_number,
+                    content,
+                    json.dumps(tuple(conditions), separators=(",", ":")),
+                    support_mass,
+                    counter_mass,
+                    1.0 if user_confirmed else 0.5,
+                    0.25 if user_confirmed else 0.75,
+                    1.0,
+                    1.0,
+                    1.0,
+                    now,
+                ),
+            )
+            for evidence_id in support_evidence_ids:
+                connection.execute(
+                    """
+                    INSERT INTO schema_evidence_links (
+                      schema_version_id, evidence_id, relation, created_at
+                    ) VALUES (?, ?, 'support', ?)
+                    """,
+                    (version_id, evidence_id, now),
+                )
+            for evidence_id in counter_evidence_ids:
+                connection.execute(
+                    """
+                    INSERT INTO schema_evidence_links (
+                      schema_version_id, evidence_id, relation, created_at
+                    ) VALUES (?, ?, 'counter', ?)
+                    """,
+                    (version_id, evidence_id, now),
+                )
+            connection.execute(
+                """
+                UPDATE personal_schemas
+                SET content = ?, current_version_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (content, version_id, now, schema_id),
+            )
+            if counter_evidence_ids:
+                counter_placeholders = ",".join("?" for _ in counter_evidence_ids)
+                connection.execute(
+                    f"""
+                    UPDATE schema_conflicts
+                    SET resolution_state = 'resolved', resolved_at = ?
+                    WHERE schema_id = ?
+                      AND evidence_id IN ({counter_placeholders})
+                    """,
+                    (now, target_schema_id or schema_id, *counter_evidence_ids),
+                )
+            connection.execute(
+                """
+                INSERT INTO memory_decisions (
+                  id, subject_id, subject_type, operation, reason_code,
+                  affected_ids_json, details_json, created_at
+                ) VALUES (?, ?, 'schema', ?, 'validated_insight', ?, '{}', ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    schema_id,
+                    resolved.value,
+                    json.dumps([version_id], separators=(",", ":")),
+                    now,
+                ),
+            )
+        return next(
+            (schema for schema in self.get_active_schemas() if schema.id == schema_id),
+            None,
+        )
+
+    def schema_version_count(self, schema_id: str) -> int:
+        """Return retained version count for accommodation tests and inspection."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM schema_versions WHERE schema_id = ?",
+                (schema_id,),
             ).fetchone()
         return int(row["count"]) if row is not None else 0
 

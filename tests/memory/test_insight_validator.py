@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from openjarvis.memory.archive import PersonalMemoryArchive
+from openjarvis.memory.evaluator import MemoryEvaluator
 from openjarvis.memory.insight_validator import InsightValidator
-from openjarvis.memory.personal_models import AdaptationOperation
+from openjarvis.memory.personal_models import (
+    AdaptationOperation,
+    CandidateDraft,
+    CandidateKind,
+)
 from openjarvis.memory.reflection import ReflectionProposal
 
 
@@ -83,3 +89,80 @@ def test_missing_counter_or_invented_provenance_blocks_insight():
     assert result.provenance_fidelity is False
     assert result.conflict_coverage is False
     assert result.may_enter_probation is False
+
+
+def _evidence_ids(archive: PersonalMemoryArchive) -> set[str]:
+    for index in range(3):
+        text = f"Exercise experience {index} improved my mood."
+        exchange_id = f"exchange-{index}"
+        archive.record_exchange(
+            exchange_id=exchange_id,
+            user_text=text,
+            assistant_text="",
+            source="test",
+            session_id=f"session-{index}",
+        )
+        assert archive.claim_candidate_job(exchange_id) is not None
+        candidate = archive.complete_candidate_job(
+            exchange_id,
+            [CandidateDraft(CandidateKind.FACT, text, 0.8, 0.9)],
+            engine_id="ollama",
+            extractor_version="test",
+        )[0]
+        assert MemoryEvaluator(archive).evaluate(candidate.id).applied
+    return {
+        evidence_id
+        for claim in archive.get_active_claims()
+        for evidence_id in claim.evidence_ids
+    }
+
+
+def test_validated_accommodation_retains_schema_versions(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    evidence_ids = _evidence_ids(archive)
+    support = tuple(sorted(evidence_ids))
+    create = ReflectionProposal(
+        content="Exercise often improves mood.",
+        operation=AdaptationOperation.ACCOMMODATE_CREATE,
+        scope="exercise_and_mood",
+        support_evidence_ids=support,
+        counter_evidence_ids=(),
+        uncertainties=(),
+        requires_user_confirmation=True,
+    )
+    validator = InsightValidator()
+
+    schema = validator.accommodate(
+        archive,
+        create,
+        available_evidence_ids=evidence_ids,
+        conflict_evidence_ids=set(),
+        user_relevant=True,
+        broad_interpretation=False,
+        user_confirmation="confirmed",
+    )
+    assert schema is not None
+    refine = ReflectionProposal(
+        content="Exercise improves mood when fatigue is manageable.",
+        operation=AdaptationOperation.ACCOMMODATE_REFINE,
+        scope="exercise_and_mood",
+        support_evidence_ids=support,
+        counter_evidence_ids=(),
+        uncertainties=("fatigue",),
+        requires_user_confirmation=True,
+    )
+    refined = validator.accommodate(
+        archive,
+        refine,
+        available_evidence_ids=evidence_ids,
+        conflict_evidence_ids=set(),
+        user_relevant=True,
+        broad_interpretation=False,
+        user_confirmation="confirmed",
+        target_schema_id=schema.id,
+    )
+
+    assert refined is not None
+    assert refined.id == schema.id
+    assert refined.content == refine.content
+    assert archive.schema_version_count(schema.id) == 2

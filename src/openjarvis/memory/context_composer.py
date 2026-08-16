@@ -97,15 +97,20 @@ class ContextComposer:
             and claim.temporal_scope != "current"
         )[: self.max_episodes]
 
-        # Schema and raw-evidence retrieval intentionally remain empty until their
-        # maturity and provenance query APIs can enforce the same safety boundary.
-        schemas: tuple[str, ...] = ()
+        schemas = tuple(
+            (
+                schema.content
+                if not schema.conditions
+                else f"{schema.content} (conditions: {', '.join(schema.conditions)})"
+            )
+            for schema in self.archive.get_active_schemas()
+        )[: self.max_schemas]
         raw_evidence: tuple[str, ...] = ()
         unresolved: tuple[str, ...] = ()
         sections = (
             ContextSection("direct_constraints", constraints),
             ContextSection("current_states", current_states),
-            ContextSection("schemas", schemas[: self.max_schemas]),
+            ContextSection("schemas", schemas),
             ContextSection("episodes", episodes),
             ContextSection("raw_evidence", raw_evidence[: self.max_raw_evidence]),
             ContextSection("unresolved", unresolved),
