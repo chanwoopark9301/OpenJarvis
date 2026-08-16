@@ -55,30 +55,63 @@ def _build_auto_search_preflight(config, engine, engine_key: str, model: str):
     )
 
 
-def _ground_search_answer(content: str, search_result) -> str:
-    """Fail closed when a generated search answer cites no fetched source."""
-    cited_sources = [
-        source for source in search_result.sources if source in content
-    ]
+def _safe_search_notice(search_result) -> str:
+    """Render a safe diagnostic when grounded answer generation fails."""
     source_lines = "\n".join(f"- {source}" for source in search_result.sources)
-    if not cited_sources:
-        query_lines = "\n".join(f"- {query}" for query in search_result.queries)
-        query_section = (
-            f"\n\n검색한 내용:\n{query_lines}" if query_lines else ""
-        )
-        return (
-            "인터넷 자료는 찾았지만, 만든 답변의 장소나 시간을 아래 출처와 "
-            "직접 연결해 확인하지 못했어. 확인되지 않은 내용은 보여주지 않을게."
-            f"{query_section}\n\n확인한 출처:\n{source_lines}"
-        )
+    query_lines = "\n".join(f"- {query}" for query in search_result.queries)
+    query_section = f"\n\n검색한 내용:\n{query_lines}" if query_lines else ""
+    return (
+        "인터넷 자료는 찾았지만, 만든 답변의 장소나 시간을 아래 출처와 "
+        "직접 연결해 확인하지 못했어. 확인되지 않은 내용은 보여주지 않을게."
+        f"{query_section}\n\n확인한 출처:\n{source_lines}"
+    )
 
-    uncited_sources = [
-        source for source in search_result.sources if source not in cited_sources
-    ]
-    if uncited_sources:
-        extra_lines = "\n".join(f"- {source}" for source in uncited_sources)
-        return f"{content}\n\n추가로 확인한 출처:\n{extra_lines}"
-    return content
+
+def _render_grounded_search_answer(content: str, search_result) -> str | None:
+    """Validate each itinerary item and render all usable steps."""
+    from openjarvis.cli._grounded_answer import (
+        parse_itinerary_json,
+        render_itinerary,
+        validate_itinerary,
+    )
+
+    try:
+        items = parse_itinerary_json(content)
+    except ValueError:
+        return None
+    if not items:
+        return None
+    validated = validate_itinerary(items, search_result.evidence)
+    return render_itinerary(validated, search_result.evidence)
+
+
+def _repair_grounded_json(
+    engine,
+    model: str,
+    content: str,
+    valid_source_ids: tuple[str, ...],
+) -> str:
+    """Ask the verified local engine once to repair malformed itinerary JSON."""
+    source_ids = ", ".join(valid_source_ids) or "none"
+    system_prompt = """Repair malformed itinerary output. Return only JSON with
+exactly one items array. Each item must contain string fields time, title, detail,
+venue, address, hours, status, check_before_visit and a string-list source_ids.
+Status must be confirmed, partial, or needs_check. Use only the allowed source IDs.
+Do not add facts or answer outside the JSON."""
+    user_prompt = f"Allowed source IDs: {source_ids}\n\nMalformed output:\n{content}"
+    try:
+        result = engine.generate(
+            [
+                Message(role=Role.SYSTEM, content=system_prompt),
+                Message(role=Role.USER, content=user_prompt),
+            ],
+            model=model,
+            temperature=0.0,
+            max_tokens=1200,
+        )
+    except Exception:  # noqa: BLE001 - repair is a single best-effort attempt
+        return ""
+    return result.get("content", "") if isinstance(result, dict) else str(result)
 
 
 @click.command()
@@ -416,9 +449,14 @@ def chat(
                 logger.debug("Failed to inject memory context", exc_info=True)
 
         if auto_search_result.success:
+            from openjarvis.cli._grounded_answer import build_itinerary_prompt
+
             search_context_message = Message(
                 role=Role.SYSTEM,
-                content=auto_search_result.context,
+                content=build_itinerary_prompt(
+                    user_input,
+                    auto_search_result.context,
+                ),
                 metadata={"external_search_context": True},
             )
             if agent is not None:
@@ -455,7 +493,26 @@ def chat(
                 )
 
             if auto_search_result.success:
-                content = _ground_search_answer(content, auto_search_result)
+                grounded_content = _render_grounded_search_answer(
+                    content,
+                    auto_search_result,
+                )
+                if grounded_content is None:
+                    repaired_content = _repair_grounded_json(
+                        engine,
+                        model,
+                        content,
+                        tuple(
+                            record.id for record in auto_search_result.evidence
+                        ),
+                    )
+                    grounded_content = _render_grounded_search_answer(
+                        repaired_content,
+                        auto_search_result,
+                    )
+                content = grounded_content or _safe_search_notice(
+                    auto_search_result
+                )
 
             history.append(Message(role=Role.ASSISTANT, content=content))
             console.print()
