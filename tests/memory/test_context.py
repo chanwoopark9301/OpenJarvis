@@ -361,3 +361,15 @@ def test_personal_context_alone_is_injected():
 
     assert augmented[0].role == Role.SYSTEM
     assert "Keep a companion role." in augmented[0].content
+
+
+def test_legacy_facts_can_be_disabled_after_rollout():
+    augmented = inject_context(
+        "hello",
+        [Message(role=Role.USER, content="hello")],
+        None,
+        config=ContextConfig(legacy_facts_enabled=False),
+        facts=[Fact(text="Old unreviewed preference")],
+    )
+
+    assert augmented == [Message(role=Role.USER, content="hello")]

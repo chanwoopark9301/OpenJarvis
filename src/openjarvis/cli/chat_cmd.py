@@ -309,6 +309,10 @@ def chat(
                     facts = memory_service.list_facts()
                 else:
                     facts = load_configured_facts(config)
+                from openjarvis.memory.store import legacy_fact_context_enabled
+
+                if not legacy_fact_context_enabled(config):
+                    facts = []
                 ctx_cfg = ContextConfig(
                     top_k=config.memory.context_top_k,
                     min_score=config.memory.context_min_score,

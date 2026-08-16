@@ -22,6 +22,7 @@ class ContextConfig:
     top_k: int = 5
     min_score: float = 0.0
     max_context_tokens: int = 2048
+    legacy_facts_enabled: bool = True
 
 
 def _count_tokens(text: str) -> int:
@@ -143,6 +144,8 @@ def inject_context(
     cfg = config or ContextConfig()
     if not cfg.enabled:
         return messages
+    if not cfg.legacy_facts_enabled:
+        facts = ()
 
     results = backend.retrieve(query, top_k=cfg.top_k) if backend is not None else []
 

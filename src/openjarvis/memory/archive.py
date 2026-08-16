@@ -497,6 +497,27 @@ class PersonalMemoryArchive:
             ).fetchone()
         return self._candidate_from_row(row) if row is not None else None
 
+    def find_candidates(
+        self,
+        *,
+        source: EvidenceSource | str | None = None,
+    ) -> list[MemoryCandidate]:
+        """List provisional candidates, optionally filtered by provenance."""
+        params: tuple[str, ...] = ()
+        source_clause = ""
+        if source is not None:
+            source_clause = " WHERE source = ?"
+            params = (EvidenceSource(source).value,)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM memory_candidates{source_clause}
+                ORDER BY created_at ASC, id ASC
+                """,
+                params,
+            ).fetchall()
+        return [self._candidate_from_row(row) for row in rows]
+
     def get_active_claims(
         self,
         *,

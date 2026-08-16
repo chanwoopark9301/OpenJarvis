@@ -131,6 +131,10 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
 
             memory_service = getattr(request.app.state, "memory_service", None)
             facts = memory_service.list_facts() if memory_service is not None else []
+            from openjarvis.memory.store import legacy_fact_context_enabled
+
+            if not legacy_fact_context_enabled(config):
+                facts = []
             personal_memory_service = getattr(
                 request.app.state, "personal_memory_service", None
             )

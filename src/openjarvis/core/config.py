@@ -963,6 +963,8 @@ class PersonalMemoryConfig:
     """Local-only archive settings for provisional personal-memory candidates."""
 
     enabled: bool = False
+    mode: str = "off"
+    legacy_context_injection: bool = True
     archive_path: str = field(
         default_factory=lambda: str(get_config_dir() / "personal_memory.db")
     )
@@ -2104,6 +2106,8 @@ max_facts = 1000              # cap on stored facts
 # facts and does not add provisional candidates to prompts.
 [personal_memory]
 enabled = false
+mode = "off"                 # off, shadow, or active
+legacy_context_injection = true
 # extraction_model = ""       # empty = active local model
 # max_queue = 256
 # idle_before_reflection_seconds = 30.0

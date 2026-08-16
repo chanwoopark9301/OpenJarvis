@@ -145,6 +145,7 @@ def test_configured_context_allows_loopback_response_engine(tmp_path):
 
     config = JarvisConfig()
     config.personal_memory.enabled = True
+    config.personal_memory.mode = "active"
     config.personal_memory.archive_path = str(tmp_path / "personal.db")
 
     context = compose_configured_personal_context(
@@ -154,3 +155,21 @@ def test_configured_context_allows_loopback_response_engine(tmp_path):
     )
 
     assert context is not None
+
+
+def test_shadow_mode_never_injects_personal_context(tmp_path):
+    from openjarvis.core.config import JarvisConfig
+
+    config = JarvisConfig()
+    config.personal_memory.enabled = True
+    config.personal_memory.mode = "shadow"
+    config.personal_memory.archive_path = str(tmp_path / "personal.db")
+
+    assert (
+        compose_configured_personal_context(
+            config,
+            "hello",
+            engine_key="ollama",
+        )
+        is None
+    )

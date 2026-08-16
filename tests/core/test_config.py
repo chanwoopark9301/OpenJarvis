@@ -59,6 +59,8 @@ class TestDefaults:
         assert cfg.personal_memory.context_schemas == 8
         assert cfg.personal_memory.context_episodes == 5
         assert cfg.personal_memory.context_raw_evidence == 3
+        assert cfg.personal_memory.mode == "off"
+        assert cfg.personal_memory.legacy_context_injection is True
 
 
 class TestRecommendEngine:

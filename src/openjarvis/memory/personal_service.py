@@ -314,6 +314,8 @@ def build_personal_memory_service(
     personal = getattr(config, "personal_memory", None)
     if personal is None or not getattr(personal, "enabled", False) or engine is None:
         return None
+    if getattr(personal, "mode", "active") == "off":
+        return None
     if not is_local_personal_memory_engine(config, engine_key):
         logger.warning(
             "Personal memory service disabled because engine is not local",

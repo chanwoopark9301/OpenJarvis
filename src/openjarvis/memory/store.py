@@ -214,7 +214,11 @@ def load_configured_facts(config: Any) -> List[Fact]:
     coupling them to the service lifecycle.
     """
     memory = getattr(config, "memory", None)
-    if memory is None or not getattr(memory, "enabled", False):
+    if (
+        memory is None
+        or not getattr(memory, "enabled", False)
+        or not legacy_fact_context_enabled(config)
+    ):
         return []
 
     store = create_fact_store(
@@ -225,10 +229,19 @@ def load_configured_facts(config: Any) -> List[Fact]:
     return store.list()
 
 
+def legacy_fact_context_enabled(config: Any) -> bool:
+    """Keep legacy facts until an enabled rollout explicitly turns them off."""
+    personal = getattr(config, "personal_memory", None)
+    if personal is None or not getattr(personal, "enabled", False):
+        return True
+    return bool(getattr(personal, "legacy_context_injection", True))
+
+
 __all__ = [
     "Fact",
     "FactStore",
     "LocalFactStore",
     "create_fact_store",
     "load_configured_facts",
+    "legacy_fact_context_enabled",
 ]

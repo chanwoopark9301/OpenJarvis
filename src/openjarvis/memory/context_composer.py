@@ -133,6 +133,8 @@ def compose_configured_personal_context(
     personal = getattr(config, "personal_memory", None)
     if personal is None or not getattr(personal, "enabled", False):
         return None
+    if getattr(personal, "mode", "active") != "active":
+        return None
     if not is_local_personal_memory_engine(config, engine_key):
         return None
     selected_archive = archive or PersonalMemoryArchive(
