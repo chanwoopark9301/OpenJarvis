@@ -8,8 +8,8 @@ and configured via the ``[memory]`` section of ``config.toml``.
 
 from __future__ import annotations
 
-from openjarvis.memory.extractor import FactExtractor
 from openjarvis.memory.archive import PersonalMemoryArchive
+from openjarvis.memory.extractor import FactExtractor
 from openjarvis.memory.personal_models import (
     CandidateDraft,
     ConversationExchange,

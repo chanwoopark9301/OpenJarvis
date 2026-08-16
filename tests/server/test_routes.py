@@ -257,7 +257,7 @@ class TestMemoryServiceWiring:
         assert events[0].data["assistant_text"] == "event reply"
 
     def test_disabled_personal_memory_keeps_the_legacy_event_payload(self):
-        """Without the optional service, ordinary chat completion behavior is unchanged."""
+        """Disabled personal memory must preserve ordinary completion behavior."""
         bus = EventBus(record_history=True)
         app = create_app(
             _make_engine(content="legacy reply"),

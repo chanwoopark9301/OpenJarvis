@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-
 CandidateKind = Literal["fact", "episode"]
 CandidateStatus = Literal["pending", "accepted", "rejected", "superseded"]
 
