@@ -132,3 +132,110 @@ def test_completed_candidate_preserves_rule_provenance_and_scope(tmp_path):
     assert candidates[0].source == "user_direct"
     assert candidates[0].temporal_scope == "until_changed"
     assert candidates[0].subject == "assistant_behavior"
+
+
+def test_completed_zero_candidate_exchange_is_recovered_once_per_version(tmp_path):
+    """Removing extractor-version recovery must strand old empty results forever."""
+    PersonalMemoryArchive, _ = _archive_api()
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    archive.record_exchange(
+        exchange_id="exchange-empty-old",
+        user_text="앞으로 농담을 하지 마.",
+        assistant_text="알겠습니다.",
+        source="cli.chat",
+    )
+    assert archive.claim_candidate_job("exchange-empty-old") is not None
+    archive.complete_candidate_job(
+        "exchange-empty-old",
+        [],
+        engine_id="ollama",
+        extractor_version="personal-memory-v1",
+    )
+
+    assert archive.recover_stale_candidate_jobs("personal-memory-v3") == 1
+    assert archive.pending_exchange_ids(limit=10) == ["exchange-empty-old"]
+    assert archive.recover_stale_candidate_jobs("personal-memory-v3") == 0
+
+
+def test_current_zero_candidate_result_is_not_recovered(tmp_path):
+    """A legitimate empty result must not be reevaluated on every startup."""
+    PersonalMemoryArchive, _ = _archive_api()
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    archive.record_exchange(
+        exchange_id="exchange-current-empty",
+        user_text="안녕?",
+        assistant_text="안녕하세요.",
+        source="cli.chat",
+    )
+    assert archive.claim_candidate_job("exchange-current-empty") is not None
+    archive.complete_candidate_job(
+        "exchange-current-empty",
+        [],
+        engine_id="ollama",
+        extractor_version="personal-memory-v3",
+    )
+
+    assert archive.recover_stale_candidate_jobs("personal-memory-v3") == 0
+    assert archive.pending_exchange_ids(limit=10) == []
+
+
+def test_zero_candidate_success_is_remembered_for_every_extractor_version(tmp_path):
+    """Rolling back versions must not repeat work already completed by that version."""
+    PersonalMemoryArchive, _ = _archive_api()
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    archive.record_exchange(
+        exchange_id="exchange-version-history",
+        user_text="안녕?",
+        assistant_text="안녕하세요.",
+        source="cli.chat",
+    )
+    assert archive.claim_candidate_job("exchange-version-history") is not None
+    archive.complete_candidate_job(
+        "exchange-version-history",
+        [],
+        engine_id="ollama",
+        extractor_version="personal-memory-v1",
+    )
+    assert archive.recover_stale_candidate_jobs("personal-memory-v3") == 1
+    assert archive.claim_candidate_job("exchange-version-history") is not None
+    archive.complete_candidate_job(
+        "exchange-version-history",
+        [],
+        engine_id="ollama",
+        extractor_version="personal-memory-v3",
+    )
+
+    assert archive.recover_stale_candidate_jobs("personal-memory-v1") == 0
+
+
+def test_recovery_reopens_a_completed_job_for_a_pending_exchange(tmp_path):
+    """A stale complete job marker must not strand recoverable conversation work."""
+    PersonalMemoryArchive, _ = _archive_api()
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    archive.record_exchange(
+        exchange_id="exchange-stranded",
+        user_text="앞으로 농담을 하지 마.",
+        assistant_text="알겠습니다.",
+        source="cli.chat",
+    )
+    assert archive.claim_candidate_job("exchange-stranded") is not None
+    archive.complete_candidate_job(
+        "exchange-stranded",
+        [],
+        engine_id="ollama",
+        extractor_version="personal-memory-v1",
+    )
+    job = archive.enqueue_job(
+        job_type="extract_candidates",
+        subject_id="exchange-stranded",
+        idempotency_key=(
+            "extract_candidates:personal-memory-v3:exchange-stranded"
+        ),
+        priority=100,
+    )
+    assert archive.claim_job(job.id) is not None
+    archive.complete_job(job.id)
+
+    assert archive.recover_stale_candidate_jobs("personal-memory-v3") == 1
+
+    assert job.id in archive.pending_job_ids(limit=10)

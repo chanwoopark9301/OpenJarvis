@@ -74,7 +74,7 @@ def test_existing_candidate_archive_migrates_in_place(tmp_path):
 
     archive = PersonalMemoryArchive(path)
 
-    assert archive.schema_version() == 3
+    assert archive.schema_version() == 4
     assert archive.get_exchange("old-exchange").user_text == "old user text"
     assert archive.get_candidate("old-candidate").source.value == "legacy_import"
     recovered = archive.recover_pending_candidate_jobs()
@@ -121,7 +121,7 @@ def test_v2_pending_user_direct_candidate_is_quarantined_on_v3_upgrade(tmp_path)
     assert reopened.recover_pending_candidate_jobs() == []
     assert reopened.pending_job_ids(limit=10) == []
     assert reopened.decision_count(subject_id=candidate.id) == 1
-    assert reopened.schema_version() == 3
+    assert reopened.schema_version() == 4
 
 
 def test_job_idempotency_key_prevents_duplicate_work(tmp_path):

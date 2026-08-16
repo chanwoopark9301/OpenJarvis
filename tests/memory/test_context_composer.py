@@ -250,23 +250,52 @@ def test_active_context_refuses_unactivated_rollout(tmp_path):
     ) is None
 
 
-def test_shadow_mode_never_injects_personal_context(tmp_path):
+def test_shadow_mode_injects_only_confirmed_direct_rules(tmp_path):
     from openjarvis.core.config import JarvisConfig
 
     config = JarvisConfig()
     config.personal_memory.enabled = True
     config.personal_memory.mode = "shadow"
     config.personal_memory.archive_path = str(tmp_path / "personal.db")
-
-    assert (
-        compose_configured_personal_context(
-            config,
-            "hello",
-            engine_key="ollama",
-        )
-        is None
-    )
     archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    _accept_claim(
+        archive,
+        index=1,
+        kind=CandidateKind.CONSTRAINT,
+        content="앞으로 농담을 먼저 꺼내지 마.",
+        temporal_scope="until_changed",
+        subject="assistant_behavior",
+    )
+    _accept_claim(
+        archive,
+        index=2,
+        kind=CandidateKind.FACT,
+        content="요즘 피곤하다.",
+        temporal_scope="current",
+        subject="energy",
+    )
+    _accept_claim(
+        archive,
+        index=3,
+        kind=CandidateKind.CORRECTION,
+        content="내 고향은 부산이 아니라 서울이다.",
+        temporal_scope="until_changed",
+        subject="home_town",
+    )
+
+    context = compose_configured_personal_context(
+        config,
+        "요즘 피곤하다.",
+        engine_key="ollama",
+    )
+
+    assert context is not None
+    assert context.constraints == ("앞으로 농담을 먼저 꺼내지 마.",)
+    assert context.current_states == ()
+    assert context.schemas == ()
+    assert context.episodes == ()
+    assert context.raw_evidence == ()
+    assert context.unresolved == ()
     assert archive.shadow_metrics()["compositions"] == 1
 
 

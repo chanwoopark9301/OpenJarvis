@@ -107,6 +107,7 @@ def test_delete_all_requires_exact_confirmation_token(tmp_path):
     preview = inspector.deletion_preview()
     assert preview["personal_claims"] == 1
     assert preview["claim_evidence_links"] == 1
+    assert preview["candidate_extraction_runs"] == 1
     assert "memory_decisions" in preview
     with pytest.raises(ValueError, match="confirmation token"):
         inspector.delete_all_personal_memory("wrong")
@@ -114,7 +115,19 @@ def test_delete_all_requires_exact_confirmation_token(tmp_path):
     removed = inspector.delete_all_personal_memory("DELETE ALL PERSONAL MEMORY")
 
     assert removed["personal_claims"] == 1
+    assert removed["candidate_extraction_runs"] == 1
     assert archive.get_active_claims() == []
+
+
+def test_delete_subject_with_raw_evidence_removes_extraction_history(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    claim = _accepted_claim(archive, "Do not proactively mention timers.")
+    inspector = PersonalMemoryInspector(archive)
+
+    removed = inspector.delete_subject(claim.id, include_raw_evidence=True)
+
+    assert removed["exchanges"] == 1
+    assert archive.get_exchange("original") is None
 
 
 def test_schema_can_be_explained_suppressed_corrected_and_deleted(tmp_path):

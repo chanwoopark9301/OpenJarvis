@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -61,10 +62,14 @@ _ALLOWED_FIELDS = frozenset(
 )
 _EXPLICIT_RULE_SIGNALS = (
     "하지 마",
+    "하지마",
     "기억해",
     "틀렸어",
     "할 수 없어",
     "역할은",
+    "역할로",
+    "이름은",
+    "불러",
     "do not",
     "don't",
     "remember this",
@@ -128,6 +133,7 @@ class PersonalCandidateExtractor:
         self.last_error_code = ""
         if not exchange.user_text.strip():
             return []
+        direct_rules = self._deterministic_direct_rules(exchange.user_text)
         messages = [
             Message(role=Role.SYSTEM, content=_SYSTEM_PROMPT),
             Message(
@@ -147,11 +153,17 @@ class PersonalCandidateExtractor:
                 _openjarvis_background=True,
             )
         except Exception:  # noqa: BLE001 - candidate extraction is best effort
+            if direct_rules:
+                return direct_rules
             self.last_error_code = "engine_error"
             return []
 
         content = result.get("content", "") if isinstance(result, dict) else str(result)
         drafts, error_code = self._parse(content)
+        drafts = [draft for draft in drafts if draft.kind not in DIRECT_RULE_KINDS]
+        if direct_rules:
+            drafts = [*direct_rules, *drafts][:5]
+            error_code = ""
         if not error_code and self._has_explicit_rule_signal(exchange.user_text):
             drafts = [
                 replace(draft, importance=1.0)
@@ -162,10 +174,155 @@ class PersonalCandidateExtractor:
         self.last_error_code = error_code
         return drafts
 
+    @classmethod
+    def _deterministic_direct_rules(cls, user_text: str) -> list[CandidateDraft]:
+        """Extract only assistant-directed command clauses as direct rules."""
+        clauses = [
+            (match.group(1).strip(" ,;:"), match.group(2))
+            for match in re.finditer(r"([^.!?\n]+)([.!?]?)", user_text.strip())
+            if match.group(1).strip(" ,;:")
+        ]
+        drafts: list[CandidateDraft] = []
+        for index, (clause, delimiter) in enumerate(clauses):
+            if delimiter == "?":
+                continue
+            next_is_memory_marker = index + 1 < len(clauses) and bool(
+                re.fullmatch(
+                    r"(?:꼭\s*)?기억해(?:\s*(?:줘|주세요))?"
+                    r"|(?:please\s+)?remember\s+(?:this|that)",
+                    clauses[index + 1][0].casefold(),
+                )
+            )
+            durable_request = cls._has_durable_rule_signal(clause) or (
+                next_is_memory_marker
+            )
+            kind = cls._classify_behavior_clause(
+                clause,
+                durable_request=durable_request,
+            )
+            if kind is None:
+                continue
+            drafts.append(
+                CandidateDraft(
+                    kind,
+                    clause,
+                    1.0,
+                    1.0,
+                    temporal_scope="until_changed",
+                    subject="assistant_behavior",
+                )
+            )
+            if len(drafts) == 5:
+                break
+        return drafts
+
+    @staticmethod
+    def _has_durable_rule_signal(clause: str) -> bool:
+        normalized = clause.casefold()
+        return any(
+            signal in normalized
+            for signal in (
+                "앞으로",
+                "이제부터",
+                "항상",
+                "계속",
+                "꼭 기억",
+                "기억해",
+                "always",
+                "from now on",
+                "going forward",
+                "remember this",
+                "keep ",
+            )
+        )
+
+    @staticmethod
+    def _classify_behavior_clause(
+        clause: str,
+        *,
+        durable_request: bool,
+    ) -> CandidateKind | None:
+        normalized = clause.casefold()
+        assistant_targeted = any(
+            signal in normalized
+            for signal in (
+                "너 ",
+                "너는",
+                "너의",
+                "네 이름",
+                "네 역할",
+                "자비스",
+                "조visor",
+                "assistant",
+                "your ",
+            )
+        )
+        capability = any(
+            signal in normalized
+            for signal in ("할 수 없어", "못해", "못 해", "못틀", "못 틀", "cannot")
+        )
+        if assistant_targeted and capability:
+            return CandidateKind.CAPABILITY_BOUNDARY
+
+        korean_role_assignment = bool(
+            re.search(
+                r"(?:이름|역할)(?:은|는)\s*.{1,40}"
+                r"(?:야|이야|예요|이에요|입니다|로\s*(?:해|하자|정해))$",
+                normalized,
+            )
+            or re.search(
+                r"(?:이름|역할)(?:을|를)\s*.{1,30}로\s*(?:해|정해)$",
+                normalized,
+            )
+        )
+        english_role_assignment = durable_request and bool(
+            re.search(r"\byour role is\s+\S", normalized)
+        )
+        if assistant_targeted and (
+            korean_role_assignment or english_role_assignment
+        ):
+            return CandidateKind.ROLE_PREFERENCE
+        if re.search(r"(?:나를|저를)\s+.{1,40}(?:라고|로)\s*불러$", normalized):
+            return CandidateKind.ROLE_PREFERENCE
+        if re.search(r"^(?:please\s+)?call me\s+\S", normalized):
+            return CandidateKind.ROLE_PREFERENCE
+
+        if re.search(r"^never\s+(?:mention|say|bring up|suggest)\b", normalized):
+            return CandidateKind.CONSTRAINT
+        if durable_request and (
+            re.search(r"^(?:please\s+)?(?:do not|don't)\b", normalized)
+            or re.search(r"지\s*마$", normalized)
+            or re.search(r"(?:하면|해서는)\s*안\s*돼$", normalized)
+        ):
+            return CandidateKind.CONSTRAINT
+
+        if re.search(
+            r"(?:존댓말|반말|한국어|영어).{0,20}(?:답변|대답|말)"
+            r".{0,12}(?:해\s*주세요|해주세요|해\s*줘|해줘)$",
+            normalized,
+        ):
+            return CandidateKind.CONSTRAINT
+
+        if durable_request and re.search(
+            r"(?:대답|답|응답|설명|말|대화|표현|작성)"
+            r".{0,24}(?:해\s*주세요|해주세요|해\s*줘|해줘|줘)$",
+            normalized,
+        ):
+            return CandidateKind.CONSTRAINT
+        if durable_request and re.search(
+            r"^(?:(?:always|please)\s+)?"
+            r"(?:answer|reply|speak|explain|keep)\b",
+            normalized,
+        ):
+            return CandidateKind.CONSTRAINT
+        return None
+
     @staticmethod
     def _has_explicit_rule_signal(user_text: str) -> bool:
         normalized = user_text.casefold()
-        return any(signal in normalized for signal in _EXPLICIT_RULE_SIGNALS)
+        return any(signal in normalized for signal in _EXPLICIT_RULE_SIGNALS) or bool(
+            re.search(r"지\s*마(?:[.!?]|\s|$)", normalized)
+        )
 
     @staticmethod
     def _parse(content: str) -> tuple[list[CandidateDraft], str]:

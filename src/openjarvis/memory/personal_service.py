@@ -37,6 +37,7 @@ CHECK_CONSOLIDATION = "check_consolidation"
 REFLECT_CONFLICTS = "reflect_conflicts"
 VALIDATE_INSIGHT = "validate_insight"
 IMPORT_LEGACY = "import_legacy"
+PERSONAL_CANDIDATE_EXTRACTOR_VERSION = "personal-memory-v4"
 
 
 class PersonalMemoryService:
@@ -102,6 +103,9 @@ class PersonalMemoryService:
             return
         self._running.set()
         self._archive.release_in_progress_jobs()
+        self._archive.recover_stale_candidate_jobs(
+            PERSONAL_CANDIDATE_EXTRACTOR_VERSION
+        )
         self._archive.recover_pending_candidate_jobs()
         self._subscribe_events()
         self._thread = threading.Thread(
@@ -159,7 +163,10 @@ class PersonalMemoryService:
         job = self._archive.enqueue_job(
             job_type=EXTRACT_CANDIDATES,
             subject_id=exchange_id,
-            idempotency_key=f"{EXTRACT_CANDIDATES}:{exchange_id}",
+            idempotency_key=(
+                f"{EXTRACT_CANDIDATES}:"
+                f"{PERSONAL_CANDIDATE_EXTRACTOR_VERSION}:{exchange_id}"
+            ),
             priority=100,
         )
         return self._enqueue_job(job.id)
@@ -256,7 +263,10 @@ class PersonalMemoryService:
             self._archive.enqueue_job(
                 job_type=EXTRACT_CANDIDATES,
                 subject_id=exchange_id,
-                idempotency_key=f"{EXTRACT_CANDIDATES}:{exchange_id}",
+                idempotency_key=(
+                    f"{EXTRACT_CANDIDATES}:"
+                    f"{PERSONAL_CANDIDATE_EXTRACTOR_VERSION}:{exchange_id}"
+                ),
                 priority=100,
             )
         for job_id in self._archive.pending_job_ids(limit=self._max_queue):
@@ -318,7 +328,7 @@ class PersonalMemoryService:
                             exchange.id,
                             drafts,
                             engine_id=getattr(self._extractor, "engine_id", "local"),
-                            extractor_version="personal-memory-v2",
+                            extractor_version=PERSONAL_CANDIDATE_EXTRACTOR_VERSION,
                         )
                         for candidate in candidates:
                             evaluation_job = self._archive.enqueue_job(

@@ -206,6 +206,46 @@ def test_invalid_candidate_output_remains_failed_without_a_hot_retry_loop(tmp_pa
         service.stop()
 
 
+def test_startup_reprocesses_an_old_zero_candidate_completion(tmp_path):
+    """Dropping startup recovery must leave explicit rules trapped as empty work."""
+    extractor = _FakeExtractor()
+    service = _service(tmp_path, EventBus(), extractor)
+    exchange = service.archive.record_exchange(
+        exchange_id="old-empty",
+        user_text="앞으로 농담을 하지 마.",
+        assistant_text="알겠습니다.",
+        source="test",
+    )
+    assert service.archive.claim_candidate_job(exchange.id) is not None
+    service.archive.complete_candidate_job(
+        exchange.id,
+        [],
+        engine_id="ollama",
+        extractor_version="personal-memory-v1",
+    )
+
+    service.start()
+    try:
+        assert extractor.started.wait(timeout=1.0)
+        deadline = time.time() + 1.0
+        while (
+            time.time() < deadline
+            and _candidate_job_state(service.archive, exchange.id) != "complete"
+        ):
+            time.sleep(0.01)
+        with sqlite3.connect(service.archive.path) as connection:
+            row = connection.execute(
+                """
+                SELECT candidate_attempts, candidate_extractor_version
+                FROM conversation_exchanges WHERE id = ?
+                """,
+                (exchange.id,),
+            ).fetchone()
+        assert row == (2, "personal-memory-v4")
+    finally:
+        service.stop()
+
+
 def test_cloud_engine_cannot_build_a_personal_memory_service(tmp_path):
     """The service factory must fail closed before a cloud engine can be invoked."""
     _, _, _, build_personal_memory_service, _ = _service_api()

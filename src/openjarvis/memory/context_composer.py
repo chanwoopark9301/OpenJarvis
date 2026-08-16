@@ -32,6 +32,13 @@ _RELEVANCE_STOPWORDS = frozenset(
         "저",
     }
 )
+_SHADOW_BEHAVIOR_RULE_KINDS = frozenset(
+    {
+        CandidateKind.CONSTRAINT,
+        CandidateKind.ROLE_PREFERENCE,
+        CandidateKind.CAPABILITY_BOUNDARY,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,7 +229,26 @@ def compose_configured_personal_context(
             episode_count=len(context.episodes),
             raw_evidence_count=len(context.raw_evidence),
         )
-        return None
+        shadow_constraints = tuple(
+            claim.content
+            for claim in selected_archive.get_active_claims()
+            if claim.kind in _SHADOW_BEHAVIOR_RULE_KINDS
+            and claim.subject_scope == "assistant_behavior"
+        )[: getattr(personal, "context_constraints", 5)]
+        if not shadow_constraints:
+            return None
+        return ComposedMemoryContext(
+            constraints=shadow_constraints,
+            current_states=(),
+            schemas=(),
+            episodes=(),
+            raw_evidence=(),
+            unresolved=(),
+            user_overlay="",
+            sections=(
+                ContextSection("direct_constraints", shadow_constraints),
+            ),
+        )
     return context
 
 

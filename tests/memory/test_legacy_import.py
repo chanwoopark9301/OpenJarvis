@@ -125,7 +125,7 @@ def test_active_rollout_requires_explicit_successful_activation(tmp_path):
     assert archive.rollout_is_active() is True
 
 
-def test_legacy_context_cannot_be_disabled_before_activation(tmp_path):
+def test_explicit_legacy_context_opt_out_is_immediate(tmp_path):
     archive_path = tmp_path / "personal.db"
     archive = PersonalMemoryArchive(archive_path)
     config = SimpleNamespace(
@@ -136,6 +136,18 @@ def test_legacy_context_cannot_be_disabled_before_activation(tmp_path):
         )
     )
 
-    assert legacy_fact_context_enabled(config) is True
+    assert legacy_fact_context_enabled(config) is False
     archive.set_metadata("release_ready", "1")
+    assert legacy_fact_context_enabled(config) is False
+
+
+def test_legacy_context_opt_out_survives_personal_memory_disablement(tmp_path):
+    config = SimpleNamespace(
+        personal_memory=SimpleNamespace(
+            enabled=False,
+            legacy_context_injection=False,
+            archive_path=str(tmp_path / "personal.db"),
+        )
+    )
+
     assert legacy_fact_context_enabled(config) is False

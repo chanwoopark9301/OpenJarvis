@@ -27,6 +27,15 @@ def _read_input(prompt: str = "You> ") -> Optional[str]:
         return None
 
 
+def _personal_memory_status(config, personal_mode: str) -> str:
+    """Describe whether stored personal memory can influence responses."""
+    if not config.agent.context_from_memory:
+        return "collecting; response injection disabled"
+    if personal_mode == "shadow":
+        return "collecting; direct rule injection enabled"
+    return "active"
+
+
 @click.command()
 @click.option("-e", "--engine", "engine_key", default=None, help="Engine backend.")
 @click.option("-m", "--model", "model_name", default=None, help="Model to use.")
@@ -219,7 +228,9 @@ def chat(
         )
         if personal_memory_service is not None:
             personal_memory_service.start()
-            console.print("[dim]  Personal memory: active[/dim]")
+            personal_mode = getattr(config.personal_memory, "mode", "active")
+            personal_status = _personal_memory_status(config, personal_mode)
+            console.print(f"[dim]  Personal memory: {personal_status}[/dim]")
     except Exception as exc:
         console.print(f"[yellow]Personal memory unavailable: {exc}[/yellow]")
         personal_memory_service = None

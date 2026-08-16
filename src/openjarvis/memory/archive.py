@@ -29,7 +29,7 @@ from openjarvis.memory.personal_models import (
     SchemaMaturity,
 )
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _RELEASE_ATTESTATION_GATES = frozenset(
     {
         "assistant_only_rejection",
@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS conversation_exchanges (
   candidate_attempts INTEGER NOT NULL DEFAULT 0,
   candidate_error TEXT NOT NULL DEFAULT '',
   candidate_claimed_at REAL NOT NULL DEFAULT 0,
-  candidate_next_attempt_at REAL NOT NULL DEFAULT 0
+  candidate_next_attempt_at REAL NOT NULL DEFAULT 0,
+  candidate_extractor_version TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS memory_candidates (
@@ -82,6 +83,14 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL,
   UNIQUE(exchange_id, kind, content)
+);
+
+CREATE TABLE IF NOT EXISTS candidate_extraction_runs (
+  exchange_id TEXT NOT NULL REFERENCES conversation_exchanges(id),
+  extractor_version TEXT NOT NULL,
+  candidate_count INTEGER NOT NULL DEFAULT 0,
+  completed_at REAL NOT NULL,
+  PRIMARY KEY(exchange_id, extractor_version)
 );
 
 CREATE INDEX IF NOT EXISTS idx_exchanges_candidate_created
@@ -296,6 +305,13 @@ class PersonalMemoryArchive:
                     ADD COLUMN candidate_next_attempt_at REAL NOT NULL DEFAULT 0
                     """
                 )
+            if "candidate_extractor_version" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE conversation_exchanges
+                    ADD COLUMN candidate_extractor_version TEXT NOT NULL DEFAULT ''
+                    """
+                )
             candidate_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -313,6 +329,25 @@ class PersonalMemoryArchive:
                     connection.execute(
                         f"ALTER TABLE memory_candidates ADD COLUMN {name} {declaration}"
                     )
+            connection.execute(
+                """
+                INSERT INTO candidate_extraction_runs (
+                    exchange_id, extractor_version, candidate_count, completed_at
+                )
+                SELECT conversation_exchanges.id,
+                       conversation_exchanges.candidate_extractor_version,
+                       (
+                         SELECT COUNT(*) FROM memory_candidates
+                         WHERE memory_candidates.exchange_id =
+                               conversation_exchanges.id
+                       ),
+                       conversation_exchanges.archived_at
+                FROM conversation_exchanges
+                WHERE conversation_exchanges.candidate_state = 'complete'
+                  AND conversation_exchanges.candidate_extractor_version != ''
+                ON CONFLICT(exchange_id, extractor_version) DO NOTHING
+                """
+            )
             if previous_schema_version == 2 and "source" in candidate_columns:
                 quarantined_rows = connection.execute(
                     """
@@ -1103,6 +1138,13 @@ class PersonalMemoryArchive:
                         (exchange_id, exchange_id),
                     ).fetchone()
                     if remaining is not None and int(remaining["count"]) == 0:
+                        connection.execute(
+                            """
+                            DELETE FROM candidate_extraction_runs
+                            WHERE exchange_id = ?
+                            """,
+                            (exchange_id,),
+                        )
                         counts["exchanges"] += connection.execute(
                             "DELETE FROM conversation_exchanges WHERE id = ?",
                             (exchange_id,),
@@ -1113,6 +1155,7 @@ class PersonalMemoryArchive:
         """Return local row counts without exposing any stored content."""
         tables = (
             "conversation_exchanges",
+            "candidate_extraction_runs",
             "memory_candidates",
             "evidence_items",
             "personal_claims",
@@ -1146,6 +1189,7 @@ class PersonalMemoryArchive:
             "memory_feedback",
             "memory_decisions",
             "memory_jobs",
+            "candidate_extraction_runs",
             "schema_conflicts",
             "schema_evidence_links",
             "schema_versions",
@@ -2270,10 +2314,22 @@ class PersonalMemoryArchive:
                 UPDATE conversation_exchanges
                 SET candidate_state = 'complete', candidate_error = '',
                     candidate_claimed_at = 0,
-                    candidate_next_attempt_at = 0
+                    candidate_next_attempt_at = 0,
+                    candidate_extractor_version = ?
                 WHERE id = ?
                 """,
-                (exchange_id,),
+                (extractor_version, exchange_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO candidate_extraction_runs (
+                    exchange_id, extractor_version, candidate_count, completed_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(exchange_id, extractor_version) DO UPDATE SET
+                    candidate_count = excluded.candidate_count,
+                    completed_at = excluded.completed_at
+                """,
+                (exchange_id, extractor_version, len(persisted), now),
             )
         return persisted
 
@@ -2348,6 +2404,52 @@ class PersonalMemoryArchive:
                 (now, count),
             ).fetchall()
         return [str(row["id"]) for row in rows]
+
+    def recover_stale_candidate_jobs(self, extractor_version: str) -> int:
+        """Requeue old zero-candidate completions once for a newer extractor."""
+        version = str(extractor_version or "").strip()
+        if not version:
+            raise ValueError("extractor_version must not be empty")
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE conversation_exchanges
+                SET candidate_state = 'pending', candidate_error = '',
+                    candidate_claimed_at = 0, candidate_next_attempt_at = 0
+                WHERE candidate_state = 'complete'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM memory_candidates
+                    WHERE memory_candidates.exchange_id = conversation_exchanges.id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM candidate_extraction_runs
+                    WHERE candidate_extraction_runs.exchange_id =
+                          conversation_exchanges.id
+                      AND candidate_extraction_runs.extractor_version = ?
+                  )
+                """,
+                (version,),
+            )
+            connection.execute(
+                """
+                UPDATE memory_jobs
+                SET state = 'pending', error_code = '', claimed_at = 0,
+                    next_attempt_at = 0, updated_at = ?
+                WHERE job_type = 'extract_candidates'
+                  AND state != 'processing'
+                  AND idempotency_key = (
+                    'extract_candidates:' || ? || ':' || subject_id
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM conversation_exchanges
+                    WHERE conversation_exchanges.id = memory_jobs.subject_id
+                      AND conversation_exchanges.candidate_state = 'pending'
+                  )
+                """,
+                (now, version),
+            )
+        return max(0, updated.rowcount)
 
     def recover_pending_candidate_jobs(self) -> list[MemoryJob]:
         """Create idempotent evaluation jobs for candidates from older archives."""

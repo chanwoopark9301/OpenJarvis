@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -231,23 +230,11 @@ def load_configured_facts(config: Any) -> List[Fact]:
 
 
 def legacy_fact_context_enabled(config: Any) -> bool:
-    """Keep legacy facts until an enabled rollout explicitly turns them off."""
+    """Honor an explicit legacy prompt opt-out without deleting stored facts."""
     personal = getattr(config, "personal_memory", None)
-    if personal is None or not getattr(personal, "enabled", False):
+    if personal is None:
         return True
-    if bool(getattr(personal, "legacy_context_injection", True)):
-        return True
-    archive_path = Path(str(getattr(personal, "archive_path", ""))).expanduser()
-    if not archive_path.is_file():
-        return True
-    try:
-        with sqlite3.connect(f"file:{archive_path}?mode=ro", uri=True) as connection:
-            row = connection.execute(
-                "SELECT value FROM archive_metadata WHERE key = 'release_ready'"
-            ).fetchone()
-    except sqlite3.Error:
-        return True
-    return row is None or str(row[0]) != "1"
+    return bool(getattr(personal, "legacy_context_injection", True))
 
 
 __all__ = [

@@ -13,13 +13,22 @@ from openjarvis.agents._stubs import (
     BaseAgent,
     ToolUsingAgent,
 )
-from openjarvis.cli.chat_cmd import _read_input, chat
+from openjarvis.cli.chat_cmd import _personal_memory_status, _read_input, chat
 from openjarvis.core.config import JarvisConfig
 from openjarvis.core.events import Event, EventBus, EventType
 from openjarvis.core.registry import AgentRegistry, ToolRegistry
 from openjarvis.core.types import ToolCall, ToolResult
 from openjarvis.memory.store import LocalFactStore
 from openjarvis.tools._stubs import BaseTool, ToolSpec
+
+
+def test_personal_memory_status_reports_disabled_response_injection():
+    config = JarvisConfig()
+    config.agent.context_from_memory = False
+
+    assert _personal_memory_status(config, "shadow") == (
+        "collecting; response injection disabled"
+    )
 
 
 class _SimpleChatAgent(BaseAgent):
@@ -295,6 +304,8 @@ class TestChatAgents:
         engine.generate.return_value = {"content": "saved reply"}
         config = JarvisConfig()
         config.intelligence.default_model = "test-model"
+        config.personal_memory.enabled = True
+        config.personal_memory.mode = "shadow"
 
         with (
             patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
@@ -317,6 +328,11 @@ class TestChatAgents:
         assert spy.started is True
         assert spy.stopped is True
         assert spy.archived == [("remember this", "saved reply", "cli.chat")]
+        assert (
+            "Personal memory: collecting; direct rule injection enabled"
+            in result.output
+        )
+        assert "Personal memory: active" not in result.output
 
     def test_tool_agent_uses_legacy_agent_tools_and_prompts_confirmation(self) -> None:
         engine = MagicMock()
