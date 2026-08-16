@@ -215,7 +215,6 @@ def test_cloud_engine_cannot_build_a_personal_memory_service(tmp_path):
         archive_path=str(tmp_path / "personal.db"),
         extraction_model="qwen3:8b",
     )
-
     assert (
         build_personal_memory_service(
             config,
@@ -226,6 +225,33 @@ def test_cloud_engine_cannot_build_a_personal_memory_service(tmp_path):
         )
         is None
     )
+
+
+def test_local_factory_wires_developmental_job_handlers(tmp_path):
+    """Production construction must not stop at extraction and evaluation."""
+    _, _, _, build_personal_memory_service, _ = _service_api()
+    config = JarvisConfig()
+    config.personal_memory = PersonalMemoryConfig(
+        enabled=True,
+        mode="shadow",
+        archive_path=str(tmp_path / "personal.db"),
+        extraction_model="qwen3:8b",
+    )
+
+    service = build_personal_memory_service(
+        config,
+        object(),
+        engine_key="ollama",
+        default_model="qwen3:8b",
+        event_bus=EventBus(),
+    )
+
+    assert service is not None
+    assert set(service._job_handlers) == {
+        "check_consolidation",
+        "reflect_conflicts",
+        "validate_insight",
+    }
 
 
 def test_extraction_is_followed_by_durable_candidate_evaluation(tmp_path):
@@ -322,5 +348,38 @@ def test_chat_busy_defers_reflection_without_running_the_extractor(tmp_path):
 
         assert service.archive.get_job(job.id).state == "deferred"
         assert extractor.started.is_set() is False
+    finally:
+        service.stop()
+
+
+def test_evaluation_schedules_separate_consolidation_job(tmp_path):
+    """Schema work must run as a distinct durable job after claim evaluation."""
+    _, CandidateDraft, _, _, _ = _service_api()
+    handled = threading.Event()
+    observed = {}
+
+    def handle_consolidation(job):
+        observed["job_type"] = job.job_type
+        observed["claim_count"] = len(service.archive.get_active_claims())
+        handled.set()
+
+    service = _service(
+        tmp_path,
+        EventBus(),
+        _FakeExtractor(
+            [CandidateDraft("fact", "Running improved my mood today.", 0.8, 0.9)]
+        ),
+        job_handlers={"check_consolidation": handle_consolidation},
+    )
+    service.start()
+    try:
+        exchange = service.archive_exchange(
+            user_text="Running improved my mood today.",
+            assistant_text="",
+            source="test",
+        )
+        assert service.enqueue_exchange(exchange.id)
+        assert handled.wait(timeout=2.0)
+        assert observed == {"job_type": "check_consolidation", "claim_count": 1}
     finally:
         service.stop()

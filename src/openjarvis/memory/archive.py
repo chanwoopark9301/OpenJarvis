@@ -17,8 +17,11 @@ from openjarvis.memory.personal_models import (
     CandidateKind,
     ClaimState,
     ConversationExchange,
+    EvidenceItem,
     EvidenceMass,
     EvidenceSource,
+    InsightCandidate,
+    InsightState,
     MemoryCandidate,
     MemoryJob,
     PersonalClaim,
@@ -718,6 +721,67 @@ class PersonalMemoryArchive:
             content_by_id[value] for value in evidence_ids if value in content_by_id
         )
 
+    def evidence_items_for_subject(
+        self,
+        subject: str,
+        *,
+        limit: int = 100,
+    ) -> list[EvidenceItem]:
+        """Return raw personal evidence for one bounded subject scope."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM evidence_items
+                WHERE subject = ? AND source IN (
+                  'user_direct', 'user_confirmed', 'social_testimony'
+                )
+                ORDER BY created_at DESC, id ASC LIMIT ?
+                """,
+                (subject, max(1, int(limit))),
+            ).fetchall()
+        return [
+            EvidenceItem(
+                id=str(row["id"]),
+                exchange_id=str(row["exchange_id"]),
+                content=str(row["content"]),
+                source=EvidenceSource(str(row["source"])),
+                created_at=float(row["created_at"]),
+                session_id=str(row["session_id"]),
+                temporal_scope=str(row["temporal_scope"]),
+                subject=str(row["subject"]),
+            )
+            for row in rows
+        ]
+
+    def evidence_items_by_id(
+        self,
+        evidence_ids: Sequence[str],
+    ) -> list[EvidenceItem]:
+        """Load an explicitly bounded evidence set in caller-supplied order."""
+        if not evidence_ids:
+            return []
+        placeholders = ",".join("?" for _ in evidence_ids)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM evidence_items WHERE id IN ({placeholders})",
+                tuple(evidence_ids),
+            ).fetchall()
+        by_id = {str(row["id"]): row for row in rows}
+        return [
+            EvidenceItem(
+                id=str(by_id[value]["id"]),
+                exchange_id=str(by_id[value]["exchange_id"]),
+                content=str(by_id[value]["content"]),
+                source=EvidenceSource(str(by_id[value]["source"])),
+                created_at=float(by_id[value]["created_at"]),
+                session_id=str(by_id[value]["session_id"]),
+                temporal_scope=str(by_id[value]["temporal_scope"]),
+                subject=str(by_id[value]["subject"]),
+            )
+            for value in evidence_ids
+            if value in by_id
+        ]
+
     def set_claim_state(
         self,
         claim_id: str,
@@ -1038,6 +1102,87 @@ class PersonalMemoryArchive:
             )
         return item_id
 
+    def store_insight_candidate(
+        self,
+        *,
+        content: str,
+        operation: AdaptationOperation | str,
+        support_evidence_ids: Sequence[str],
+        counter_evidence_ids: Sequence[str],
+        uncertainties: Sequence[str],
+        requires_user_confirmation: bool,
+    ) -> InsightCandidate:
+        """Persist one model proposal separately from active personal schemas."""
+        insight_id = str(uuid.uuid4())
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO insight_candidates (
+                  id, content, operation, state, support_evidence_json,
+                  counter_evidence_json, uncertainties_json,
+                  requires_user_confirmation, created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    insight_id,
+                    content,
+                    AdaptationOperation(operation).value,
+                    json.dumps(tuple(support_evidence_ids), separators=(",", ":")),
+                    json.dumps(tuple(counter_evidence_ids), separators=(",", ":")),
+                    json.dumps(tuple(uncertainties), separators=(",", ":")),
+                    int(requires_user_confirmation),
+                    now,
+                    now,
+                ),
+            )
+        result = self.get_insight_candidate(insight_id)
+        if result is None:  # pragma: no cover - SQLite transaction guarantee
+            raise RuntimeError("insight candidate could not be read")
+        return result
+
+    def get_insight_candidate(self, insight_id: str) -> InsightCandidate | None:
+        """Return one isolated reflection proposal by identifier."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM insight_candidates WHERE id = ?",
+                (insight_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return InsightCandidate(
+            id=str(row["id"]),
+            content=str(row["content"]),
+            operation=AdaptationOperation(str(row["operation"])),
+            state=InsightState(str(row["state"])),
+            support_evidence_ids=tuple(
+                json.loads(str(row["support_evidence_json"]))
+            ),
+            counter_evidence_ids=tuple(
+                json.loads(str(row["counter_evidence_json"]))
+            ),
+            created_at=float(row["created_at"]),
+            requires_user_confirmation=bool(row["requires_user_confirmation"]),
+            uncertainties=tuple(json.loads(str(row["uncertainties_json"]))),
+        )
+
+    def set_insight_state(
+        self,
+        insight_id: str,
+        state: InsightState | str,
+    ) -> bool:
+        """Advance one insight without altering its immutable proposal content."""
+        resolved = InsightState(state)
+        with self._lock, self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE insight_candidates SET state = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (resolved.value, time.time(), insight_id),
+            )
+        return updated.rowcount == 1
+
     def external_knowledge_count(self) -> int:
         """Return isolated external-knowledge row count for safety checks."""
         with self._lock, self._connect() as connection:
@@ -1051,6 +1196,23 @@ class PersonalMemoryArchive:
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 "SELECT COUNT(*) AS count FROM personal_schemas WHERE state = 'active'"
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def unresolved_conflict_count(self, *, schema_id: str = "") -> int:
+        """Return unresolved conflict count without exposing personal content."""
+        clause = ""
+        params: tuple[str, ...] = ()
+        if schema_id:
+            clause = " AND schema_id = ?"
+            params = (schema_id,)
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS count FROM schema_conflicts
+                WHERE resolution_state = 'unresolved'{clause}
+                """,
+                params,
             ).fetchone()
         return int(row["count"]) if row is not None else 0
 
@@ -1102,6 +1264,48 @@ class PersonalMemoryArchive:
                 )
             )
         return schemas
+
+    def get_schema(self, schema_id: str) -> PersonalSchema | None:
+        """Return one schema in any maturity state with its current version."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT s.*, v.content AS version_content, v.conditions_json,
+                       v.support_mass, v.counter_mass, v.stability, v.plasticity,
+                       v.scope_fit, v.source_quality, v.temporal_validity
+                FROM personal_schemas AS s
+                JOIN schema_versions AS v ON v.id = s.current_version_id
+                WHERE s.id = ?
+                """,
+                (schema_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        state_value = str(row["state"])
+        if state_value == "retired":
+            state_value = ClaimState.ARCHIVED.value
+        return PersonalSchema(
+            id=str(row["id"]),
+            content=str(row["version_content"]),
+            maturity=SchemaMaturity(str(row["maturity"])),
+            state=ClaimState(state_value),
+            current_version_id=str(row["current_version_id"]),
+            evidence_mass=EvidenceMass(
+                support_mass=float(row["support_mass"]),
+                counter_mass=float(row["counter_mass"]),
+                stability=float(row["stability"]),
+                plasticity=float(row["plasticity"]),
+                scope_fit=float(row["scope_fit"]),
+                source_quality=float(row["source_quality"]),
+                temporal_validity=float(row["temporal_validity"]),
+            ),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+            conditions=tuple(json.loads(str(row["conditions_json"]))),
+            subject_scope=str(row["subject_scope"]),
+            broad_interpretation=bool(row["broad_interpretation"]),
+            user_confirmed=bool(row["user_confirmed"]),
+        )
 
     def apply_schema_accommodation(
         self,
@@ -1280,10 +1484,7 @@ class PersonalMemoryArchive:
                     now,
                 ),
             )
-        return next(
-            (schema for schema in self.get_active_schemas() if schema.id == schema_id),
-            None,
-        )
+        return self.get_schema(schema_id)
 
     def schema_version_count(self, schema_id: str) -> int:
         """Return retained version count for accommodation tests and inspection."""
@@ -1327,6 +1528,7 @@ class PersonalMemoryArchive:
         operation: AdaptationOperation | str,
         reason_code: str,
         superseded_claim_ids: Sequence[str] = (),
+        target_schema_ids: Sequence[str] = (),
     ) -> dict[str, Any] | None:
         """Persist evidence, claims, supersession, and audit atomically."""
         now = time.time()
@@ -1390,6 +1592,65 @@ class PersonalMemoryArchive:
                 )
 
             affected_ids: list[str] = [evidence_id, *superseded]
+            for schema_id in dict.fromkeys(str(value) for value in target_schema_ids):
+                schema = connection.execute(
+                    """
+                    SELECT current_version_id FROM personal_schemas
+                    WHERE id = ? AND state = 'active'
+                    """,
+                    (schema_id,),
+                ).fetchone()
+                if schema is None or not schema["current_version_id"]:
+                    continue
+                if resolved_operation is AdaptationOperation.HOLD_DISEQUILIBRIUM:
+                    conflict_id = str(uuid.uuid4())
+                    connection.execute(
+                        """
+                        INSERT INTO schema_conflicts (
+                          id, schema_id, schema_version_id, evidence_id,
+                          conflict_type, prediction_error, source_quality,
+                          resolution_state, created_at
+                        ) VALUES (?, ?, ?, ?, 'contradiction', ?, ?,
+                                  'unresolved', ?)
+                        """,
+                        (
+                            conflict_id,
+                            schema_id,
+                            str(schema["current_version_id"]),
+                            evidence_id,
+                            candidate.confidence,
+                            candidate.confidence,
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE personal_schemas
+                        SET maturity = 'challenged', updated_at = ? WHERE id = ?
+                        """,
+                        (now, schema_id),
+                    )
+                    affected_ids.append(conflict_id)
+                elif resolved_operation in {
+                    AdaptationOperation.ASSIMILATE_REINFORCE,
+                    AdaptationOperation.ASSIMILATE_AS_EXCEPTION,
+                    AdaptationOperation.ASSIMILATE_LINK_ONLY,
+                }:
+                    relation = (
+                        "exception"
+                        if resolved_operation
+                        is AdaptationOperation.ASSIMILATE_AS_EXCEPTION
+                        else "support"
+                    )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO schema_evidence_links (
+                          schema_version_id, evidence_id, relation, created_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (str(schema["current_version_id"]), evidence_id, relation, now),
+                    )
+                    affected_ids.append(schema_id)
             claim_id = ""
             if candidate.kind in atomic_claim_kinds:
                 claim_id = str(uuid.uuid4())

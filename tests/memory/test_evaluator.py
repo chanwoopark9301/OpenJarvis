@@ -6,14 +6,31 @@ import sqlite3
 
 import pytest
 
+from openjarvis.memory.adaptation import RelationProposal
 from openjarvis.memory.archive import PersonalMemoryArchive
 from openjarvis.memory.evaluator import MemoryEvaluator
-from openjarvis.memory.personal_models import CandidateDraft, CandidateKind
+from openjarvis.memory.personal_models import (
+    AdaptationOperation,
+    CandidateDraft,
+    CandidateKind,
+)
+from openjarvis.memory.relation_classifier import RelationAssessment
 
 
 class _NeverCalledClassifier:
     def classify(self, candidate, schemas):
         raise AssertionError("direct rules must bypass relation classification")
+
+
+class _ContradictionClassifier:
+    def classify(self, candidate, schemas):
+        assert schemas
+        return RelationAssessment(
+            RelationProposal.CONTRADICTS,
+            1.0,
+            "new user evidence conflicts",
+            True,
+        )
 
 
 def _candidate(
@@ -175,3 +192,57 @@ def test_audit_insert_failure_rolls_back_evidence_and_claim(tmp_path):
     assert archive.get_candidate(candidate.id).status == "pending"
     assert archive.get_active_claims() == []
     assert archive.evidence_count(candidate_id=candidate.id) == 0
+
+
+def test_contradiction_challenges_schema_and_leaves_auditable_conflict(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    for index in range(3):
+        candidate = _candidate(
+            archive,
+            exchange_id=f"support-{index}",
+            user_text=f"Running improved my mood on day {index}.",
+            assistant_text="",
+            draft=CandidateDraft(
+                CandidateKind.FACT,
+                f"Running improved my mood on day {index}.",
+                0.8,
+                0.9,
+                subject="running_and_mood",
+            ),
+        )
+        assert MemoryEvaluator(archive).evaluate(candidate.id).applied
+    evidence_ids = tuple(
+        evidence_id
+        for claim in archive.get_active_claims()
+        for evidence_id in claim.evidence_ids
+    )
+    schema = archive.apply_schema_accommodation(
+        content="Running improves my mood.",
+        operation=AdaptationOperation.ACCOMMODATE_CREATE,
+        support_evidence_ids=evidence_ids,
+        subject_scope="running_and_mood",
+        user_confirmed=True,
+    )
+    assert schema is not None
+    contradiction = _candidate(
+        archive,
+        exchange_id="counter",
+        user_text="Running made my mood worse today.",
+        assistant_text="",
+        draft=CandidateDraft(
+            CandidateKind.FACT,
+            "Running made my mood worse today.",
+            1.0,
+            1.0,
+            subject="running_and_mood",
+        ),
+    )
+
+    result = MemoryEvaluator(
+        archive,
+        relation_classifier=_ContradictionClassifier(),
+    ).evaluate(contradiction.id)
+
+    assert result.applied is True
+    assert archive.unresolved_conflict_count(schema_id=schema.id) == 1
+    assert archive.get_active_schemas() == []

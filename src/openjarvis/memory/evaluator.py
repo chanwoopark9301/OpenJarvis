@@ -79,7 +79,11 @@ class MemoryEvaluator:
             )
 
         active_claims = self._archive.get_active_claims()
-        related_schemas = []
+        related_schemas = [
+            schema
+            for schema in self._archive.get_active_schemas()
+            if schema.subject_scope in {"", "user", candidate.subject}
+        ][:8]
         relation = None
         if related_schemas and self._relation_classifier is not None:
             relation = self._relation_classifier.classify(
@@ -107,6 +111,7 @@ class MemoryEvaluator:
             operation=decision.operation,
             reason_code=decision.reason_code,
             superseded_claim_ids=decision.superseded_claim_ids,
+            target_schema_ids=decision.target_schema_ids,
         )
         if persisted is None:
             return EvaluationResult(

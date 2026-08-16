@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 import uuid
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from openjarvis.core.events import Event, EventBus, EventType
 from openjarvis.memory.archive import PersonalMemoryArchive
@@ -16,7 +16,7 @@ from openjarvis.memory.candidate_extractor import (
     is_local_personal_memory_engine,
 )
 from openjarvis.memory.evaluator import MemoryEvaluator
-from openjarvis.memory.personal_models import ConversationExchange
+from openjarvis.memory.personal_models import ConversationExchange, MemoryJob
 from openjarvis.memory.service import publish_completed_exchange
 
 logger = logging.getLogger(__name__)
@@ -43,6 +43,7 @@ class PersonalMemoryService:
         chat_is_busy: Callable[[], bool] | None = None,
         last_user_activity: Callable[[], float] | None = None,
         idle_before_reflection_seconds: float = 30.0,
+        job_handlers: Mapping[str, Callable[[MemoryJob], None]] | None = None,
     ) -> None:
         self._archive = archive
         self._extractor = extractor
@@ -54,6 +55,7 @@ class PersonalMemoryService:
             0.0,
             float(idle_before_reflection_seconds),
         )
+        self._job_handlers = dict(job_handlers or {})
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, max_queue))
         self._max_queue = max(1, max_queue)
         self._queued_ids: set[str] = set()
@@ -261,7 +263,27 @@ class PersonalMemoryService:
                             self._enqueue_job(evaluation_job.id)
                         self._archive.complete_job(claimed_job.id)
                 elif claimed_job.job_type == EVALUATE_CANDIDATE:
-                    self._evaluator.evaluate(claimed_job.subject_id)
+                    result = self._evaluator.evaluate(claimed_job.subject_id)
+                    if result.applied:
+                        consolidation_job = self._archive.enqueue_job(
+                            job_type=CHECK_CONSOLIDATION,
+                            subject_id=claimed_job.subject_id,
+                            idempotency_key=(
+                                f"{CHECK_CONSOLIDATION}:{claimed_job.subject_id}"
+                            ),
+                            priority=50,
+                        )
+                        self._enqueue_job(consolidation_job.id)
+                    self._archive.complete_job(claimed_job.id)
+                elif claimed_job.job_type in {
+                    CHECK_CONSOLIDATION,
+                    REFLECT_CONFLICTS,
+                    VALIDATE_INSIGHT,
+                    IMPORT_LEGACY,
+                }:
+                    handler = self._job_handlers.get(claimed_job.job_type)
+                    if handler is not None:
+                        handler(claimed_job)
                     self._archive.complete_job(claimed_job.id)
                 else:
                     self._archive.fail_job(
@@ -327,10 +349,29 @@ def build_personal_memory_service(
         return None
     archive = PersonalMemoryArchive(getattr(personal, "archive_path", ""))
     extractor = PersonalCandidateExtractor(engine, model, engine_id=engine_key)
+    from openjarvis.memory.developmental_pipeline import DevelopmentalMemoryPipeline
+    from openjarvis.memory.reflection import ReflectionEngine
+    from openjarvis.memory.relation_classifier import RelationClassifier
+
+    evaluator = MemoryEvaluator(
+        archive,
+        relation_classifier=RelationClassifier(engine, model),
+    )
+    pipeline = DevelopmentalMemoryPipeline(
+        archive,
+        ReflectionEngine(
+            engine,
+            model,
+            max_evidence=getattr(personal, "max_evidence_per_job", 12),
+        ),
+        max_evidence=getattr(personal, "max_evidence_per_job", 12),
+    )
     return PersonalMemoryService(
         archive,
         extractor,
         event_bus=event_bus,
+        evaluator=evaluator,
+        job_handlers=pipeline.handlers(),
         max_queue=getattr(personal, "max_queue", 256),
         idle_before_reflection_seconds=getattr(
             personal,
