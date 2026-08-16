@@ -559,6 +559,115 @@ class PersonalMemoryArchive:
             ).fetchone()
         return int(row["count"]) if row is not None else 0
 
+    def create_pending_question(
+        self,
+        *,
+        subject_id: str,
+        question: str,
+        decision_effect: str,
+    ) -> dict[str, Any]:
+        """Create at most one open clarification for a memory subject."""
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM pending_user_questions
+                WHERE subject_id = ? AND state IN ('pending', 'unresolved')
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (subject_id,),
+            ).fetchone()
+            if row is None:
+                question_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO pending_user_questions (
+                      id, subject_id, question, decision_effect, state,
+                      created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (question_id, subject_id, question, decision_effect, now, now),
+                )
+                row = connection.execute(
+                    "SELECT * FROM pending_user_questions WHERE id = ?",
+                    (question_id,),
+                ).fetchone()
+        if row is None:  # pragma: no cover - SQLite transaction guarantee
+            raise RuntimeError("pending question could not be read")
+        return dict(row)
+
+    def answer_pending_question(
+        self,
+        question_id: str,
+        *,
+        answer_text: str,
+        answer_evidence_id: str = "",
+        unresolved: bool = False,
+        cooldown_seconds: float = 0.0,
+    ) -> dict[str, Any] | None:
+        """Record a user answer while preserving uncertainty and cooldown."""
+        now = time.time()
+        state = "unresolved" if unresolved else "answered"
+        cooldown_until = now + max(0.0, float(cooldown_seconds)) if unresolved else 0
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE pending_user_questions
+                SET state = ?, answer_evidence_id = ?, cooldown_until = ?,
+                    updated_at = ?
+                WHERE id = ? AND state IN ('pending', 'unresolved')
+                """,
+                (
+                    state,
+                    answer_evidence_id or None,
+                    cooldown_until,
+                    now,
+                    question_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                return None
+            subject = connection.execute(
+                "SELECT subject_id FROM pending_user_questions WHERE id = ?",
+                (question_id,),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO memory_feedback (
+                  id, subject_id, action, user_text, evidence_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    str(subject["subject_id"]),
+                    state,
+                    answer_text,
+                    answer_evidence_id or None,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM pending_user_questions WHERE id = ?",
+                (question_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def next_pending_question(self) -> dict[str, Any] | None:
+        """Return one askable clarification, respecting unresolved cooldowns."""
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM pending_user_questions
+                WHERE state = 'pending'
+                   OR (state = 'unresolved' AND cooldown_until <= ?)
+                ORDER BY created_at ASC, id ASC LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def reject_candidate(self, candidate_id: str, *, reason_code: str) -> bool:
         """Reject one pending candidate and audit the reason atomically."""
         now = time.time()
