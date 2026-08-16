@@ -10,6 +10,7 @@ from openjarvis.core.types import Message, Role
 from openjarvis.tools.storage._stubs import MemoryBackend, RetrievalResult
 
 if TYPE_CHECKING:
+    from openjarvis.memory.context_composer import ComposedMemoryContext
     from openjarvis.memory.store import Fact
 
 
@@ -50,9 +51,14 @@ def format_context(results: List[RetrievalResult]) -> str:
 def build_context_message(
     results: List[RetrievalResult],
     facts: Sequence[Fact] = (),
+    personal_context: Optional[ComposedMemoryContext] = None,
 ) -> Message:
     """Create a system message with formatted context."""
     sections = []
+    if personal_context is not None:
+        rendered_personal_context = personal_context.render()
+        if rendered_personal_context:
+            sections.append(rendered_personal_context)
     if facts:
         fact_text = "\n".join(f"- {fact.text}" for fact in facts)
         sections.append(
@@ -111,6 +117,7 @@ def inject_context(
     *,
     config: Optional[ContextConfig] = None,
     facts: Sequence[Fact] = (),
+    personal_context: Optional[ComposedMemoryContext] = None,
 ) -> List[Message]:
     """Retrieve relevant context and prepend it to *messages*.
 
@@ -175,7 +182,10 @@ def inject_context(
         truncated.append(r)
         total_tokens += tokens
 
-    if not selected_facts and not truncated:
+    rendered_personal_context = (
+        personal_context.render() if personal_context is not None else ""
+    )
+    if not selected_facts and not truncated and not rendered_personal_context:
         return messages
 
     # Publish event
@@ -187,12 +197,17 @@ def inject_context(
             "query": query,
             "num_results": len(truncated),
             "num_facts": len(selected_facts),
+            "personal_context": bool(rendered_personal_context),
             "total_tokens": total_tokens,
         },
     )
 
     # Build context message and prepend
-    ctx_msg = build_context_message(truncated, selected_facts)
+    ctx_msg = build_context_message(
+        truncated,
+        selected_facts,
+        personal_context=personal_context,
+    )
     return _merge_context_message(messages, ctx_msg)
 
 

@@ -330,6 +330,7 @@ def _run_agent(
     agent_name: str,
     query_text: str,
     engine,
+    engine_name: str,
     model_name: str,
     tool_names: list[str],
     config,
@@ -424,11 +425,19 @@ def _run_agent(
     # Inject memory context into conversation if available
     if config.agent.context_from_memory:
         try:
+            from openjarvis.memory.context_composer import (
+                compose_configured_personal_context,
+            )
             from openjarvis.tools.storage.context import ContextConfig, inject_context
 
             backend = _get_memory_backend(config)
             facts = _get_memory_facts(config)
-            if backend is not None or facts:
+            personal_context = compose_configured_personal_context(
+                config,
+                query_text,
+                engine_key=engine_name,
+            )
+            if backend is not None or facts or personal_context is not None:
                 ctx_cfg = ContextConfig(
                     top_k=config.memory.context_top_k,
                     min_score=config.memory.context_min_score,
@@ -440,6 +449,7 @@ def _run_agent(
                     backend,
                     config=ctx_cfg,
                     facts=facts,
+                    personal_context=personal_context,
                 )
                 for msg in context_messages:
                     ctx.conversation.add(msg)
@@ -886,6 +896,7 @@ def ask(
                 agent_name,
                 query_text,
                 engine,
+                engine_name,
                 model_name,
                 parsed_tools,
                 config,
@@ -970,6 +981,9 @@ def ask(
     # Memory-augmented context injection
     if not no_context and config.agent.context_from_memory:
         try:
+            from openjarvis.memory.context_composer import (
+                compose_configured_personal_context,
+            )
             from openjarvis.tools.storage.context import (
                 ContextConfig,
                 inject_context,
@@ -977,7 +991,12 @@ def ask(
 
             backend = _get_memory_backend(config)
             facts = _get_memory_facts(config)
-            if backend is not None or facts:
+            personal_context = compose_configured_personal_context(
+                config,
+                query_text,
+                engine_key=engine_name,
+            )
+            if backend is not None or facts or personal_context is not None:
                 ctx_cfg = ContextConfig(
                     top_k=config.memory.context_top_k,
                     min_score=config.memory.context_min_score,
@@ -989,6 +1008,7 @@ def ask(
                     backend,
                     config=ctx_cfg,
                     facts=facts,
+                    personal_context=personal_context,
                 )
         except Exception as exc:
             logger.debug("Failed to inject memory context: %s", exc)

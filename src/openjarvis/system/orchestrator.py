@@ -43,6 +43,9 @@ class QueryOrchestrator:
         if context and s.config.agent.context_from_memory:
             try:
                 from openjarvis.memory import load_configured_facts
+                from openjarvis.memory.context_composer import (
+                    compose_configured_personal_context,
+                )
                 from openjarvis.tools.storage.context import (
                     ContextConfig,
                     inject_context,
@@ -60,6 +63,11 @@ class QueryOrchestrator:
                     s.memory_backend,
                     config=ctx_cfg,
                     facts=facts,
+                    personal_context=compose_configured_personal_context(
+                        s.config,
+                        query,
+                        engine_key=s.engine_key,
+                    ),
                 )
             except Exception as exc:
                 logger.warning("Failed to inject memory context: %s", exc)

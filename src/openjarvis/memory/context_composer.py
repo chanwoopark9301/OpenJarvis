@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from openjarvis.memory.archive import PersonalMemoryArchive
+from openjarvis.memory.candidate_extractor import is_local_personal_memory_engine
 from openjarvis.memory.personal_models import DIRECT_RULE_KINDS, CandidateKind
 
 
@@ -121,4 +122,34 @@ class ContextComposer:
         )
 
 
-__all__ = ["ComposedMemoryContext", "ContextComposer", "ContextSection"]
+def compose_configured_personal_context(
+    config: object,
+    current_user_text: str,
+    *,
+    engine_key: str,
+    archive: PersonalMemoryArchive | None = None,
+) -> ComposedMemoryContext | None:
+    """Compose only when both storage and the response engine are local."""
+    personal = getattr(config, "personal_memory", None)
+    if personal is None or not getattr(personal, "enabled", False):
+        return None
+    if not is_local_personal_memory_engine(config, engine_key):
+        return None
+    selected_archive = archive or PersonalMemoryArchive(
+        getattr(personal, "archive_path", "")
+    )
+    return ContextComposer(
+        selected_archive,
+        max_constraints=getattr(personal, "context_constraints", 5),
+        max_schemas=getattr(personal, "context_schemas", 8),
+        max_episodes=getattr(personal, "context_episodes", 5),
+        max_raw_evidence=getattr(personal, "context_raw_evidence", 3),
+    ).compose(current_user_text)
+
+
+__all__ = [
+    "ComposedMemoryContext",
+    "ContextComposer",
+    "ContextSection",
+    "compose_configured_personal_context",
+]

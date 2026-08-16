@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import Message, Role
+from openjarvis.memory.context_composer import ComposedMemoryContext, ContextSection
 from openjarvis.memory.store import Fact
 from openjarvis.tools.storage._stubs import MemoryBackend, RetrievalResult
 from openjarvis.tools.storage.context import (
@@ -306,3 +307,57 @@ def test_inject_context_does_not_mutate_original():
     augmented = inject_context("query", messages, backend)
     assert len(messages) == original_len
     assert len(augmented) == original_len + 1
+
+
+def test_inject_context_places_personal_rules_before_legacy_facts():
+    personal = ComposedMemoryContext(
+        constraints=("Do not proactively mention timers.",),
+        current_states=(),
+        schemas=(),
+        episodes=(),
+        raw_evidence=(),
+        unresolved=(),
+        user_overlay="",
+        sections=(
+            ContextSection(
+                "direct_constraints",
+                ("Do not proactively mention timers.",),
+            ),
+        ),
+    )
+
+    augmented = inject_context(
+        "hello",
+        [Message(role=Role.USER, content="hello")],
+        None,
+        facts=[Fact(text="User once liked timers")],
+        personal_context=personal,
+    )
+
+    content = augmented[0].content
+    assert content.index("Do not proactively mention timers") < content.index(
+        "User once liked timers"
+    )
+
+
+def test_personal_context_alone_is_injected():
+    personal = ComposedMemoryContext(
+        constraints=("Keep a companion role.",),
+        current_states=(),
+        schemas=(),
+        episodes=(),
+        raw_evidence=(),
+        unresolved=(),
+        user_overlay="",
+        sections=(ContextSection("direct_constraints", ("Keep a companion role.",)),),
+    )
+
+    augmented = inject_context(
+        "hello",
+        [Message(role=Role.USER, content="hello")],
+        None,
+        personal_context=personal,
+    )
+
+    assert augmented[0].role == Role.SYSTEM
+    assert "Keep a companion role." in augmented[0].content

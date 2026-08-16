@@ -131,6 +131,9 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
 
             memory_service = getattr(request.app.state, "memory_service", None)
             facts = memory_service.list_facts() if memory_service is not None else []
+            personal_memory_service = getattr(
+                request.app.state, "personal_memory_service", None
+            )
 
             # Extract query from the last user message
             query_text = ""
@@ -140,6 +143,10 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                     break
 
             if query_text:
+                from openjarvis.memory.context_composer import (
+                    compose_configured_personal_context,
+                )
+
                 messages = _to_messages(request_body.messages)
                 messages = _ensure_identity_prompt(messages, config)
                 ctx_cfg = ContextConfig(
@@ -153,6 +160,19 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                     memory_backend,
                     config=ctx_cfg,
                     facts=facts,
+                    personal_context=compose_configured_personal_context(
+                        config,
+                        query_text,
+                        engine_key=(
+                            _engine_key_for_model(engine, model)
+                            or getattr(request.app.state, "engine_name", "")
+                        ),
+                        archive=(
+                            personal_memory_service.archive
+                            if personal_memory_service is not None
+                            else None
+                        ),
+                    ),
                 )
                 # Rebuild after identity/context merging so downstream engine
                 # adapters always receive exactly one system message.

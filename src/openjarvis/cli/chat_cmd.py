@@ -297,6 +297,9 @@ def chat(
         if config.agent.context_from_memory:
             try:
                 from openjarvis.memory import load_configured_facts
+                from openjarvis.memory.context_composer import (
+                    compose_configured_personal_context,
+                )
                 from openjarvis.tools.storage.context import (
                     ContextConfig,
                     inject_context,
@@ -317,6 +320,16 @@ def chat(
                     memory_backend,
                     config=ctx_cfg,
                     facts=facts,
+                    personal_context=compose_configured_personal_context(
+                        config,
+                        user_input,
+                        engine_key=engine_name,
+                        archive=(
+                            personal_memory_service.archive
+                            if personal_memory_service is not None
+                            else None
+                        ),
+                    ),
                 )
                 if agent is not None:
                     if context_messages:

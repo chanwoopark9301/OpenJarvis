@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from openjarvis.memory.archive import PersonalMemoryArchive
-from openjarvis.memory.context_composer import ContextComposer
+from openjarvis.memory.context_composer import (
+    ContextComposer,
+    compose_configured_personal_context,
+)
 from openjarvis.memory.evaluator import MemoryEvaluator
 from openjarvis.memory.personal_models import CandidateDraft, CandidateKind
 
@@ -118,3 +121,36 @@ def test_latest_unevaluated_text_is_a_user_overlay_not_a_system_rule(tmp_path):
     assert context.user_overlay == "I might want to run tomorrow."
     assert "definitely a runner" not in context.render()
     assert "definitely a runner" not in context.user_overlay
+
+
+def test_configured_context_refuses_non_local_response_engine(tmp_path):
+    from openjarvis.core.config import JarvisConfig
+
+    config = JarvisConfig()
+    config.personal_memory.enabled = True
+    config.personal_memory.archive_path = str(tmp_path / "personal.db")
+
+    assert (
+        compose_configured_personal_context(
+            config,
+            "hello",
+            engine_key="openai",
+        )
+        is None
+    )
+
+
+def test_configured_context_allows_loopback_response_engine(tmp_path):
+    from openjarvis.core.config import JarvisConfig
+
+    config = JarvisConfig()
+    config.personal_memory.enabled = True
+    config.personal_memory.archive_path = str(tmp_path / "personal.db")
+
+    context = compose_configured_personal_context(
+        config,
+        "hello",
+        engine_key="ollama",
+    )
+
+    assert context is not None

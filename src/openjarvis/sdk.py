@@ -523,6 +523,9 @@ class Jarvis:
         if context and self._config.agent.context_from_memory:
             try:
                 from openjarvis.cli.ask import _get_memory_backend, _get_memory_facts
+                from openjarvis.memory.context_composer import (
+                    compose_configured_personal_context,
+                )
                 from openjarvis.tools.storage.context import (
                     ContextConfig,
                     inject_context,
@@ -530,7 +533,12 @@ class Jarvis:
 
                 backend = _get_memory_backend(self._config)
                 facts = _get_memory_facts(self._config)
-                if backend is not None or facts:
+                personal_context = compose_configured_personal_context(
+                    self._config,
+                    query,
+                    engine_key=self._resolved_engine_key or "",
+                )
+                if backend is not None or facts or personal_context is not None:
                     ctx_cfg = ContextConfig(
                         top_k=self._config.memory.context_top_k,
                         min_score=self._config.memory.context_min_score,
@@ -542,6 +550,7 @@ class Jarvis:
                         backend,
                         config=ctx_cfg,
                         facts=facts,
+                        personal_context=personal_context,
                     )
                     for msg in context_messages:
                         ctx.conversation.add(msg)
@@ -573,11 +582,19 @@ class Jarvis:
         """Inject memory context into messages."""
         try:
             from openjarvis.cli.ask import _get_memory_backend, _get_memory_facts
+            from openjarvis.memory.context_composer import (
+                compose_configured_personal_context,
+            )
             from openjarvis.tools.storage.context import ContextConfig, inject_context
 
             backend = _get_memory_backend(self._config)
             facts = _get_memory_facts(self._config)
-            if backend is not None or facts:
+            personal_context = compose_configured_personal_context(
+                self._config,
+                query,
+                engine_key=self._resolved_engine_key or "",
+            )
+            if backend is not None or facts or personal_context is not None:
                 ctx_cfg = ContextConfig(
                     top_k=self._config.memory.context_top_k,
                     min_score=self._config.memory.context_min_score,
@@ -589,6 +606,7 @@ class Jarvis:
                     backend,
                     config=ctx_cfg,
                     facts=facts,
+                    personal_context=personal_context,
                 )
         except Exception as exc:
             logger.warning("Failed to inject memory context: %s", exc)
