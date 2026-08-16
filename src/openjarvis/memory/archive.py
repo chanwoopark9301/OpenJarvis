@@ -12,10 +12,15 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from openjarvis.memory.personal_models import (
+    AdaptationOperation,
     CandidateDraft,
+    CandidateKind,
+    ClaimState,
     ConversationExchange,
+    EvidenceSource,
     MemoryCandidate,
     MemoryJob,
+    PersonalClaim,
 )
 
 _SCHEMA_VERSION = 2
@@ -81,10 +86,18 @@ CREATE TABLE IF NOT EXISTS personal_claims (
   state TEXT NOT NULL DEFAULT 'pending',
   source TEXT NOT NULL,
   temporal_scope TEXT NOT NULL DEFAULT 'unspecified',
+  subject_scope TEXT NOT NULL DEFAULT 'user',
   supersedes_id TEXT REFERENCES personal_claims(id),
   expires_at REAL NOT NULL DEFAULT 0,
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS claim_evidence_links (
+  claim_id TEXT NOT NULL REFERENCES personal_claims(id),
+  evidence_id TEXT NOT NULL REFERENCES evidence_items(id),
+  created_at REAL NOT NULL,
+  PRIMARY KEY(claim_id, evidence_id)
 );
 
 CREATE TABLE IF NOT EXISTS personal_schemas (
@@ -93,6 +106,7 @@ CREATE TABLE IF NOT EXISTS personal_schemas (
   state TEXT NOT NULL DEFAULT 'pending',
   maturity TEXT NOT NULL DEFAULT 'tentative',
   current_version_id TEXT,
+  subject_scope TEXT NOT NULL DEFAULT 'user',
   broad_interpretation INTEGER NOT NULL DEFAULT 0,
   user_confirmed INTEGER NOT NULL DEFAULT 0,
   created_at REAL NOT NULL,
@@ -265,6 +279,26 @@ class PersonalMemoryArchive:
                     connection.execute(
                         f"ALTER TABLE memory_candidates ADD COLUMN {name} {declaration}"
                     )
+            table_column_migrations = {
+                "personal_claims": {
+                    "subject_scope": "TEXT NOT NULL DEFAULT 'user'",
+                },
+                "personal_schemas": {
+                    "subject_scope": "TEXT NOT NULL DEFAULT 'user'",
+                },
+            }
+            for table, migrations in table_column_migrations.items():
+                existing = {
+                    str(row["name"])
+                    for row in connection.execute(
+                        f"PRAGMA table_info({table})"
+                    ).fetchall()
+                }
+                for name, declaration in migrations.items():
+                    if name not in existing:
+                        connection.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                        )
             connection.execute(
                 """
                 INSERT INTO archive_metadata(key, value)
@@ -349,6 +383,26 @@ class PersonalMemoryArchive:
             updated_at=float(row["updated_at"]),
         )
 
+    @staticmethod
+    def _claim_from_row(
+        row: sqlite3.Row,
+        evidence_ids: Sequence[str] = (),
+    ) -> PersonalClaim:
+        return PersonalClaim(
+            id=str(row["id"]),
+            kind=CandidateKind(str(row["kind"])),
+            content=str(row["content"]),
+            state=ClaimState(str(row["state"])),
+            source=EvidenceSource(str(row["source"])),
+            evidence_ids=tuple(evidence_ids),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+            temporal_scope=str(row["temporal_scope"]),
+            subject_scope=str(row["subject_scope"]),
+            supersedes_id=str(row["supersedes_id"] or ""),
+            expires_at=float(row["expires_at"]),
+        )
+
     def schema_version(self) -> int:
         """Return the archive schema version after in-place migration."""
         with self._lock, self._connect() as connection:
@@ -421,6 +475,248 @@ class PersonalMemoryArchive:
                 "SELECT * FROM conversation_exchanges WHERE id = ?", (exchange_id,)
             ).fetchone()
         return self._exchange_from_row(row) if row is not None else None
+
+    def get_candidate(self, candidate_id: str) -> MemoryCandidate | None:
+        """Return one provisional candidate by stable ID."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM memory_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+        return self._candidate_from_row(row) if row is not None else None
+
+    def get_active_claims(
+        self,
+        *,
+        kind: CandidateKind | str | None = None,
+    ) -> list[PersonalClaim]:
+        """Return active atomic claims with their exact evidence links."""
+        params: list[Any] = []
+        kind_clause = ""
+        if kind is not None:
+            kind_clause = " AND kind = ?"
+            params.append(CandidateKind(kind).value)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM personal_claims
+                WHERE state = 'active'{kind_clause}
+                ORDER BY updated_at DESC, id ASC
+                """,
+                params,
+            ).fetchall()
+            claims = []
+            for row in rows:
+                evidence_rows = connection.execute(
+                    """
+                    SELECT evidence_id FROM claim_evidence_links
+                    WHERE claim_id = ? ORDER BY created_at ASC, evidence_id ASC
+                    """,
+                    (str(row["id"]),),
+                ).fetchall()
+                claims.append(
+                    self._claim_from_row(
+                        row,
+                        [str(item["evidence_id"]) for item in evidence_rows],
+                    )
+                )
+        return claims
+
+    def get_claim(self, claim_id: str) -> PersonalClaim | None:
+        """Return an atomic claim in any lifecycle state."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM personal_claims WHERE id = ?", (claim_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            evidence_rows = connection.execute(
+                """
+                SELECT evidence_id FROM claim_evidence_links
+                WHERE claim_id = ? ORDER BY created_at ASC, evidence_id ASC
+                """,
+                (claim_id,),
+            ).fetchall()
+        return self._claim_from_row(
+            row,
+            [str(item["evidence_id"]) for item in evidence_rows],
+        )
+
+    def decision_count(self, *, subject_id: str) -> int:
+        """Count append-only decisions for idempotency and audit checks."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM memory_decisions WHERE subject_id = ?",
+                (subject_id,),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def evidence_count(self, *, candidate_id: str) -> int:
+        """Count evidence rows derived from one provisional candidate."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM evidence_items WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def reject_candidate(self, candidate_id: str, *, reason_code: str) -> bool:
+        """Reject one pending candidate and audit the reason atomically."""
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE memory_candidates
+                SET status = 'rejected', updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, candidate_id),
+            )
+            if updated.rowcount != 1:
+                return False
+            connection.execute(
+                """
+                INSERT INTO memory_decisions (
+                  id, subject_id, subject_type, operation, reason_code,
+                  affected_ids_json, details_json, created_at
+                ) VALUES (?, ?, 'candidate', 'no_op', ?, '[]', '{}', ?)
+                """,
+                (str(uuid.uuid4()), candidate_id, reason_code, now),
+            )
+        return True
+
+    def apply_candidate_decision(
+        self,
+        candidate_id: str,
+        *,
+        operation: AdaptationOperation | str,
+        reason_code: str,
+        superseded_claim_ids: Sequence[str] = (),
+    ) -> dict[str, Any] | None:
+        """Persist evidence, claims, supersession, and audit atomically."""
+        now = time.time()
+        resolved_operation = AdaptationOperation(operation)
+        atomic_claim_kinds = {
+            CandidateKind.FACT,
+            CandidateKind.PREFERENCE,
+            CandidateKind.CONSTRAINT,
+            CandidateKind.CORRECTION,
+            CandidateKind.ROLE_PREFERENCE,
+            CandidateKind.CAPABILITY_BOUNDARY,
+        }
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM memory_candidates WHERE id = ? AND status = 'pending'",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            candidate = self._candidate_from_row(row)
+            exchange = connection.execute(
+                "SELECT session_id FROM conversation_exchanges WHERE id = ?",
+                (candidate.exchange_id,),
+            ).fetchone()
+            if exchange is None:
+                raise RuntimeError("candidate evidence exchange is missing")
+
+            evidence_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO evidence_items (
+                  id, exchange_id, candidate_id, source, content, temporal_scope,
+                  subject, session_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence_id,
+                    candidate.exchange_id,
+                    candidate.id,
+                    candidate.source.value,
+                    candidate.content,
+                    candidate.temporal_scope,
+                    candidate.subject,
+                    str(exchange["session_id"]),
+                    now,
+                ),
+            )
+
+            superseded = tuple(
+                dict.fromkeys(str(value) for value in superseded_claim_ids)
+            )
+            for claim_id in superseded:
+                connection.execute(
+                    """
+                    UPDATE personal_claims
+                    SET state = 'superseded', updated_at = ?
+                    WHERE id = ? AND state = 'active'
+                    """,
+                    (now, claim_id),
+                )
+
+            affected_ids: list[str] = [evidence_id, *superseded]
+            claim_id = ""
+            if candidate.kind in atomic_claim_kinds:
+                claim_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO personal_claims (
+                      id, kind, content, state, source, temporal_scope,
+                      subject_scope, supersedes_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        claim_id,
+                        candidate.kind.value,
+                        candidate.content,
+                        candidate.source.value,
+                        candidate.temporal_scope,
+                        candidate.subject,
+                        superseded[0] if superseded else None,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO claim_evidence_links(claim_id, evidence_id, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (claim_id, evidence_id, now),
+                )
+                affected_ids.append(claim_id)
+
+            connection.execute(
+                """
+                UPDATE memory_candidates
+                SET status = 'accepted', updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, candidate_id),
+            )
+            decision_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO memory_decisions (
+                  id, subject_id, subject_type, operation, reason_code,
+                  affected_ids_json, details_json, created_at
+                ) VALUES (?, ?, 'candidate', ?, ?, ?, '{}', ?)
+                """,
+                (
+                    decision_id,
+                    candidate_id,
+                    resolved_operation.value,
+                    reason_code,
+                    json.dumps(affected_ids, separators=(",", ":")),
+                    now,
+                ),
+            )
+        return {
+            "decision_id": decision_id,
+            "evidence_id": evidence_id,
+            "claim_id": claim_id,
+            "superseded_claim_ids": superseded,
+        }
 
     def claim_candidate_job(self, exchange_id: str) -> ConversationExchange | None:
         """Atomically move retryable work to processing and return its evidence."""
