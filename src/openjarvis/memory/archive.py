@@ -476,6 +476,19 @@ class PersonalMemoryArchive:
             ).fetchone()
         return self._exchange_from_row(row) if row is not None else None
 
+    def get_latest_unevaluated_user_text(self) -> str:
+        """Return only the user's newest raw text awaiting candidate extraction."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT user_text FROM conversation_exchanges
+                WHERE candidate_state != 'complete'
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return str(row["user_text"]) if row is not None else ""
+
     def get_candidate(self, candidate_id: str) -> MemoryCandidate | None:
         """Return one provisional candidate by stable ID."""
         with self._lock, self._connect() as connection:
