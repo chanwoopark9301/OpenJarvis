@@ -554,6 +554,205 @@ class PersonalMemoryArchive:
             [str(item["evidence_id"]) for item in evidence_rows],
         )
 
+    def list_claims(self) -> list[PersonalClaim]:
+        """Return claims in every lifecycle state for user inspection."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM personal_claims ORDER BY updated_at DESC, id ASC"
+            ).fetchall()
+            claims = []
+            for row in rows:
+                evidence_rows = connection.execute(
+                    """
+                    SELECT evidence_id FROM claim_evidence_links
+                    WHERE claim_id = ? ORDER BY created_at ASC, evidence_id ASC
+                    """,
+                    (str(row["id"]),),
+                ).fetchall()
+                claims.append(
+                    self._claim_from_row(
+                        row,
+                        [str(item["evidence_id"]) for item in evidence_rows],
+                    )
+                )
+        return claims
+
+    def evidence_texts(self, evidence_ids: Sequence[str]) -> tuple[str, ...]:
+        """Return only evidence explicitly requested by stable identifier."""
+        if not evidence_ids:
+            return ()
+        placeholders = ",".join("?" for _ in evidence_ids)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, content FROM evidence_items
+                WHERE id IN ({placeholders})
+                """,
+                tuple(evidence_ids),
+            ).fetchall()
+        content_by_id = {str(row["id"]): str(row["content"]) for row in rows}
+        return tuple(
+            content_by_id[value] for value in evidence_ids if value in content_by_id
+        )
+
+    def set_claim_state(
+        self,
+        claim_id: str,
+        state: ClaimState | str,
+        *,
+        reason: str,
+    ) -> bool:
+        """Apply an auditable user-requested claim state transition."""
+        resolved_state = ClaimState(state)
+        if resolved_state not in {ClaimState.ACTIVE, ClaimState.SUPPRESSED}:
+            raise ValueError("unsupported user claim state")
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE personal_claims SET state = ?, updated_at = ?
+                WHERE id = ? AND state IN ('active', 'suppressed')
+                """,
+                (resolved_state.value, now, claim_id),
+            )
+            if updated.rowcount != 1:
+                return False
+            connection.execute(
+                """
+                INSERT INTO memory_feedback (
+                  id, subject_id, action, user_text, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    claim_id,
+                    resolved_state.value,
+                    reason,
+                    now,
+                ),
+            )
+        return True
+
+    def delete_claim_subject(
+        self,
+        claim_id: str,
+        *,
+        include_raw_evidence: bool = False,
+    ) -> dict[str, int]:
+        """Delete one claim while preserving its raw evidence unless requested."""
+        counts = {"personal_claims": 0, "evidence_items": 0, "exchanges": 0}
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            evidence_rows = connection.execute(
+                "SELECT evidence_id FROM claim_evidence_links WHERE claim_id = ?",
+                (claim_id,),
+            ).fetchall()
+            evidence_ids = [str(row["evidence_id"]) for row in evidence_rows]
+            connection.execute(
+                """
+                UPDATE personal_claims SET supersedes_id = NULL
+                WHERE supersedes_id = ?
+                """,
+                (claim_id,),
+            )
+            connection.execute(
+                "DELETE FROM claim_evidence_links WHERE claim_id = ?",
+                (claim_id,),
+            )
+            counts["personal_claims"] = connection.execute(
+                "DELETE FROM personal_claims WHERE id = ?",
+                (claim_id,),
+            ).rowcount
+            if include_raw_evidence:
+                for evidence_id in evidence_ids:
+                    evidence = connection.execute(
+                        """
+                        SELECT exchange_id, candidate_id FROM evidence_items
+                        WHERE id = ?
+                        """,
+                        (evidence_id,),
+                    ).fetchone()
+                    if evidence is None:
+                        continue
+                    exchange_id = str(evidence["exchange_id"])
+                    candidate_id = str(evidence["candidate_id"] or "")
+                    counts["evidence_items"] += connection.execute(
+                        "DELETE FROM evidence_items WHERE id = ?",
+                        (evidence_id,),
+                    ).rowcount
+                    if candidate_id:
+                        connection.execute(
+                            "DELETE FROM memory_candidates WHERE id = ?",
+                            (candidate_id,),
+                        )
+                    remaining = connection.execute(
+                        """
+                        SELECT
+                          (SELECT COUNT(*) FROM evidence_items WHERE exchange_id = ?) +
+                          (SELECT COUNT(*) FROM memory_candidates WHERE exchange_id = ?)
+                          AS count
+                        """,
+                        (exchange_id, exchange_id),
+                    ).fetchone()
+                    if remaining is not None and int(remaining["count"]) == 0:
+                        counts["exchanges"] += connection.execute(
+                            "DELETE FROM conversation_exchanges WHERE id = ?",
+                            (exchange_id,),
+                        ).rowcount
+        return counts
+
+    def personal_table_counts(self) -> dict[str, int]:
+        """Return local row counts without exposing any stored content."""
+        tables = (
+            "conversation_exchanges",
+            "memory_candidates",
+            "evidence_items",
+            "personal_claims",
+            "personal_schemas",
+            "schema_versions",
+            "schema_conflicts",
+            "insight_candidates",
+            "external_knowledge_items",
+            "memory_jobs",
+            "pending_user_questions",
+        )
+        with self._lock, self._connect() as connection:
+            return {
+                table: int(
+                    connection.execute(
+                        f"SELECT COUNT(*) AS count FROM {table}"
+                    ).fetchone()["count"]
+                )
+                for table in tables
+            }
+
+    def delete_all_personal_data(self) -> dict[str, int]:
+        """Delete personal-memory rows in foreign-key-safe dependency order."""
+        counts = self.personal_table_counts()
+        tables = (
+            "pending_user_questions",
+            "memory_feedback",
+            "memory_decisions",
+            "memory_jobs",
+            "schema_conflicts",
+            "schema_evidence_links",
+            "schema_versions",
+            "personal_schemas",
+            "insight_candidates",
+            "external_knowledge_items",
+            "claim_evidence_links",
+            "personal_claims",
+            "evidence_items",
+            "memory_candidates",
+            "conversation_exchanges",
+        )
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for table in tables:
+                connection.execute(f"DELETE FROM {table}")
+        return counts
+
     def decision_count(self, *, subject_id: str) -> int:
         """Count append-only decisions for idempotency and audit checks."""
         with self._lock, self._connect() as connection:

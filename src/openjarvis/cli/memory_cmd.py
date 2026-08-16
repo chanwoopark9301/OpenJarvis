@@ -180,6 +180,17 @@ def _get_fact_store():
     )
 
 
+def _get_personal_inspector():
+    """Open the configured local personal-memory archive for explicit controls."""
+    from openjarvis.memory.archive import PersonalMemoryArchive
+    from openjarvis.memory.inspector import PersonalMemoryInspector
+
+    config = load_config()
+    return PersonalMemoryInspector(
+        PersonalMemoryArchive(config.personal_memory.archive_path)
+    )
+
+
 @memory.command(name="list")
 def list_facts() -> None:
     """List durable facts captured by the automatic memory service."""
@@ -225,6 +236,106 @@ def clear(yes: bool) -> None:
 
     removed = store.clear()
     console.print(f"[green]Cleared {removed} memory fact(s).[/green]")
+
+
+@memory.command(name="personal-list")
+def personal_list() -> None:
+    """List developmental personal-memory subjects and their states."""
+    console = Console()
+    subjects = _get_personal_inspector().list_subjects()
+    if not subjects:
+        console.print("[yellow]No personal memories stored yet.[/yellow]")
+        return
+    table = Table(title=f"Personal Memory ({len(subjects)})")
+    table.add_column("ID", style="dim")
+    table.add_column("State", style="cyan")
+    table.add_column("Content")
+    for subject in subjects:
+        table.add_row(subject.id, subject.state, subject.content)
+    console.print(table)
+
+
+@memory.command(name="personal-explain")
+@click.argument("subject_id")
+def personal_explain(subject_id: str) -> None:
+    """Show one memory and only its directly linked evidence."""
+    console = Console()
+    subject = _get_personal_inspector().explain(subject_id)
+    if subject is None:
+        raise click.ClickException("Personal memory not found")
+    console.print(f"[cyan]State:[/cyan] {subject.state}")
+    console.print(f"[cyan]Content:[/cyan] {subject.content}")
+    if subject.supporting_evidence:
+        console.print("[cyan]Supporting evidence:[/cyan]")
+        for evidence in subject.supporting_evidence:
+            console.print(f"- {evidence}")
+
+
+@memory.command(name="personal-suppress")
+@click.argument("subject_id")
+@click.option("--reason", default="user requested", show_default=True)
+def personal_suppress(subject_id: str, reason: str) -> None:
+    """Hide one personal memory from future response context."""
+    if not _get_personal_inspector().suppress(subject_id, reason):
+        raise click.ClickException("Personal memory not found")
+    Console().print("[green]Personal memory suppressed.[/green]")
+
+
+@memory.command(name="personal-restore")
+@click.argument("subject_id")
+def personal_restore(subject_id: str) -> None:
+    """Restore one suppressed personal memory."""
+    if not _get_personal_inspector().restore(subject_id):
+        raise click.ClickException("Suppressed personal memory not found")
+    Console().print("[green]Personal memory restored.[/green]")
+
+
+@memory.command(name="personal-correct")
+@click.argument("subject_id")
+@click.argument("replacement_text")
+@click.option("--user-text", required=True)
+def personal_correct(
+    subject_id: str,
+    replacement_text: str,
+    user_text: str,
+) -> None:
+    """Supersede one memory with a user-confirmed correction."""
+    result = _get_personal_inspector().correct(
+        subject_id,
+        replacement_text,
+        user_text,
+    )
+    if result is None:
+        raise click.ClickException("Personal memory could not be corrected")
+    Console().print(f"[green]Created corrected memory {result.id}.[/green]")
+
+
+@memory.command(name="personal-delete")
+@click.argument("subject_id")
+@click.option("--include-raw-evidence", is_flag=True, default=False)
+def personal_delete(subject_id: str, include_raw_evidence: bool) -> None:
+    """Delete one memory, preserving raw evidence unless explicitly requested."""
+    removed = _get_personal_inspector().delete_subject(
+        subject_id,
+        include_raw_evidence=include_raw_evidence,
+    )
+    if not removed["personal_claims"]:
+        raise click.ClickException("Personal memory not found")
+    Console().print("[green]Personal memory deleted.[/green]")
+
+
+@memory.command(name="personal-delete-all")
+@click.option("--confirm-token", required=True)
+def personal_delete_all(confirm_token: str) -> None:
+    """Delete all personal memory after exact-token confirmation."""
+    inspector = _get_personal_inspector()
+    preview = inspector.deletion_preview()
+    Console().print(f"Rows scheduled for deletion: {sum(preview.values())}")
+    try:
+        removed = inspector.delete_all_personal_memory(confirm_token)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    Console().print(f"[green]Deleted {sum(removed.values())} rows.[/green]")
 
 
 @memory.command()
