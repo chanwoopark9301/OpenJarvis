@@ -319,7 +319,7 @@ def personal_delete(subject_id: str, include_raw_evidence: bool) -> None:
         subject_id,
         include_raw_evidence=include_raw_evidence,
     )
-    if not removed["personal_claims"]:
+    if not any(removed.values()):
         raise click.ClickException("Personal memory not found")
     Console().print("[green]Personal memory deleted.[/green]")
 

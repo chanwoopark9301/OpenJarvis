@@ -127,10 +127,13 @@ async def delete_personal_memory(
     include_raw_evidence: bool = False,
 ):
     """Delete one subject and optionally its linked raw evidence."""
-    return _require_local_inspector(request).delete_subject(
+    removed = _require_local_inspector(request).delete_subject(
         subject_id,
         include_raw_evidence=include_raw_evidence,
     )
+    if not any(removed.values()):
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return removed
 
 
 @router.delete("")
