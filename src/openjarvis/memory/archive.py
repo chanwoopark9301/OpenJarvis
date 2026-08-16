@@ -668,6 +668,57 @@ class PersonalMemoryArchive:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def store_external_knowledge(
+        self,
+        *,
+        request_id: str,
+        provider_id: str,
+        source_url: str,
+        query_text: str,
+        summary: str,
+        consent_id: str,
+        deidentified: bool,
+    ) -> str:
+        """Store general outside knowledge without creating personal evidence."""
+        item_id = str(uuid.uuid4())
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO external_knowledge_items (
+                  id, request_id, provider_id, source_url, query_text, summary,
+                  consent_id, deidentified, retrieved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item_id,
+                    request_id,
+                    provider_id,
+                    source_url,
+                    query_text,
+                    summary,
+                    consent_id,
+                    int(bool(deidentified)),
+                    time.time(),
+                ),
+            )
+        return item_id
+
+    def external_knowledge_count(self) -> int:
+        """Return isolated external-knowledge row count for safety checks."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM external_knowledge_items"
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def active_schema_count(self) -> int:
+        """Return active personal-schema count without exposing their content."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM personal_schemas WHERE state = 'active'"
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
     def reject_candidate(self, candidate_id: str, *, reason_code: str) -> bool:
         """Reject one pending candidate and audit the reason atomically."""
         now = time.time()
