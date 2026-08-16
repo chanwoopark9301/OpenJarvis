@@ -446,6 +446,11 @@ def create_app(
     app.include_router(upload_router)
     app.include_router(research_router)
     app.include_router(analytics_router)
+    from openjarvis.server.personal_memory_routes import (
+        router as personal_memory_router,
+    )
+
+    app.include_router(personal_memory_router)
     include_all_routes(app)
 
     # Restore SendBlue channel bindings from database on startup
