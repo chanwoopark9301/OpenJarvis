@@ -39,8 +39,11 @@ Add literal cases proving:
 ```python
 assert needs_web_search("안녕?") is False
 assert needs_web_search("요즘 내가 왜 이렇게 지치는지 모르겠어") is False
-assert needs_web_search("내 심리를 인터넷에서 검색해서 분석해 줘") is False
+assert needs_web_search("내 상태와 관련된 심리 연구를 인터넷에서 찾아줘") is True
 assert needs_web_search("이 글을 요약해 줘") is False
+assert needs_web_search("요즘 인기 있는 러닝화를 검색해 줘") is True
+assert needs_web_search("인터넷에서 대전 맛집을 찾아줘") is True
+assert needs_web_search("웹에서 테미오래 운영시간을 확인해 줘") is True
 assert needs_web_search("내일 대전 테미오래 운영시간을 인터넷에서 확인해 줘") is True
 assert needs_web_search("대전 한식 맛집과 소품샵을 찾아줘") is True
 assert needs_web_search("오늘 서울 날씨가 어때?") is True
@@ -56,9 +59,11 @@ Expected: import failure because `_auto_search.py` does not exist.
 
 - [ ] **Step 3: Implement the minimal pure gate**
 
-Use normalized text and three signal groups:
+Use normalized text and four decision stages in this order:
 
-- explicit search: `인터넷`, `검색`, `찾아줘`, `찾아봐`, `출처`, `확인해 줘`;
+- explicit search commands: `검색해 줘`, `검색해줘`, `인터넷에서 ... 찾아줘`,
+  `인터넷에서 ... 확인해 줘`, `웹에서 ... 찾아줘`, `웹에서 ... 확인해 줘`;
+- private introspection exclusion for requests without an explicit search command;
 - current domain: weather, hours, closures, price, transport, events combined with today/tomorrow/current/latest signals;
 - local recommendations: restaurant, cafe, shop, attraction, or small-goods-shop combined with find/recommend/where signals.
 
