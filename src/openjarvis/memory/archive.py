@@ -29,7 +29,19 @@ from openjarvis.memory.personal_models import (
     SchemaMaturity,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
+_RELEASE_ATTESTATION_GATES = frozenset(
+    {
+        "assistant_only_rejection",
+        "benchmark_10000",
+        "chat_priority_and_concurrency",
+        "external_isolation",
+        "provider_privacy_interception",
+        "replay_idempotency",
+        "restart_and_direct_rule",
+        "user_controls",
+    }
+)
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS archive_metadata (
   key TEXT PRIMARY KEY,
@@ -167,6 +179,7 @@ CREATE TABLE IF NOT EXISTS schema_conflicts (
 CREATE TABLE IF NOT EXISTS insight_candidates (
   id TEXT PRIMARY KEY,
   content TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'user',
   operation TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'discovered',
   support_evidence_json TEXT NOT NULL DEFAULT '[]',
@@ -261,6 +274,15 @@ class PersonalMemoryArchive:
         self._lock = threading.RLock()
         with self._connect() as connection:
             connection.executescript(_SCHEMA)
+            version_row = connection.execute(
+                "SELECT value FROM archive_metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            try:
+                previous_schema_version = (
+                    int(version_row["value"]) if version_row is not None else 0
+                )
+            except (TypeError, ValueError):
+                previous_schema_version = 0
             columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -281,7 +303,7 @@ class PersonalMemoryArchive:
                 ).fetchall()
             }
             candidate_migrations = {
-                "source": "TEXT NOT NULL DEFAULT 'user_direct'",
+                "source": "TEXT NOT NULL DEFAULT 'legacy_import'",
                 "temporal_scope": "TEXT NOT NULL DEFAULT 'unspecified'",
                 "subject": "TEXT NOT NULL DEFAULT 'user'",
                 "target_claim_id": "TEXT NOT NULL DEFAULT ''",
@@ -291,12 +313,46 @@ class PersonalMemoryArchive:
                     connection.execute(
                         f"ALTER TABLE memory_candidates ADD COLUMN {name} {declaration}"
                     )
+            if previous_schema_version == 2 and "source" in candidate_columns:
+                quarantined_rows = connection.execute(
+                    """
+                    SELECT id FROM memory_candidates
+                    WHERE status = 'pending' AND source = 'user_direct'
+                    """
+                ).fetchall()
+                connection.execute(
+                    """
+                    UPDATE memory_candidates
+                    SET source = 'legacy_import', status = 'quarantined'
+                    WHERE status = 'pending' AND source = 'user_direct'
+                    """
+                )
+                for row in quarantined_rows:
+                    candidate_id = str(row["id"])
+                    connection.execute(
+                        """
+                        INSERT INTO memory_decisions (
+                          id, subject_id, subject_type, operation, reason_code,
+                          affected_ids_json, details_json, created_at
+                        ) VALUES (?, ?, 'candidate', 'no_op',
+                                  'v3_provenance_quarantine', ?, '{}', ?)
+                        """,
+                        (
+                            str(uuid.uuid4()),
+                            candidate_id,
+                            json.dumps([candidate_id], separators=(",", ":")),
+                            time.time(),
+                        ),
+                    )
             table_column_migrations = {
                 "personal_claims": {
                     "subject_scope": "TEXT NOT NULL DEFAULT 'user'",
                 },
                 "personal_schemas": {
                     "subject_scope": "TEXT NOT NULL DEFAULT 'user'",
+                },
+                "insight_candidates": {
+                    "scope": "TEXT NOT NULL DEFAULT 'user'",
                 },
             }
             for table, migrations in table_column_migrations.items():
@@ -524,6 +580,125 @@ class PersonalMemoryArchive:
             return {}
         return value if isinstance(value, dict) else {}
 
+    def release_gate_failures(self) -> tuple[str, ...]:
+        """Run content-free structural checks required before active injection."""
+        failures: list[str] = []
+        with self._lock, self._connect() as connection:
+            integrity = connection.execute("PRAGMA quick_check").fetchone()
+            if integrity is None or str(integrity[0]).casefold() != "ok":
+                failures.append("archive_integrity_failed")
+            ungrounded = connection.execute(
+                """
+                SELECT COUNT(*) FROM personal_schemas AS s
+                WHERE s.current_version_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM schema_evidence_links AS l
+                    WHERE l.schema_version_id = s.current_version_id
+                  )
+                """
+            ).fetchone()
+            if ungrounded is not None and int(ungrounded[0]) > 0:
+                failures.append("ungrounded_personal_schema")
+            broad_unconfirmed = connection.execute(
+                """
+                SELECT COUNT(*) FROM personal_schemas
+                WHERE state = 'active' AND broad_interpretation = 1
+                  AND user_confirmed = 0
+                """
+            ).fetchone()
+            if broad_unconfirmed is not None and int(broad_unconfirmed[0]) > 0:
+                failures.append("broad_schema_unconfirmed")
+            unfinished = connection.execute(
+                """
+                SELECT COUNT(*) FROM memory_jobs
+                WHERE state IN ('pending', 'processing')
+                """
+            ).fetchone()
+            if unfinished is not None and int(unfinished[0]) > 0:
+                failures.append("background_jobs_not_drained")
+        metrics = self.shadow_metrics()
+        if int(metrics.get("compositions", 0)) < 1:
+            failures.append("shadow_sample_missing")
+        if float(metrics.get("latency_ms_max", 0.0)) > 100.0:
+            failures.append("shadow_context_latency_exceeded")
+        try:
+            attestations = json.loads(
+                self.get_metadata("release_gate_attestations", "{}")
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            attestations = {}
+        for gate in sorted(_RELEASE_ATTESTATION_GATES):
+            if attestations.get(gate) is not True:
+                failures.append(f"release_attestation_missing:{gate}")
+        return tuple(failures)
+
+    def record_release_gate_attestation(self, gate: str, *, passed: bool) -> None:
+        """Persist and audit one named release-check result without personal text."""
+        if gate not in _RELEASE_ATTESTATION_GATES:
+            raise ValueError("unknown release gate")
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT value FROM archive_metadata WHERE key = ?",
+                ("release_gate_attestations",),
+            ).fetchone()
+            try:
+                values = json.loads(str(row["value"])) if row is not None else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                values = {}
+            values[gate] = bool(passed)
+            connection.execute(
+                """
+                INSERT INTO archive_metadata(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (
+                    "release_gate_attestations",
+                    json.dumps(values, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO memory_decisions (
+                  id, subject_id, subject_type, operation, reason_code,
+                  affected_ids_json, details_json, created_at
+                ) VALUES (?, 'rollout', 'rollout', 'no_op', ?, '[]', '{}', ?)
+                """,
+                (str(uuid.uuid4()), f"release_gate_{gate}_{passed}", now),
+            )
+
+    def rollout_is_active(self) -> bool:
+        """Return whether the explicit, audited release gate was activated."""
+        return self.get_metadata("release_ready", "0") == "1"
+
+    def mark_rollout_active(self) -> None:
+        """Activate response injection and append its audit in one transaction."""
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for key, value in (
+                ("release_ready", "1"),
+                ("release_activated_at", str(now)),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO archive_metadata(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, value),
+                )
+            connection.execute(
+                """
+                INSERT INTO memory_decisions (
+                  id, subject_id, subject_type, operation, reason_code,
+                  affected_ids_json, details_json, created_at
+                ) VALUES (?, 'rollout', 'rollout', 'no_op',
+                          'release_gates_passed', '[]', '{}', ?)
+                """,
+                (str(uuid.uuid4()), now),
+            )
+
     def record_exchange(
         self,
         *,
@@ -634,11 +809,13 @@ class PersonalMemoryArchive:
         if kind is not None:
             kind_clause = " AND kind = ?"
             params.append(CandidateKind(kind).value)
+        params.insert(0, time.time())
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 f"""
                 SELECT * FROM personal_claims
-                WHERE state = 'active'{kind_clause}
+                WHERE state = 'active'
+                  AND (expires_at = 0 OR expires_at > ?){kind_clause}
                 ORDER BY updated_at DESC, id ASC
                 """,
                 params,
@@ -819,6 +996,21 @@ class PersonalMemoryArchive:
                     now,
                 ),
             )
+            connection.execute(
+                """
+                INSERT INTO memory_decisions (
+                  id, subject_id, subject_type, operation, reason_code,
+                  affected_ids_json, details_json, created_at
+                ) VALUES (?, ?, 'claim', 'no_op', ?, ?, '{}', ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    claim_id,
+                    f"user_{resolved_state.value}",
+                    json.dumps([claim_id], separators=(",", ":")),
+                    now,
+                ),
+            )
         return True
 
     def delete_claim_subject(
@@ -836,6 +1028,34 @@ class PersonalMemoryArchive:
                 (claim_id,),
             ).fetchall()
             evidence_ids = [str(row["evidence_id"]) for row in evidence_rows]
+            if include_raw_evidence and evidence_ids:
+                placeholders = ",".join("?" for _ in evidence_ids)
+                dependency = connection.execute(
+                    f"""
+                    SELECT (
+                      (SELECT COUNT(*) FROM claim_evidence_links
+                       WHERE claim_id != ? AND evidence_id IN ({placeholders})) +
+                      (SELECT COUNT(*) FROM schema_evidence_links
+                       WHERE evidence_id IN ({placeholders})) +
+                      (SELECT COUNT(*) FROM schema_conflicts
+                       WHERE evidence_id IN ({placeholders})) +
+                      (SELECT COUNT(*) FROM memory_feedback
+                       WHERE evidence_id IN ({placeholders})) +
+                      (SELECT COUNT(*) FROM pending_user_questions
+                       WHERE answer_evidence_id IN ({placeholders}))
+                    ) AS count
+                    """,
+                    (
+                        claim_id,
+                        *evidence_ids,
+                        *evidence_ids,
+                        *evidence_ids,
+                        *evidence_ids,
+                        *evidence_ids,
+                    ),
+                ).fetchone()
+                if dependency is not None and int(dependency["count"]) > 0:
+                    raise ValueError("raw evidence is linked to another memory record")
             connection.execute(
                 """
                 UPDATE personal_claims SET supersedes_id = NULL
@@ -896,13 +1116,17 @@ class PersonalMemoryArchive:
             "memory_candidates",
             "evidence_items",
             "personal_claims",
+            "claim_evidence_links",
             "personal_schemas",
             "schema_versions",
+            "schema_evidence_links",
             "schema_conflicts",
             "insight_candidates",
             "external_knowledge_items",
             "memory_jobs",
             "pending_user_questions",
+            "memory_decisions",
+            "memory_feedback",
         )
         with self._lock, self._connect() as connection:
             return {
@@ -1046,6 +1270,21 @@ class PersonalMemoryArchive:
                     now,
                 ),
             )
+            connection.execute(
+                """
+                INSERT INTO memory_decisions (
+                  id, subject_id, subject_type, operation, reason_code,
+                  affected_ids_json, details_json, created_at
+                ) VALUES (?, ?, 'question', 'no_op', ?, ?, '{}', ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    str(subject["subject_id"]),
+                    f"user_question_{state}",
+                    json.dumps([question_id], separators=(",", ":")),
+                    now,
+                ),
+            )
             row = connection.execute(
                 "SELECT * FROM pending_user_questions WHERE id = ?",
                 (question_id,),
@@ -1064,6 +1303,15 @@ class PersonalMemoryArchive:
                 ORDER BY created_at ASC, id ASC LIMIT 1
                 """,
                 (now,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_pending_question(self, question_id: str) -> dict[str, Any] | None:
+        """Return one clarification row without changing its state."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM pending_user_questions WHERE id = ?",
+                (question_id,),
             ).fetchone()
         return dict(row) if row is not None else None
 
@@ -1106,6 +1354,7 @@ class PersonalMemoryArchive:
         self,
         *,
         content: str,
+        scope: str = "user",
         operation: AdaptationOperation | str,
         support_evidence_ids: Sequence[str],
         counter_evidence_ids: Sequence[str],
@@ -1119,14 +1368,15 @@ class PersonalMemoryArchive:
             connection.execute(
                 """
                 INSERT INTO insight_candidates (
-                  id, content, operation, state, support_evidence_json,
+                  id, content, scope, operation, state, support_evidence_json,
                   counter_evidence_json, uncertainties_json,
                   requires_user_confirmation, created_at, updated_at
-                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     insight_id,
                     content,
+                    scope,
                     AdaptationOperation(operation).value,
                     json.dumps(tuple(support_evidence_ids), separators=(",", ":")),
                     json.dumps(tuple(counter_evidence_ids), separators=(",", ":")),
@@ -1153,6 +1403,7 @@ class PersonalMemoryArchive:
         return InsightCandidate(
             id=str(row["id"]),
             content=str(row["content"]),
+            scope=str(row["scope"]),
             operation=AdaptationOperation(str(row["operation"])),
             state=InsightState(str(row["state"])),
             support_evidence_ids=tuple(
@@ -1215,6 +1466,28 @@ class PersonalMemoryArchive:
                 params,
             ).fetchone()
         return int(row["count"]) if row is not None else 0
+
+    def unresolved_conflicts_for_subject(
+        self,
+        subject_scope: str,
+    ) -> list[dict[str, Any]]:
+        """Return bounded conflict metadata and raw evidence for one schema scope."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.schema_id, c.evidence_id, c.prediction_error,
+                       c.created_at, e.session_id
+                FROM schema_conflicts AS c
+                JOIN personal_schemas AS s ON s.id = c.schema_id
+                JOIN evidence_items AS e ON e.id = c.evidence_id
+                WHERE c.resolution_state = 'unresolved'
+                  AND s.subject_scope = ?
+                ORDER BY c.created_at DESC, c.id ASC
+                LIMIT 12
+                """,
+                (subject_scope,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_active_schemas(self) -> list[PersonalSchema]:
         """Return response-eligible stable schemas with their current versions."""
@@ -1423,6 +1696,21 @@ class PersonalMemoryArchive:
                     now,
                 ),
             )
+            connection.execute(
+                """
+                INSERT INTO memory_decisions (
+                  id, subject_id, subject_type, operation, reason_code,
+                  affected_ids_json, details_json, created_at
+                ) VALUES (?, ?, 'schema', 'no_op', ?, ?, '{}', ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    schema_id,
+                    f"user_{resolved.value}",
+                    json.dumps([schema_id], separators=(",", ":")),
+                    now,
+                ),
+            )
         return True
 
     def delete_schema_subject(self, schema_id: str) -> dict[str, int]:
@@ -1604,10 +1892,20 @@ class PersonalMemoryArchive:
             connection.execute(
                 """
                 UPDATE personal_schemas
-                SET content = ?, current_version_id = ?, updated_at = ?
+                SET content = ?, current_version_id = ?,
+                    user_confirmed = CASE WHEN ? THEN 1 ELSE user_confirmed END,
+                    maturity = CASE WHEN ? THEN 'stable' ELSE maturity END,
+                    updated_at = ?
                 WHERE id = ?
                 """,
-                (content, version_id, now, schema_id),
+                (
+                    content,
+                    version_id,
+                    int(user_confirmed),
+                    int(user_confirmed),
+                    now,
+                    schema_id,
+                ),
             )
             if counter_evidence_ids:
                 counter_placeholders = ",".join("?" for _ in counter_evidence_ids)
@@ -1819,12 +2117,18 @@ class PersonalMemoryArchive:
             claim_id = ""
             if candidate.kind in atomic_claim_kinds:
                 claim_id = str(uuid.uuid4())
+                expires_at = (
+                    now + (7 * 24 * 60 * 60)
+                    if candidate.temporal_scope == "current"
+                    else 0.0
+                )
                 connection.execute(
                     """
                     INSERT INTO personal_claims (
                       id, kind, content, state, source, temporal_scope,
-                      subject_scope, supersedes_id, created_at, updated_at
-                    ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+                      subject_scope, supersedes_id, created_at, updated_at,
+                      expires_at
+                    ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         claim_id,
@@ -1836,6 +2140,7 @@ class PersonalMemoryArchive:
                         superseded[0] if superseded else None,
                         now,
                         now,
+                        expires_at,
                     ),
                 )
                 connection.execute(
@@ -2043,6 +2348,25 @@ class PersonalMemoryArchive:
                 (now, count),
             ).fetchall()
         return [str(row["id"]) for row in rows]
+
+    def recover_pending_candidate_jobs(self) -> list[MemoryJob]:
+        """Create idempotent evaluation jobs for candidates from older archives."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM memory_candidates
+                WHERE status = 'pending' ORDER BY created_at ASC, id ASC
+                """
+            ).fetchall()
+        return [
+            self.enqueue_job(
+                job_type="evaluate_candidate",
+                subject_id=str(row["id"]),
+                idempotency_key=f"evaluate_candidate:{row['id']}",
+                priority=90,
+            )
+            for row in rows
+        ]
 
     def enqueue_job(
         self,

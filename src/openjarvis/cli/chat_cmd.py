@@ -97,6 +97,15 @@ def chat(
             console.print("[red]No model available.[/red]")
             sys.exit(1)
 
+    if (
+        config.personal_memory.enabled
+        and config.personal_memory.mode != "off"
+        and not hasattr(engine, "is_generating")
+    ):
+        from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
+
+        engine = InstrumentedEngine(engine, bus)
+
     # Resolve agent (optional)
     agent = None
     agent_key = agent_name or config.agent.default_agent

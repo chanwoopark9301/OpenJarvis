@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 from openjarvis.memory.archive import PersonalMemoryArchive
+from openjarvis.memory.personal_models import CandidateDraft
 
 _V1_SCHEMA = """
 CREATE TABLE conversation_exchanges (
@@ -53,6 +54,17 @@ def _create_v1_archive(path) -> None:
                       'old reply', 'old-hash')
             """
         )
+        connection.execute(
+            """
+            INSERT INTO memory_candidates (
+              id, exchange_id, kind, content, importance, confidence, status,
+              engine_id, extractor_version, created_at, updated_at
+            ) VALUES (
+              'old-candidate', 'old-exchange', 'fact', 'old user text',
+              0.5, 0.5, 'pending', 'old-engine', 'v1', 1, 1
+            )
+            """
+        )
 
 
 def test_existing_candidate_archive_migrates_in_place(tmp_path):
@@ -62,8 +74,11 @@ def test_existing_candidate_archive_migrates_in_place(tmp_path):
 
     archive = PersonalMemoryArchive(path)
 
-    assert archive.schema_version() == 2
+    assert archive.schema_version() == 3
     assert archive.get_exchange("old-exchange").user_text == "old user text"
+    assert archive.get_candidate("old-candidate").source.value == "legacy_import"
+    recovered = archive.recover_pending_candidate_jobs()
+    assert [job.subject_id for job in recovered] == ["old-candidate"]
     assert {
         "archive_metadata",
         "evidence_items",
@@ -79,6 +94,34 @@ def test_existing_candidate_archive_migrates_in_place(tmp_path):
         "memory_feedback",
         "pending_user_questions",
     } <= archive.table_names()
+
+
+def test_v2_pending_user_direct_candidate_is_quarantined_on_v3_upgrade(tmp_path):
+    path = tmp_path / "personal.db"
+    archive = PersonalMemoryArchive(path)
+    archive.record_exchange(
+        exchange_id="pending-v2",
+        user_text="possibly migrated text",
+        assistant_text="",
+        source="test",
+    )
+    assert archive.claim_candidate_job("pending-v2") is not None
+    candidate = archive.complete_candidate_job(
+        "pending-v2",
+        [CandidateDraft("fact", "possibly migrated text", 0.5, 0.5)],
+        engine_id="old-v2",
+        extractor_version="old-v2",
+    )[0]
+    archive.set_metadata("schema_version", "2")
+
+    reopened = PersonalMemoryArchive(path)
+
+    assert reopened.get_candidate(candidate.id).source.value == "legacy_import"
+    assert reopened.get_candidate(candidate.id).status.value == "quarantined"
+    assert reopened.recover_pending_candidate_jobs() == []
+    assert reopened.pending_job_ids(limit=10) == []
+    assert reopened.decision_count(subject_id=candidate.id) == 1
+    assert reopened.schema_version() == 3
 
 
 def test_job_idempotency_key_prevents_duplicate_work(tmp_path):

@@ -108,3 +108,35 @@ def test_missing_provider_keeps_request_pending_without_network(tmp_path):
     )
 
     assert result.action == "provider_unavailable"
+
+
+def test_provider_receives_only_a_deidentified_general_query(tmp_path):
+    calls = []
+
+    class Provider:
+        provider_id = "intercepted"
+
+        def search(self, query, *, max_results=5):
+            calls.append((query, max_results))
+            return []
+
+    coordinator = SocialReflectionCoordinator(
+        PersonalMemoryArchive(tmp_path / "personal.db"),
+        mode="allowed",
+        provider=Provider(),
+    )
+
+    rejected = coordinator.explore(
+        "Chanwoo fatigue factors",
+        user_requested_analysis=True,
+        consent_granted=True,
+    )
+    completed = coordinator.explore(
+        "general factors affecting fatigue",
+        user_requested_analysis=True,
+        consent_granted=True,
+    )
+
+    assert rejected.action == "reject_unsafe_query"
+    assert completed.action == "complete"
+    assert calls == [("general factors affecting fatigue", 5)]

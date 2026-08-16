@@ -2,12 +2,32 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from openjarvis.memory.archive import PersonalMemoryArchive
 from openjarvis.memory.legacy_import import (
     LegacyFactImporter,
+    activate_rollout,
     evaluate_rollout_readiness,
 )
 from openjarvis.memory.personal_models import EvidenceSource
+from openjarvis.memory.store import legacy_fact_context_enabled
+
+_RELEASE_GATES = (
+    "assistant_only_rejection",
+    "benchmark_10000",
+    "chat_priority_and_concurrency",
+    "external_isolation",
+    "provider_privacy_interception",
+    "replay_idempotency",
+    "restart_and_direct_rule",
+    "user_controls",
+)
+
+
+def _attest_release_checks(archive: PersonalMemoryArchive) -> None:
+    for gate in _RELEASE_GATES:
+        archive.record_release_gate_attestation(gate, passed=True)
 
 
 def test_legacy_fact_import_is_low_trust_and_idempotent(tmp_path):
@@ -57,7 +77,15 @@ def test_rollout_requires_backup_and_seven_days_or_manual_override(tmp_path):
     facts = tmp_path / "memory_facts.jsonl"
     facts.write_text('{"text":"legacy"}\n', encoding="utf-8")
     backup = LegacyFactImporter.backup(facts, tmp_path / "legacy.backup")
+    archive.record_shadow_composition(
+        latency_ms=1.0,
+        constraint_count=0,
+        schema_count=0,
+        episode_count=0,
+        raw_evidence_count=0,
+    )
     archive.set_metadata("shadow_started_at", "1000")
+    _attest_release_checks(archive)
 
     too_soon = evaluate_rollout_readiness(
         archive,
@@ -74,3 +102,40 @@ def test_rollout_requires_backup_and_seven_days_or_manual_override(tmp_path):
     assert too_soon.ready is False
     assert too_soon.failing_gates == ("seven_shadow_days_incomplete",)
     assert overridden.ready is True
+
+
+def test_active_rollout_requires_explicit_successful_activation(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    facts = tmp_path / "memory_facts.jsonl"
+    facts.write_text('{"text":"legacy"}\n', encoding="utf-8")
+    backup = LegacyFactImporter.backup(facts, tmp_path / "legacy.backup")
+    archive.record_shadow_composition(
+        latency_ms=1.0,
+        constraint_count=0,
+        schema_count=0,
+        episode_count=0,
+        raw_evidence_count=0,
+    )
+    archive.set_metadata("shadow_started_at", "1000")
+    _attest_release_checks(archive)
+
+    result = activate_rollout(archive, backup_path=backup, now=1000 + 604801)
+
+    assert result.ready is True
+    assert archive.rollout_is_active() is True
+
+
+def test_legacy_context_cannot_be_disabled_before_activation(tmp_path):
+    archive_path = tmp_path / "personal.db"
+    archive = PersonalMemoryArchive(archive_path)
+    config = SimpleNamespace(
+        personal_memory=SimpleNamespace(
+            enabled=True,
+            legacy_context_injection=False,
+            archive_path=str(archive_path),
+        )
+    )
+
+    assert legacy_fact_context_enabled(config) is True
+    archive.set_metadata("release_ready", "1")
+    assert legacy_fact_context_enabled(config) is False

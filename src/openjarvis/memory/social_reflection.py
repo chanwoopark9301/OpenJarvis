@@ -11,6 +11,9 @@ from openjarvis.memory.archive import PersonalMemoryArchive
 
 _EMAIL_RE = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
 _PHONE_RE = re.compile(r"(?:\+?\d[\d -]{7,}\d)")
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7f]")
+_PROPER_NAME_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
+_SAFE_CAPITALIZED_QUERY_WORDS = frozenset({"General", "How", "What", "Why"})
 _ADDRESS_RE = re.compile(
     r"\b\d{1,5}\s+[A-Za-z가-힣0-9-]+\s+(?:street|st|road|rd|avenue|ave|길|로)\b",
     re.IGNORECASE,
@@ -171,6 +174,11 @@ class SocialReflectionCoordinator:
         normalized = query.casefold()
         return not (
             not query.strip()
+            or _NON_ASCII_RE.search(query)
+            or any(
+                token not in _SAFE_CAPITALIZED_QUERY_WORDS
+                for token in _PROPER_NAME_RE.findall(query)
+            )
             or _EMAIL_RE.search(query)
             or _PHONE_RE.search(query)
             or _ADDRESS_RE.search(query)

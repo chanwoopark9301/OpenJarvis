@@ -2,12 +2,36 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 
 from openjarvis.memory.archive import PersonalMemoryArchive
 from openjarvis.memory.candidate_extractor import is_local_personal_memory_engine
 from openjarvis.memory.personal_models import DIRECT_RULE_KINDS, CandidateKind
+
+_RELEVANCE_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "for",
+        "help",
+        "i",
+        "is",
+        "me",
+        "my",
+        "of",
+        "the",
+        "to",
+        "you",
+        "그",
+        "내",
+        "나",
+        "저",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +102,6 @@ class ContextComposer:
 
     def compose(self, current_user_text: str) -> ComposedMemoryContext:
         """Compose evaluated memory plus a separate latest-user continuity overlay."""
-        del current_user_text  # Relevance ranking is introduced with schema retrieval.
         claims = self.archive.get_active_claims()
         constraints = tuple(
             claim.content
@@ -90,12 +113,14 @@ class ContextComposer:
             for claim in claims
             if claim.kind not in DIRECT_RULE_KINDS
             and claim.temporal_scope == "current"
+            and self._is_relevant(current_user_text, claim.content)
         )[: self.max_current_states]
         episodes = tuple(
             claim.content
             for claim in claims
             if claim.kind is CandidateKind.EPISODE
             and claim.temporal_scope != "current"
+            and self._is_relevant(current_user_text, claim.content)
         )[: self.max_episodes]
 
         schemas = tuple(
@@ -105,9 +130,27 @@ class ContextComposer:
                 else f"{schema.content} (conditions: {', '.join(schema.conditions)})"
             )
             for schema in self.archive.get_active_schemas()
+            if self._is_relevant(
+                current_user_text,
+                " ".join((schema.content, *schema.conditions)),
+            )
         )[: self.max_schemas]
         raw_evidence: tuple[str, ...] = ()
-        unresolved: tuple[str, ...] = ()
+        pending_question = self.archive.next_pending_question()
+        pending_insight = (
+            self.archive.get_insight_candidate(
+                str(pending_question["subject_id"])
+            )
+            if pending_question is not None
+            else None
+        )
+        unresolved = (
+            (str(pending_question["question"]),)
+            if pending_question is not None
+            and pending_insight is not None
+            and self._is_relevant(current_user_text, pending_insight.content)
+            else ()
+        )
         sections = (
             ContextSection("direct_constraints", constraints),
             ContextSection("current_states", current_states),
@@ -126,6 +169,20 @@ class ContextComposer:
             user_overlay=self.archive.get_latest_unevaluated_user_text(),
             sections=sections,
         )
+
+    @staticmethod
+    def _is_relevant(query: str, content: str) -> bool:
+        """Use a conservative local lexical gate before adding private context."""
+        def tokenize(value: str) -> set[str]:
+            return {
+                token
+                for token in re.findall(r"[\w가-힣]+", value.casefold())
+                if len(token) >= 2 and token not in _RELEVANCE_STOPWORDS
+            }
+
+        query_tokens = tokenize(query)
+        content_tokens = tokenize(content)
+        return bool(query_tokens & content_tokens)
 
 
 def compose_configured_personal_context(
@@ -147,6 +204,8 @@ def compose_configured_personal_context(
     selected_archive = archive or PersonalMemoryArchive(
         getattr(personal, "archive_path", "")
     )
+    if mode == "active" and not selected_archive.rollout_is_active():
+        return None
     started = time.perf_counter()
     context = ContextComposer(
         selected_archive,

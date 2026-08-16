@@ -14,6 +14,7 @@ from openjarvis.memory.personal_models import (
 )
 from openjarvis.memory.personal_service import PersonalMemoryService
 from openjarvis.memory.reflection import ReflectionProposal
+from openjarvis.memory.understanding_gap import QuestionCoordinator
 
 
 class _Extractor:
@@ -74,3 +75,71 @@ def test_three_sessions_flow_through_separate_jobs_into_emerging_schema(tmp_path
         assert archive.get_active_schemas() == []
     finally:
         service.stop()
+
+
+def test_broad_insight_waits_for_a_durable_user_question(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    pipeline = DevelopmentalMemoryPipeline(archive, _Reflection())
+    insight = archive.store_insight_candidate(
+        content="A broad interpretation about the user.",
+        operation=AdaptationOperation.ACCOMMODATE_CREATE,
+        support_evidence_ids=(),
+        counter_evidence_ids=(),
+        uncertainties=("scope",),
+        requires_user_confirmation=False,
+    )
+    job = archive.enqueue_job(
+        job_type="validate_insight",
+        subject_id=insight.id,
+        idempotency_key=f"validate:{insight.id}",
+        payload={"subject": "identity"},
+    )
+
+    pipeline.validate_insight(job)
+
+    question = QuestionCoordinator(archive).next_pending()
+    assert question is not None
+    assert question.subject_id == insight.id
+    assert archive.active_schema_count() == 0
+
+
+def test_explicit_question_confirmation_activates_grounded_broad_schema(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    pipeline = DevelopmentalMemoryPipeline(archive, _Reflection())
+    evidence_ids = tuple(
+        archive.record_user_confirmed_evidence(
+            user_text=f"Example {index}",
+            content=f"Example {index}",
+            subject="identity",
+        ).id
+        for index in range(3)
+    )
+    insight = archive.store_insight_candidate(
+        content="A broad but grounded interpretation.",
+        scope="identity",
+        operation=AdaptationOperation.ACCOMMODATE_CREATE,
+        support_evidence_ids=evidence_ids,
+        counter_evidence_ids=(),
+        uncertainties=(),
+        requires_user_confirmation=True,
+    )
+    job = archive.enqueue_job(
+        job_type="validate_insight",
+        subject_id=insight.id,
+        idempotency_key=f"validate:{insight.id}",
+        payload={"subject": "identity"},
+    )
+    pipeline.validate_insight(job)
+    question = QuestionCoordinator(archive).next_pending()
+    assert question is not None
+
+    pipeline.answer_question(
+        question.id,
+        "Yes, this fits my experience.",
+        confirms=True,
+    )
+
+    schemas = archive.get_active_schemas()
+    assert len(schemas) == 1
+    assert schemas[0].user_confirmed is True
+    assert QuestionCoordinator(archive).next_pending() is None

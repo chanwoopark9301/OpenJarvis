@@ -315,10 +315,13 @@ def personal_correct(
 @click.option("--include-raw-evidence", is_flag=True, default=False)
 def personal_delete(subject_id: str, include_raw_evidence: bool) -> None:
     """Delete one memory, preserving raw evidence unless explicitly requested."""
-    removed = _get_personal_inspector().delete_subject(
-        subject_id,
-        include_raw_evidence=include_raw_evidence,
-    )
+    try:
+        removed = _get_personal_inspector().delete_subject(
+            subject_id,
+            include_raw_evidence=include_raw_evidence,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     if not any(removed.values()):
         raise click.ClickException("Personal memory not found")
     Console().print("[green]Personal memory deleted.[/green]")
@@ -361,20 +364,32 @@ def personal_import_legacy(legacy_path: str | None, backup: bool) -> None:
 @memory.command(name="personal-rollout-status")
 @click.option("--backup-path", required=True)
 @click.option("--manual-override", is_flag=True, default=False)
-def personal_rollout_status(backup_path: str, manual_override: bool) -> None:
+@click.option("--activate", is_flag=True, default=False)
+def personal_rollout_status(
+    backup_path: str,
+    manual_override: bool,
+    activate: bool,
+) -> None:
     """Check whether legacy prompt injection may be disabled safely."""
-    from openjarvis.memory.legacy_import import evaluate_rollout_readiness
+    from openjarvis.memory.legacy_import import (
+        activate_rollout,
+        evaluate_rollout_readiness,
+    )
 
     inspector = _get_personal_inspector()
-    result = evaluate_rollout_readiness(
+    config = load_config()
+    check = activate_rollout if activate else evaluate_rollout_readiness
+    result = check(
         inspector.archive,
         backup_path=backup_path,
         manual_override=manual_override,
+        worker_concurrency=config.personal_memory.worker_concurrency,
     )
     if not result.ready:
         failures = ", ".join(result.failing_gates)
         raise click.ClickException(f"Rollout gates failed: {failures}")
-    Console().print("[green]Rollout gates passed.[/green]")
+    status = "activated" if activate else "passed"
+    Console().print(f"[green]Rollout gates {status}.[/green]")
 
 
 @memory.command()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 from openjarvis.memory.archive import PersonalMemoryArchive
 from openjarvis.memory.context_composer import (
     ContextComposer,
@@ -84,12 +86,33 @@ def test_current_state_is_labeled_and_not_generalized(tmp_path):
         subject="energy",
     )
 
-    context = ContextComposer(archive).compose("Why can I not focus?")
+    context = ContextComposer(archive).compose("Why am I tired?")
 
     assert context.current_states == ("I feel tired lately.",)
     assert context.schemas == ()
     assert "CURRENT USER STATE" in context.render()
     assert "do not generalize" in context.render()
+
+
+def test_expired_current_state_is_not_composed(tmp_path):
+    archive_path = tmp_path / "personal.db"
+    archive = PersonalMemoryArchive(archive_path)
+    claim = _accept_claim(
+        archive,
+        index=1,
+        kind=CandidateKind.FACT,
+        content="I feel tired lately.",
+        temporal_scope="current",
+        subject="energy",
+    )
+
+    with sqlite3.connect(archive_path) as connection:
+        connection.execute(
+            "UPDATE personal_claims SET expires_at = 1 WHERE id = ?",
+            (claim.id,),
+        )
+
+    assert ContextComposer(archive).compose("Why am I tired?").current_states == ()
 
 
 def test_external_knowledge_never_enters_personal_context(tmp_path):
@@ -110,6 +133,29 @@ def test_external_knowledge_never_enters_personal_context(tmp_path):
     assert "Fatigue can affect concentration" not in context.render()
 
 
+def test_unrelated_confirmed_schema_is_not_added_to_prompt(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    claim = _accept_claim(
+        archive,
+        index=1,
+        kind=CandidateKind.FACT,
+        content="Running improved my mood.",
+        subject="running_and_mood",
+    )
+    schema = archive.apply_schema_accommodation(
+        content="Running often improves my mood.",
+        operation=AdaptationOperation.ACCOMMODATE_CREATE,
+        support_evidence_ids=claim.evidence_ids,
+        subject_scope="running_and_mood",
+        user_confirmed=True,
+    )
+    assert schema is not None
+
+    context = ContextComposer(archive).compose("Help me organize my desk.")
+
+    assert context.schemas == ()
+
+
 def test_latest_unevaluated_text_is_a_user_overlay_not_a_system_rule(tmp_path):
     """Immediate continuity must not elevate raw text into authoritative memory."""
     archive = PersonalMemoryArchive(tmp_path / "personal.db")
@@ -125,6 +171,31 @@ def test_latest_unevaluated_text_is_a_user_overlay_not_a_system_rule(tmp_path):
     assert context.user_overlay == "I might want to run tomorrow."
     assert "definitely a runner" not in context.render()
     assert "definitely a runner" not in context.user_overlay
+
+
+def test_pending_clarification_is_exposed_without_becoming_a_claim(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    insight = archive.store_insight_candidate(
+        content="Running may improve mood.",
+        operation=AdaptationOperation.ACCOMMODATE_CREATE,
+        support_evidence_ids=(),
+        counter_evidence_ids=(),
+        uncertainties=(),
+        requires_user_confirmation=True,
+    )
+    archive.create_pending_question(
+        subject_id=insight.id,
+        question="Does this proposed pattern fit your experience?",
+        decision_effect="confirm or reject the proposed pattern",
+    )
+
+    context = ContextComposer(archive).compose("Does running affect my mood?")
+
+    assert context.unresolved == (
+        "Does this proposed pattern fit your experience?",
+    )
+    assert context.schemas == ()
+    assert "UNRESOLVED" in context.render()
 
 
 def test_configured_context_refuses_non_local_response_engine(tmp_path):
@@ -151,6 +222,9 @@ def test_configured_context_allows_loopback_response_engine(tmp_path):
     config.personal_memory.enabled = True
     config.personal_memory.mode = "active"
     config.personal_memory.archive_path = str(tmp_path / "personal.db")
+    PersonalMemoryArchive(tmp_path / "personal.db").set_metadata(
+        "release_ready", "1"
+    )
 
     context = compose_configured_personal_context(
         config,
@@ -159,6 +233,21 @@ def test_configured_context_allows_loopback_response_engine(tmp_path):
     )
 
     assert context is not None
+
+
+def test_active_context_refuses_unactivated_rollout(tmp_path):
+    from openjarvis.core.config import JarvisConfig
+
+    config = JarvisConfig()
+    config.personal_memory.enabled = True
+    config.personal_memory.mode = "active"
+    config.personal_memory.archive_path = str(tmp_path / "personal.db")
+
+    assert compose_configured_personal_context(
+        config,
+        "hello",
+        engine_key="ollama",
+    ) is None
 
 
 def test_shadow_mode_never_injects_personal_context(tmp_path):

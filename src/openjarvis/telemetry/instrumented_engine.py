@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import statistics
+import threading
 import time
 from collections.abc import AsyncIterator
 from typing import Any, Dict, List, Optional, Sequence
@@ -11,6 +13,60 @@ from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import TOKEN_COUNTING_VERSION, Message, TelemetryRecord
 from openjarvis.engine._stubs import InferenceEngine, StreamChunk
 from openjarvis.telemetry.gpu_monitor import GpuSample
+
+
+class _GenerationArbiter:
+    """Serialize one local model while allowing waiting chat work to go first."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._active = False
+        self._waiting_foreground = 0
+
+    @property
+    def active(self) -> bool:
+        with self._condition:
+            return self._active
+
+    def acquire(self, *, background: bool) -> None:
+        with self._condition:
+            if not background:
+                self._waiting_foreground += 1
+            try:
+                while self._active or (background and self._waiting_foreground):
+                    self._condition.wait()
+                self._active = True
+            finally:
+                if not background:
+                    self._waiting_foreground -= 1
+
+    async def acquire_async(self, *, background: bool) -> None:
+        registered = False
+        try:
+            while True:
+                with self._condition:
+                    if not background and not registered:
+                        self._waiting_foreground += 1
+                        registered = True
+                    if not self._active and not (
+                        background and self._waiting_foreground
+                    ):
+                        self._active = True
+                        if registered:
+                            self._waiting_foreground -= 1
+                            registered = False
+                        return
+                await asyncio.sleep(0.005)
+        finally:
+            if registered:
+                with self._condition:
+                    self._waiting_foreground -= 1
+                    self._condition.notify_all()
+
+    def release(self) -> None:
+        with self._condition:
+            self._active = False
+            self._condition.notify_all()
 
 # ---------------------------------------------------------------------------
 # ITL helpers
@@ -75,8 +131,37 @@ class InstrumentedEngine(InferenceEngine):
         self._gpu_monitor = gpu_monitor
         self._energy_monitor = energy_monitor
         self._publishes_events = True
+        self._generation_arbiter = _GenerationArbiter()
+
+    @property
+    def is_generating(self) -> bool:
+        """Whether the wrapped model is currently serving any generation."""
+        return self._generation_arbiter.active
 
     def generate(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: str = "",
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Serialize synchronous calls and prioritize queued foreground work."""
+        background = bool(kwargs.pop("_openjarvis_background", False))
+        self._generation_arbiter.acquire(background=background)
+        try:
+            return self._generate_unlocked(
+                messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **kwargs,
+            )
+        finally:
+            self._generation_arbiter.release()
+
+    def _generate_unlocked(
         self,
         messages: Sequence[Message],
         *,
@@ -307,6 +392,30 @@ class InstrumentedEngine(InferenceEngine):
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> Any:
+        """Serialize streaming calls with synchronous calls on the same engine."""
+        background = bool(kwargs.pop("_openjarvis_background", False))
+        await self._generation_arbiter.acquire_async(background=background)
+        try:
+            async for chunk in self._stream_unlocked(
+                messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **kwargs,
+            ):
+                yield chunk
+        finally:
+            self._generation_arbiter.release()
+
+    async def _stream_unlocked(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: str = "",
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+        **kwargs: Any,
+    ) -> Any:
         """Stream with per-token timing and full telemetry recording."""
         self._bus.publish(
             EventType.INFERENCE_START,
@@ -492,15 +601,20 @@ class InstrumentedEngine(InferenceEngine):
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> AsyncIterator["StreamChunk"]:
-        """Delegate to inner engine's stream_full for tool-call support."""
-        async for chunk in self._inner.stream_full(
-            messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **kwargs,
-        ):
-            yield chunk
+        """Serialize tool-call streaming with every other model generation."""
+        background = bool(kwargs.pop("_openjarvis_background", False))
+        await self._generation_arbiter.acquire_async(background=background)
+        try:
+            async for chunk in self._inner.stream_full(
+                messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **kwargs,
+            ):
+                yield chunk
+        finally:
+            self._generation_arbiter.release()
 
     def list_models(self) -> List[str]:
         return self._inner.list_models()

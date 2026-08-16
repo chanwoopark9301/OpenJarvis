@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 from openjarvis.memory.archive import PersonalMemoryArchive
 from openjarvis.memory.evaluator import MemoryEvaluator
 from openjarvis.memory.personal_models import CandidateDraft, CandidateKind
+from openjarvis.memory.social_reflection import ExternalAction
+from openjarvis.memory.understanding_gap import GapRoute
 from openjarvis.server.personal_memory_routes import router
 
 
@@ -40,7 +42,17 @@ def _app_with_claim(tmp_path):
     )[0]
     assert MemoryEvaluator(archive).evaluate(candidate.id).applied
     app = FastAPI()
-    app.state.personal_memory_service = SimpleNamespace(archive=archive)
+    app.state.personal_memory_service = SimpleNamespace(
+        archive=archive,
+        route_understanding_gap=lambda kind, **kwargs: GapRoute(
+            "ask_user" if kind == "intent_ambiguity" else "hold_local",
+            "user_is_authority_on_intent",
+        ),
+        prepare_external_reflection=lambda query, **kwargs: ExternalAction(
+            "hold_local",
+            "analysis_not_requested",
+        ),
+    )
     app.include_router(router)
     return app, archive.get_active_claims()[0]
 
@@ -95,3 +107,20 @@ def test_bulk_delete_requires_exact_token(tmp_path):
     assert rejected.status_code == 400
     assert accepted.status_code == 200
     assert accepted.json()["personal_claims"] == 1
+
+
+def test_gap_and_external_routes_are_loopback_only_and_user_first(tmp_path):
+    app, _claim = _app_with_claim(tmp_path)
+    client = TestClient(app, client=("127.0.0.1", 50000))
+
+    gap = client.post(
+        "/v1/personal-memory/understanding-gap/route",
+        json={"kind": "intent_ambiguity"},
+    )
+    outside = client.post(
+        "/v1/personal-memory/external-reflection/prepare",
+        json={"query": "general habit research"},
+    )
+
+    assert gap.json()["action"] == "ask_user"
+    assert outside.json()["action"] == "hold_local"

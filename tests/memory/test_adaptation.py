@@ -79,6 +79,54 @@ def test_new_user_correction_supersedes_its_explicit_target():
     assert result.requires_user_confirmation is False
 
 
+def test_unrelated_generic_direct_rules_do_not_supersede_each_other():
+    """A generic extractor subject must not erase a different direct rule."""
+    result = SchemaAdaptationEngine().decide(
+        candidate=CandidateDraft(
+            CandidateKind.CONSTRAINT,
+            "Do not mention timers.",
+            1.0,
+            1.0,
+            subject="user",
+        ),
+        active_claims=[
+            _claim(
+                "exam-rule",
+                "Do not mention exams.",
+                kind=CandidateKind.CONSTRAINT,
+                subject_scope="user",
+            )
+        ],
+        related_schemas=[],
+    )
+
+    assert result.operation is AdaptationOperation.ACCOMMODATE_CREATE
+    assert result.superseded_claim_ids == ()
+
+
+def test_shared_broad_subject_does_not_supersede_without_explicit_target():
+    result = SchemaAdaptationEngine().decide(
+        candidate=CandidateDraft(
+            CandidateKind.ROLE_PREFERENCE,
+            "Use a warm tone.",
+            1.0,
+            1.0,
+            subject="assistant_behavior",
+        ),
+        active_claims=[
+            _claim(
+                "length-rule",
+                "Keep replies concise.",
+                kind=CandidateKind.ROLE_PREFERENCE,
+            )
+        ],
+        related_schemas=[],
+    )
+
+    assert result.operation is AdaptationOperation.ACCOMMODATE_CREATE
+    assert result.superseded_claim_ids == ()
+
+
 def test_external_candidate_cannot_change_a_personal_schema():
     """External knowledge must remain a hypothesis, never personal evidence."""
     result = SchemaAdaptationEngine().decide(

@@ -238,9 +238,12 @@ def test_local_factory_wires_developmental_job_handlers(tmp_path):
         extraction_model="qwen3:8b",
     )
 
+    from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
+
+    engine = InstrumentedEngine(object(), EventBus())
     service = build_personal_memory_service(
         config,
-        object(),
+        engine,
         engine_key="ollama",
         default_model="qwen3:8b",
         event_bus=EventBus(),

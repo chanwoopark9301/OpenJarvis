@@ -161,14 +161,8 @@ class SchemaAdaptationEngine:
             claim.id
             for claim in active_claims
             if claim.state.value == "active"
-            and (
-                claim.id == explicit_target
-                or (
-                    not explicit_target
-                    and claim.kind == candidate.kind
-                    and claim.subject_scope == candidate.subject
-                )
-            )
+            and bool(explicit_target)
+            and claim.id == explicit_target
         )
         if superseded:
             return AdaptationDecision(

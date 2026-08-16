@@ -114,6 +114,40 @@ def test_evaluator_rejects_assistant_only_claim(tmp_path):
     assert archive.get_candidate(candidate.id).status == "rejected"
 
 
+@pytest.mark.parametrize(
+    ("user_text", "candidate_text"),
+    [
+        ("I do not like timers.", "I like timers."),
+        ("I don't like timers.", "I like timers."),
+        ("나는 달리기를 좋아하지 않아.", "나는 달리기를 좋아해."),
+    ],
+)
+def test_evaluator_rejects_negation_inversion(
+    tmp_path,
+    user_text,
+    candidate_text,
+):
+    """Lexical overlap must not turn a negative statement into its opposite."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    candidate = _candidate(
+        archive,
+        exchange_id="negative",
+        user_text=user_text,
+        assistant_text="",
+        draft=CandidateDraft(
+            CandidateKind.PREFERENCE,
+            candidate_text,
+            0.8,
+            0.9,
+        ),
+    )
+
+    result = MemoryEvaluator(archive).evaluate(candidate.id)
+
+    assert result.applied is False
+    assert result.reason_code == "unsupported_by_user_evidence"
+
+
 def test_new_direct_rule_supersedes_explicit_target_atomically(tmp_path):
     """A correction and its supersession audit must become visible together."""
     archive = PersonalMemoryArchive(tmp_path / "personal.db")

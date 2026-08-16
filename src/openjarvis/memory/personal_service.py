@@ -18,6 +18,16 @@ from openjarvis.memory.candidate_extractor import (
 from openjarvis.memory.evaluator import MemoryEvaluator
 from openjarvis.memory.personal_models import ConversationExchange, MemoryJob
 from openjarvis.memory.service import publish_completed_exchange
+from openjarvis.memory.social_reflection import (
+    ExternalAction,
+    SocialReflectionCoordinator,
+)
+from openjarvis.memory.understanding_gap import (
+    GapKind,
+    GapRoute,
+    UnderstandingGap,
+    UnderstandingGapGate,
+)
 
 logger = logging.getLogger(__name__)
 _STOP = object()
@@ -44,6 +54,8 @@ class PersonalMemoryService:
         last_user_activity: Callable[[], float] | None = None,
         idle_before_reflection_seconds: float = 30.0,
         job_handlers: Mapping[str, Callable[[MemoryJob], None]] | None = None,
+        external_reflection_mode: str = "ask",
+        question_answer_handler: Callable[..., Any] | None = None,
     ) -> None:
         self._archive = archive
         self._extractor = extractor
@@ -56,6 +68,14 @@ class PersonalMemoryService:
             float(idle_before_reflection_seconds),
         )
         self._job_handlers = dict(job_handlers or {})
+        self._gap_gate = UnderstandingGapGate(
+            external_mode=external_reflection_mode
+        )
+        self._social_reflection = SocialReflectionCoordinator(
+            archive,
+            mode=external_reflection_mode,
+        )
+        self._question_answer_handler = question_answer_handler
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, max_queue))
         self._max_queue = max(1, max_queue)
         self._queued_ids: set[str] = set()
@@ -82,6 +102,7 @@ class PersonalMemoryService:
             return
         self._running.set()
         self._archive.release_in_progress_jobs()
+        self._archive.recover_pending_candidate_jobs()
         self._subscribe_events()
         self._thread = threading.Thread(
             target=self._loop,
@@ -142,6 +163,54 @@ class PersonalMemoryService:
             priority=100,
         )
         return self._enqueue_job(job.id)
+
+    def route_understanding_gap(
+        self,
+        kind: GapKind | str,
+        *,
+        user_requested_analysis: bool = False,
+        sensitive: bool = False,
+    ) -> GapRoute:
+        """Choose user clarification before any possible outside lookup."""
+        return self._gap_gate.route(
+            UnderstandingGap(
+                GapKind(kind),
+                user_requested_analysis=user_requested_analysis,
+                sensitive=sensitive,
+            )
+        )
+
+    def prepare_external_reflection(
+        self,
+        query: str,
+        *,
+        user_requested_analysis: bool,
+        consent_granted: bool,
+        sensitive: bool = False,
+    ) -> ExternalAction:
+        """Apply request, consent, and deidentification gates without searching."""
+        return self._social_reflection.prepare_request(
+            query,
+            user_requested_analysis=user_requested_analysis,
+            consent_granted=consent_granted,
+            sensitive=sensitive,
+        )
+
+    def answer_personal_question(
+        self,
+        question_id: str,
+        answer_text: str,
+        *,
+        confirms: bool,
+    ) -> Any:
+        """Send an explicit user answer back through validated accommodation."""
+        if self._question_answer_handler is None:
+            raise RuntimeError("question answering is unavailable")
+        return self._question_answer_handler(
+            question_id,
+            answer_text,
+            confirms=confirms,
+        )
 
     def _enqueue_job(self, job_id: str) -> bool:
         """Place a durable job ID in the bounded in-memory wake-up queue."""
@@ -344,10 +413,24 @@ def build_personal_memory_service(
             extra={"engine_key": engine_key},
         )
         return None
+    if not hasattr(engine, "is_generating"):
+        logger.warning(
+            "Personal memory service disabled because shared generation "
+            "arbitration is unavailable"
+        )
+        return None
     model = str(getattr(personal, "extraction_model", "") or default_model).strip()
     if not model:
         return None
     archive = PersonalMemoryArchive(getattr(personal, "archive_path", ""))
+    if (
+        getattr(personal, "mode", "active") == "active"
+        and not archive.rollout_is_active()
+    ):
+        logger.warning(
+            "Personal memory active mode refused: rollout gate not activated"
+        )
+        return None
     extractor = PersonalCandidateExtractor(engine, model, engine_id=engine_key)
     from openjarvis.memory.developmental_pipeline import DevelopmentalMemoryPipeline
     from openjarvis.memory.reflection import ReflectionEngine
@@ -373,11 +456,18 @@ def build_personal_memory_service(
         evaluator=evaluator,
         job_handlers=pipeline.handlers(),
         max_queue=getattr(personal, "max_queue", 256),
+        chat_is_busy=lambda: bool(getattr(engine, "is_generating", False)),
         idle_before_reflection_seconds=getattr(
             personal,
             "idle_before_reflection_seconds",
             30.0,
         ),
+        external_reflection_mode=getattr(
+            personal,
+            "external_reflection_mode",
+            "ask",
+        ),
+        question_answer_handler=pipeline.answer_question,
     )
 
 

@@ -106,6 +106,7 @@ class ReflectionEngine:
                 model=self._model,
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
+                _openjarvis_background=True,
             )
         except Exception:  # noqa: BLE001 - reflection is optional background work
             self.last_error_code = "engine_error"

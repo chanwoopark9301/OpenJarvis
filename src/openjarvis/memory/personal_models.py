@@ -25,6 +25,7 @@ class CandidateStatus(str, Enum):
     PENDING = "pending"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
+    QUARANTINED = "quarantined"
     SUPERSEDED = "superseded"
 
 
@@ -310,6 +311,7 @@ class InsightCandidate:
 
     id: str
     content: str
+    scope: str
     operation: AdaptationOperation
     state: InsightState
     support_evidence_ids: tuple[str, ...]

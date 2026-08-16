@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -129,6 +131,44 @@ class TestInstrumentedEngine:
     def test_engine_id_attribute(self, mock_engine, bus):
         ie = InstrumentedEngine(mock_engine, bus)
         assert ie.engine_id == "instrumented"
+
+    def test_background_and_chat_generation_never_overlap(self, bus):
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        class SlowEngine:
+            engine_id = "slow"
+
+            def generate(self, messages, **kwargs):
+                nonlocal active, max_active
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.03)
+                with lock:
+                    active -= 1
+                return {"content": "ok", "usage": {}}
+
+        engine = InstrumentedEngine(SlowEngine(), bus)
+        messages = [Message(role=Role.USER, content="Hi")]
+        background = threading.Thread(
+            target=lambda: engine.generate(
+                messages,
+                model="test",
+                _openjarvis_background=True,
+            )
+        )
+        chat = threading.Thread(
+            target=lambda: engine.generate(messages, model="test")
+        )
+
+        background.start()
+        chat.start()
+        background.join()
+        chat.join()
+
+        assert max_active == 1
 
 
 class TestTokensPerJoule:

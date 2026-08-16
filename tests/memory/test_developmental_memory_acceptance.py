@@ -56,7 +56,7 @@ def test_direct_rules_and_current_state_survive_restart(tmp_path):
         assert len(context.constraints) == expected_constraints
 
     reopened = PersonalMemoryArchive(path)
-    context = ContextComposer(reopened).compose("I had a difficult week.")
+    context = ContextComposer(reopened).compose("I still feel tired this week.")
 
     assert len(context.constraints) == 2
     assert context.current_states == ("I feel tired lately.",)
@@ -84,3 +84,49 @@ def test_assistant_text_never_becomes_personal_evidence(tmp_path):
 
     assert result.applied is False
     assert archive.evidence_count(candidate_id=candidate.id) == 0
+
+
+def test_conflicting_old_direct_rule_is_absent_immediately_after_restart(tmp_path):
+    path = tmp_path / "personal.db"
+    archive = PersonalMemoryArchive(path)
+    _apply(
+        archive,
+        {
+            "id": "old-rule",
+            "text": "Proactively mention topic alpha.",
+            "kind": "role_preference",
+            "scope": "until_changed",
+            "subject": "topic:alpha",
+        },
+    )
+    old_claim = archive.get_active_claims()[0]
+    archive.record_exchange(
+        exchange_id="correction",
+        user_text="Do not mention topic alpha unless I ask.",
+        assistant_text="",
+        source="acceptance",
+    )
+    assert archive.claim_candidate_job("correction") is not None
+    candidate = archive.complete_candidate_job(
+        "correction",
+        [
+            CandidateDraft(
+                CandidateKind.CORRECTION,
+                "Do not mention topic alpha unless I ask.",
+                1.0,
+                1.0,
+                temporal_scope="until_changed",
+                subject="topic:alpha",
+                target_claim_id=old_claim.id,
+            )
+        ],
+        engine_id="ollama",
+        extractor_version="acceptance",
+    )[0]
+    assert MemoryEvaluator(archive).evaluate(candidate.id).applied
+
+    reopened = PersonalMemoryArchive(path)
+    context = ContextComposer(reopened).compose("Continue.")
+
+    assert context.constraints == ("Do not mention topic alpha unless I ask.",)
+    assert "Proactively mention topic alpha." not in context.render()

@@ -14,6 +14,15 @@ _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _LOW_INFORMATION_WORDS = frozenset(
     {"a", "an", "and", "i", "is", "me", "my", "the", "to", "user"}
 )
+_NEGATION_MARKERS = frozenset(
+    {"not", "no", "never", "dont", "cannot", "않", "안", "말", "못"}
+)
+_ENGLISH_NEGATION_RE = re.compile(
+    r"\b(?:not|no|never|cannot|can't|cant|don't|dont|doesn't|doesnt|"
+    r"didn't|didnt|won't|wont)\b",
+    re.IGNORECASE,
+)
+_KOREAN_NEGATION_RE = re.compile(r"(?:안\s|못\s|않|말(?:아|라|고|자)|없)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +161,10 @@ class MemoryEvaluator:
         user_normalized = " ".join(cls._tokens(user_text))
         if not candidate_normalized or not user_normalized:
             return False
+        candidate_negated = cls._has_negation(candidate.content)
+        user_negated = cls._has_negation(user_text)
+        if candidate_negated != user_negated:
+            return False
         if candidate_normalized in user_normalized:
             return True
         candidate_tokens = set(candidate_normalized.split())
@@ -162,6 +175,17 @@ class MemoryEvaluator:
             return False
         overlap = meaningful_candidate & meaningful_user
         return len(overlap) / len(meaningful_candidate) >= 0.5
+
+    @staticmethod
+    def _has_negation(text: str) -> bool:
+        return bool(
+            _ENGLISH_NEGATION_RE.search(text)
+            or _KOREAN_NEGATION_RE.search(text)
+            or any(
+                token in _NEGATION_MARKERS
+                for token in MemoryEvaluator._tokens(text)
+            )
+        )
 
     @staticmethod
     def _tokens(text: str) -> list[str]:

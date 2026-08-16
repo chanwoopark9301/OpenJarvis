@@ -110,9 +110,10 @@ def evaluate_rollout_readiness(
     *,
     backup_path: str | Path | None,
     manual_override: bool = False,
+    worker_concurrency: int = 1,
     now: float | None = None,
 ) -> RolloutReadiness:
-    """Require a backup and seven shadow days unless manually overridden."""
+    """Evaluate every named safety gate before active prompt injection."""
     failures = []
     backup = Path(backup_path).expanduser() if backup_path else None
     if backup is None or not backup.is_file():
@@ -125,12 +126,37 @@ def evaluate_rollout_readiness(
     elapsed = (time.time() if now is None else now) - started_at
     if not manual_override and (started_at <= 0 or elapsed < 7 * 24 * 60 * 60):
         failures.append("seven_shadow_days_incomplete")
+    failures.extend(archive.release_gate_failures())
+    if int(worker_concurrency) != 1:
+        failures.append("single_memory_worker_required")
     return RolloutReadiness(not failures, tuple(failures))
+
+
+def activate_rollout(
+    archive: PersonalMemoryArchive,
+    *,
+    backup_path: str | Path | None,
+    manual_override: bool = False,
+    worker_concurrency: int = 1,
+    now: float | None = None,
+) -> RolloutReadiness:
+    """Persist activation only after the complete readiness report passes."""
+    result = evaluate_rollout_readiness(
+        archive,
+        backup_path=backup_path,
+        manual_override=manual_override,
+        worker_concurrency=worker_concurrency,
+        now=now,
+    )
+    if result.ready:
+        archive.mark_rollout_active()
+    return result
 
 
 __all__ = [
     "LegacyFactImporter",
     "LegacyImportResult",
     "RolloutReadiness",
+    "activate_rollout",
     "evaluate_rollout_readiness",
 ]

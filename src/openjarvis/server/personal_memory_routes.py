@@ -30,6 +30,24 @@ class DeleteAllRequest(BaseModel):
     confirm_token: str
 
 
+class GapRequest(BaseModel):
+    kind: str
+    user_requested_analysis: bool = False
+    sensitive: bool = False
+
+
+class ExternalReflectionRequest(BaseModel):
+    query: str
+    user_requested_analysis: bool = False
+    consent_granted: bool = False
+    sensitive: bool = False
+
+
+class QuestionAnswerRequest(BaseModel):
+    answer_text: str
+    confirms: bool
+
+
 def _require_local_inspector(request: Request) -> PersonalMemoryInspector:
     """Reject every personal-memory operation unless the client is loopback."""
     host = request.client.host if request.client is not None else ""
@@ -45,6 +63,11 @@ def _require_local_inspector(request: Request) -> PersonalMemoryInspector:
     return PersonalMemoryInspector(service.archive)
 
 
+def _require_local_service(request: Request):
+    _require_local_inspector(request)
+    return request.app.state.personal_memory_service
+
+
 @router.get("")
 async def list_personal_memory(request: Request):
     """List safe read models without unrelated archive records."""
@@ -58,6 +81,53 @@ async def list_personal_memory(request: Request):
 async def deletion_preview(request: Request):
     """Return affected row counts without exposing stored text."""
     return _require_local_inspector(request).deletion_preview()
+
+
+@router.post("/understanding-gap/route")
+async def route_understanding_gap(body: GapRequest, request: Request):
+    """Choose whether to ask, hold locally, or offer outside knowledge."""
+    try:
+        result = _require_local_service(request).route_understanding_gap(
+            body.kind,
+            user_requested_analysis=body.user_requested_analysis,
+            sensitive=body.sensitive,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return asdict(result)
+
+
+@router.post("/external-reflection/prepare")
+async def prepare_external_reflection(
+    body: ExternalReflectionRequest,
+    request: Request,
+):
+    """Validate explicit request and consent without making a network call."""
+    result = _require_local_service(request).prepare_external_reflection(
+        body.query,
+        user_requested_analysis=body.user_requested_analysis,
+        consent_granted=body.consent_granted,
+        sensitive=body.sensitive,
+    )
+    return asdict(result)
+
+
+@router.post("/questions/{question_id}/answer")
+async def answer_personal_question(
+    question_id: str,
+    body: QuestionAnswerRequest,
+    request: Request,
+):
+    """Record a clarification and apply only an explicit confirmation."""
+    try:
+        result = _require_local_service(request).answer_personal_question(
+            question_id,
+            body.answer_text,
+            confirms=body.confirms,
+        )
+    except (KeyError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return asdict(result)
 
 
 @router.get("/{subject_id}")
@@ -127,10 +197,13 @@ async def delete_personal_memory(
     include_raw_evidence: bool = False,
 ):
     """Delete one subject and optionally its linked raw evidence."""
-    removed = _require_local_inspector(request).delete_subject(
-        subject_id,
-        include_raw_evidence=include_raw_evidence,
-    )
+    try:
+        removed = _require_local_inspector(request).delete_subject(
+            subject_id,
+            include_raw_evidence=include_raw_evidence,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not any(removed.values()):
         raise HTTPException(status_code=404, detail="Memory not found")
     return removed
