@@ -253,6 +253,7 @@ class PersonalClaim:
     created_at: float
     updated_at: float
     temporal_scope: str = "unspecified"
+    subject_scope: str = "user"
     supersedes_id: str = ""
     expires_at: float = 0.0
 
@@ -270,6 +271,7 @@ class PersonalSchema:
     created_at: float
     updated_at: float
     conditions: tuple[str, ...] = field(default_factory=tuple)
+    subject_scope: str = "user"
     broad_interpretation: bool = False
     user_confirmed: bool = False
 
