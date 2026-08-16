@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from openjarvis.memory.personal_models import (
     CandidateDraft,
     ConversationExchange,
     MemoryCandidate,
+    MemoryJob,
 )
 
+_SCHEMA_VERSION = 2
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS archive_metadata (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS conversation_exchanges (
   id TEXT PRIMARY KEY,
   created_at REAL NOT NULL,
@@ -48,6 +56,169 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
   updated_at REAL NOT NULL,
   UNIQUE(exchange_id, kind, content)
 );
+
+CREATE TABLE IF NOT EXISTS evidence_items (
+  id TEXT PRIMARY KEY,
+  exchange_id TEXT NOT NULL REFERENCES conversation_exchanges(id),
+  candidate_id TEXT REFERENCES memory_candidates(id),
+  source TEXT NOT NULL,
+  content TEXT NOT NULL,
+  temporal_scope TEXT NOT NULL DEFAULT 'unspecified',
+  subject TEXT NOT NULL DEFAULT 'user',
+  session_id TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  UNIQUE(candidate_id)
+);
+
+CREATE TABLE IF NOT EXISTS personal_claims (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  content TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending',
+  source TEXT NOT NULL,
+  temporal_scope TEXT NOT NULL DEFAULT 'unspecified',
+  supersedes_id TEXT REFERENCES personal_claims(id),
+  expires_at REAL NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS personal_schemas (
+  id TEXT PRIMARY KEY,
+  content TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending',
+  maturity TEXT NOT NULL DEFAULT 'tentative',
+  current_version_id TEXT,
+  broad_interpretation INTEGER NOT NULL DEFAULT 0,
+  user_confirmed INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS schema_versions (
+  id TEXT PRIMARY KEY,
+  schema_id TEXT NOT NULL REFERENCES personal_schemas(id),
+  version_number INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  conditions_json TEXT NOT NULL DEFAULT '[]',
+  support_mass REAL NOT NULL DEFAULT 0,
+  counter_mass REAL NOT NULL DEFAULT 0,
+  stability REAL NOT NULL DEFAULT 0,
+  plasticity REAL NOT NULL DEFAULT 1,
+  scope_fit REAL NOT NULL DEFAULT 0,
+  source_quality REAL NOT NULL DEFAULT 0,
+  temporal_validity REAL NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL,
+  UNIQUE(schema_id, version_number)
+);
+
+CREATE TABLE IF NOT EXISTS schema_evidence_links (
+  schema_version_id TEXT NOT NULL REFERENCES schema_versions(id),
+  evidence_id TEXT NOT NULL REFERENCES evidence_items(id),
+  relation TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  PRIMARY KEY(schema_version_id, evidence_id, relation)
+);
+
+CREATE TABLE IF NOT EXISTS schema_conflicts (
+  id TEXT PRIMARY KEY,
+  schema_id TEXT NOT NULL REFERENCES personal_schemas(id),
+  schema_version_id TEXT NOT NULL REFERENCES schema_versions(id),
+  evidence_id TEXT NOT NULL REFERENCES evidence_items(id),
+  conflict_type TEXT NOT NULL,
+  prediction_error REAL NOT NULL,
+  source_quality REAL NOT NULL,
+  resolution_state TEXT NOT NULL DEFAULT 'unresolved',
+  resolution_decision_id TEXT,
+  created_at REAL NOT NULL,
+  resolved_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS insight_candidates (
+  id TEXT PRIMARY KEY,
+  content TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'discovered',
+  support_evidence_json TEXT NOT NULL DEFAULT '[]',
+  counter_evidence_json TEXT NOT NULL DEFAULT '[]',
+  uncertainties_json TEXT NOT NULL DEFAULT '[]',
+  requires_user_confirmation INTEGER NOT NULL DEFAULT 1,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS external_knowledge_items (
+  id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  source_url TEXT NOT NULL,
+  query_text TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  consent_id TEXT NOT NULL,
+  deidentified INTEGER NOT NULL DEFAULT 0,
+  retrieved_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_jobs (
+  id TEXT PRIMARY KEY,
+  job_type TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  state TEXT NOT NULL DEFAULT 'pending',
+  priority INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  error_code TEXT NOT NULL DEFAULT '',
+  claimed_at REAL NOT NULL DEFAULT 0,
+  next_attempt_at REAL NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_decisions (
+  id TEXT PRIMARY KEY,
+  subject_id TEXT NOT NULL,
+  subject_type TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  reason_code TEXT NOT NULL,
+  affected_ids_json TEXT NOT NULL DEFAULT '[]',
+  details_json TEXT NOT NULL DEFAULT '{}',
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_feedback (
+  id TEXT PRIMARY KEY,
+  subject_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  user_text TEXT NOT NULL DEFAULT '',
+  evidence_id TEXT REFERENCES evidence_items(id),
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pending_user_questions (
+  id TEXT PRIMARY KEY,
+  subject_id TEXT NOT NULL,
+  question TEXT NOT NULL,
+  decision_effect TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending',
+  asked_at REAL NOT NULL DEFAULT 0,
+  answer_evidence_id TEXT REFERENCES evidence_items(id),
+  cooldown_until REAL NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_claims_active_kind
+ON personal_claims(state, kind, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_schemas_active_maturity
+ON personal_schemas(state, maturity, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_conflicts_open_schema
+ON schema_conflicts(resolution_state, schema_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_claimable
+ON memory_jobs(state, next_attempt_at, priority, created_at);
 """
 
 
@@ -73,6 +244,14 @@ class PersonalMemoryArchive:
                     ADD COLUMN candidate_next_attempt_at REAL NOT NULL DEFAULT 0
                     """
                 )
+            connection.execute(
+                """
+                INSERT INTO archive_metadata(key, value)
+                VALUES ('schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(_SCHEMA_VERSION),),
+            )
 
     @property
     def path(self) -> Path:
@@ -126,6 +305,40 @@ class PersonalMemoryArchive:
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
         )
+
+    @staticmethod
+    def _job_from_row(row: sqlite3.Row) -> MemoryJob:
+        return MemoryJob(
+            id=str(row["id"]),
+            job_type=str(row["job_type"]),
+            subject_id=str(row["subject_id"]),
+            idempotency_key=str(row["idempotency_key"]),
+            payload_json=str(row["payload_json"]),
+            state=str(row["state"]),
+            priority=int(row["priority"]),
+            attempts=int(row["attempts"]),
+            error_code=str(row["error_code"]),
+            claimed_at=float(row["claimed_at"]),
+            next_attempt_at=float(row["next_attempt_at"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    def schema_version(self) -> int:
+        """Return the archive schema version after in-place migration."""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM archive_metadata WHERE key = 'schema_version'"
+            ).fetchone()
+        return int(row["value"]) if row is not None else 0
+
+    def table_names(self) -> set[str]:
+        """Expose table names for migration diagnostics and integrity tests."""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        return {str(row["name"]) for row in rows}
 
     def record_exchange(
         self,
@@ -304,9 +517,9 @@ class PersonalMemoryArchive:
             )
 
     def release_in_progress_jobs(self) -> int:
-        """Return interrupted worker jobs to the durable pending queue."""
+        """Return interrupted legacy and developmental jobs to their queues."""
         with self._lock, self._connect() as connection:
-            updated = connection.execute(
+            legacy = connection.execute(
                 """
                 UPDATE conversation_exchanges
                 SET candidate_state = 'pending', candidate_claimed_at = 0,
@@ -314,7 +527,16 @@ class PersonalMemoryArchive:
                 WHERE candidate_state = 'processing'
                 """
             )
-        return max(0, updated.rowcount)
+            jobs = connection.execute(
+                """
+                UPDATE memory_jobs
+                SET state = 'pending', claimed_at = 0, next_attempt_at = 0,
+                    updated_at = ?
+                WHERE state = 'processing'
+                """,
+                (time.time(),),
+            )
+        return max(0, legacy.rowcount) + max(0, jobs.rowcount)
 
     def pending_exchange_ids(self, *, limit: int) -> list[str]:
         """List durable candidate work that can be tried or retried."""
@@ -334,6 +556,171 @@ class PersonalMemoryArchive:
                 (now, count),
             ).fetchall()
         return [str(row["id"]) for row in rows]
+
+    def enqueue_job(
+        self,
+        *,
+        job_type: str,
+        subject_id: str,
+        idempotency_key: str,
+        payload: dict[str, Any] | None = None,
+        priority: int = 0,
+    ) -> MemoryJob:
+        """Persist one idempotent unit of work and return the durable row."""
+        if (
+            not job_type.strip()
+            or not subject_id.strip()
+            or not idempotency_key.strip()
+        ):
+            raise ValueError("job type, subject ID, and idempotency key are required")
+        now = time.time()
+        job_id = str(uuid.uuid4())
+        payload_json = json.dumps(
+            payload or {},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO memory_jobs (
+                  id, job_type, subject_id, idempotency_key, payload_json,
+                  state, priority, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (
+                    job_id,
+                    job_type.strip(),
+                    subject_id.strip(),
+                    idempotency_key.strip(),
+                    payload_json,
+                    int(priority),
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM memory_jobs WHERE idempotency_key = ?",
+                (idempotency_key.strip(),),
+            ).fetchone()
+        if row is None:  # pragma: no cover - SQLite transaction guarantee
+            raise RuntimeError("memory job could not be read after enqueue")
+        return self._job_from_row(row)
+
+    def pending_job_ids(self, *, limit: int) -> list[str]:
+        """List claimable jobs in priority order without changing state."""
+        count = max(0, int(limit))
+        if count == 0:
+            return []
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM memory_jobs
+                WHERE state = 'pending'
+                   OR (state = 'failed' AND next_attempt_at <= ?)
+                ORDER BY priority DESC, created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (now, count),
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def claim_next_job(
+        self,
+        *,
+        job_types: Sequence[str] | None = None,
+    ) -> MemoryJob | None:
+        """Atomically claim the next eligible one-shot job."""
+        now = time.time()
+        allowed = tuple(str(value).strip() for value in (job_types or ()) if value)
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            params: list[Any] = [now]
+            type_clause = ""
+            if allowed:
+                placeholders = ",".join("?" for _ in allowed)
+                type_clause = f" AND job_type IN ({placeholders})"
+                params.extend(allowed)
+            row = connection.execute(
+                f"""
+                SELECT id FROM memory_jobs
+                WHERE (state = 'pending'
+                   OR (state = 'failed' AND next_attempt_at <= ?))
+                  {type_clause}
+                ORDER BY priority DESC, created_at ASC, id ASC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            if row is None:
+                return None
+            job_id = str(row["id"])
+            updated = connection.execute(
+                """
+                UPDATE memory_jobs
+                SET state = 'processing', attempts = attempts + 1,
+                    error_code = '', claimed_at = ?, next_attempt_at = 0,
+                    updated_at = ?
+                WHERE id = ? AND state IN ('pending', 'failed')
+                """,
+                (now, now, job_id),
+            )
+            if updated.rowcount != 1:
+                return None
+            claimed = connection.execute(
+                "SELECT * FROM memory_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._job_from_row(claimed) if claimed is not None else None
+
+    def complete_job(self, job_id: str) -> None:
+        """Mark a claimed job complete exactly once."""
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE memory_jobs
+                SET state = 'complete', error_code = '', claimed_at = 0,
+                    next_attempt_at = 0, updated_at = ?
+                WHERE id = ? AND state = 'processing'
+                """,
+                (now, job_id),
+            )
+
+    def fail_job(
+        self,
+        job_id: str,
+        *,
+        error_code: str,
+        retry_after: float | None = None,
+    ) -> None:
+        """Return failed work to a bounded-backoff durable state."""
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT attempts FROM memory_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return
+            if retry_after is None:
+                attempts = max(1, int(row["attempts"]))
+                retry_after = min(60.0, float(2 ** min(attempts - 1, 6)))
+            connection.execute(
+                """
+                UPDATE memory_jobs
+                SET state = 'failed', error_code = ?, claimed_at = 0,
+                    next_attempt_at = ?, updated_at = ?
+                WHERE id = ? AND state = 'processing'
+                """,
+                (
+                    error_code.strip() or "job_failed",
+                    now + max(0.0, float(retry_after)),
+                    now,
+                    job_id,
+                ),
+            )
 
 
 __all__ = ["PersonalMemoryArchive"]

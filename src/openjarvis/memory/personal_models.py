@@ -93,6 +93,15 @@ class InsightState(str, Enum):
     REJECTED = "rejected"
 
 
+class MemoryJobState(str, Enum):
+    """Durable one-shot worker lifecycle."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    FAILED = "failed"
+    COMPLETE = "complete"
+
+
 DIRECT_RULE_KINDS = frozenset(
     {
         CandidateKind.CONSTRAINT,
@@ -320,6 +329,28 @@ class MemoryDecision:
     created_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryJob:
+    """One restart-safe background operation carrying identifiers, not raw text."""
+
+    id: str
+    job_type: str
+    subject_id: str
+    idempotency_key: str
+    payload_json: str
+    state: MemoryJobState | str
+    priority: int
+    attempts: int
+    error_code: str
+    claimed_at: float
+    next_attempt_at: float
+    created_at: float
+    updated_at: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "state", MemoryJobState(self.state))
+
+
 __all__ = [
     "AdaptationOperation",
     "CandidateDraft",
@@ -337,6 +368,8 @@ __all__ = [
     "InsightState",
     "MemoryCandidate",
     "MemoryDecision",
+    "MemoryJob",
+    "MemoryJobState",
     "PersonalClaim",
     "PersonalSchema",
     "SchemaConflict",
