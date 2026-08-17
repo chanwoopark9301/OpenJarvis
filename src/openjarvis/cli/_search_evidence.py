@@ -39,6 +39,23 @@ _KOREAN_REGION_NAMES = frozenset(
         "경북",
         "경남",
         "제주",
+        "서울시",
+        "부산시",
+        "대구시",
+        "인천시",
+        "광주시",
+        "대전시",
+        "울산시",
+        "세종시",
+        "경기도",
+        "강원도",
+        "충청북도",
+        "충청남도",
+        "전라북도",
+        "전라남도",
+        "경상북도",
+        "경상남도",
+        "제주도",
     }
 )
 _NEARBY_WORDS = frozenset({"근처", "인근", "주변"})
@@ -78,6 +95,11 @@ def _record_matches(requirement: SearchRequirement, record: EvidenceSource) -> b
 def _query_place_anchors(query: str) -> tuple[str, ...]:
     tokens = re.findall(r"[가-힣]{2,}", query)
     anchors: list[str] = [token for token in tokens if token in _KOREAN_REGION_NAMES]
+    anchors.extend(
+        token
+        for token in tokens
+        if len(token) >= 3 and token.endswith(("시", "군", "구", "도"))
+    )
     for index, token in enumerate(tokens):
         if token in _NEARBY_WORDS and index:
             anchors.append(tokens[index - 1])
@@ -90,8 +112,8 @@ def record_is_relevant(
 ) -> bool:
     """Return whether a result mentions at least one requested public term."""
     searchable = _normalize(f"{record.title} {record.summary} {record.url}")
-    term_matches = any(
-        normalized_term and normalized_term in searchable
+    term_matches = all(
+        normalized_term in searchable
         for term in requirement.required_terms
         if (normalized_term := _normalize(term))
     )
@@ -183,8 +205,7 @@ def requirement_is_met(
             record,
         ):
             continue
-        if requirement.kind != "official" or record.source_kind == "official":
-            return True
+        return True
     return False
 
 

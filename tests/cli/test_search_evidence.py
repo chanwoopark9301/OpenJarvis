@@ -1,8 +1,8 @@
 """Tests for structured evidence parsed from web-search output."""
 
+from openjarvis.cli._request_plan import PlanRequirement
 from openjarvis.cli._search_evidence import (
     EvidenceSource,
-    SearchRequirement,
     parse_search_content,
     record_is_relevant,
     requirement_is_met,
@@ -10,9 +10,8 @@ from openjarvis.cli._search_evidence import (
 
 
 def test_parse_search_content_assigns_stable_ids_and_fields():
-    requirement = SearchRequirement(
+    requirement = PlanRequirement(
         id="R1",
-        kind="official",
         query="대전 테미오래 공식 운영시간",
         required_terms=("대전", "테미오래"),
     )
@@ -48,9 +47,8 @@ def test_parse_search_content_assigns_stable_ids_and_fields():
 
 
 def test_parse_search_content_ignores_malformed_url_less_and_duplicate_blocks():
-    requirement = SearchRequirement(
+    requirement = PlanRequirement(
         id="R2",
-        kind="food",
         query="대전 한식 맛집",
         required_terms=("대전", "한식"),
     )
@@ -71,9 +69,8 @@ def test_parse_search_content_ignores_malformed_url_less_and_duplicate_blocks():
 
 
 def test_parse_search_content_classifies_listing_review_and_other_sources():
-    requirement = SearchRequirement(
+    requirement = PlanRequirement(
         id="R3",
-        kind="shops",
         query="대전 소품샵",
         required_terms=("대전", "소품샵"),
     )
@@ -98,10 +95,9 @@ def test_parse_search_content_classifies_listing_review_and_other_sources():
     ]
 
 
-def test_requirement_is_met_requires_terms_in_one_record_and_official_source():
-    requirement = SearchRequirement(
+def test_requirement_is_met_requires_all_terms_in_one_record():
+    requirement = PlanRequirement(
         id="R1",
-        kind="official",
         query="대전 테미오래 공식 운영시간",
         required_terms=("대전", "테미오래"),
     )
@@ -109,7 +105,7 @@ def test_requirement_is_met_requires_terms_in_one_record_and_official_source():
         EvidenceSource("S1", "R1", "대전 관광", "https://a.test", "", "official"),
         EvidenceSource("S2", "R1", "테미오래", "https://b.test", "", "official"),
     )
-    unofficial_match = (
+    matching_record = (
         EvidenceSource(
             "S3",
             "R1",
@@ -119,26 +115,13 @@ def test_requirement_is_met_requires_terms_in_one_record_and_official_source():
             "review",
         ),
     )
-    official_match = (
-        EvidenceSource(
-            "S4",
-            "R1",
-            "테미오래 공식 누리집",
-            "https://temiorae.com",
-            "대전 관람 안내",
-            "official",
-        ),
-    )
-
     assert requirement_is_met(requirement, split_terms) is False
-    assert requirement_is_met(requirement, unofficial_match) is False
-    assert requirement_is_met(requirement, official_match) is True
+    assert requirement_is_met(requirement, matching_record) is True
 
 
 def test_nonofficial_requirement_accepts_one_matching_record():
-    requirement = SearchRequirement(
+    requirement = PlanRequirement(
         id="R2",
-        kind="food",
         query="대전 한식 맛집",
         required_terms=("대전", "한식"),
     )
@@ -157,9 +140,8 @@ def test_nonofficial_requirement_accepts_one_matching_record():
 
 
 def test_generic_social_profile_is_not_relevant_from_snippet_only():
-    requirement = SearchRequirement(
+    requirement = PlanRequirement(
         id="R2",
-        kind="food",
         query="대전 테미오래 근처 한식 맛집",
         required_terms=("한식", "맛집"),
     )

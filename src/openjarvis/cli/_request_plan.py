@@ -135,9 +135,10 @@ def _content(response: Any) -> str:
     return response.get("content", "") if isinstance(response, dict) else str(response)
 
 
-def _is_private_or_invalid(value: str) -> bool:
+def is_safe_public_query(value: str) -> bool:
+    """Return whether text is safe to send to a public search service."""
     normalized = value.casefold()
-    return (
+    return not (
         any(signal in normalized for signal in _PRIVATE_QUERY_SIGNALS)
         or bool(_EMAIL_PATTERN.search(value))
         or bool(_PHONE_PATTERN.search(value))
@@ -201,13 +202,13 @@ def _parse_plan(content: str) -> RequestPlan | None:
             or not isinstance(query, str)
             or not query.strip()
             or query.strip() in seen_queries
-            or _is_private_or_invalid(query)
+            or not is_safe_public_query(query)
             or not isinstance(terms, list)
             or not 1 <= len(terms) <= 3
             or any(
                 not isinstance(term, str)
                 or not term.strip()
-                or _is_private_or_invalid(term)
+                or not is_safe_public_query(term)
                 for term in terms
             )
         ):
@@ -282,5 +283,6 @@ __all__ = [
     "PlanRequirement",
     "RequestPlan",
     "RequestPlanner",
+    "is_safe_public_query",
     "needs_assistant_planning",
 ]
