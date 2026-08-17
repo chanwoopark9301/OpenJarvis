@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 from openjarvis.core.registry import ToolRegistry
@@ -12,6 +13,13 @@ from openjarvis.security.ssrf import check_ssrf
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 logger = logging.getLogger(__name__)
+
+_NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
+_OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+_KOREAN_WEATHER_QUERY = re.compile(
+    r"(?P<place>(?:[가-힣]{2,}(?:도|시|군|구)\s*){1,3})"
+    r"(?:현재|오늘)?\s*날씨"
+)
 
 
 @ToolRegistry.register("web_search")
@@ -120,7 +128,10 @@ class WebSearchTool(BaseTool):
         from ddgs import DDGS
 
         ddgs = DDGS()
-        raw_results = list(ddgs.text(query, max_results=max_results))
+        search_options: dict[str, Any] = {"max_results": max_results}
+        if any("가" <= character <= "힣" for character in query):
+            search_options["region"] = "kr-kr"
+        raw_results = list(ddgs.text(query, **search_options))
         results = []
         for r in raw_results:
             title = r.get("title", "Untitled")
@@ -130,6 +141,106 @@ class WebSearchTool(BaseTool):
 
         formatted = "\n\n---\n\n".join(results)
         return formatted
+
+    @staticmethod
+    def _weather_description(code: int) -> str:
+        if code == 0:
+            return "맑음"
+        if code in {1, 2}:
+            return "구름 조금"
+        if code == 3:
+            return "흐림"
+        if code in {45, 48}:
+            return "안개"
+        if code in {51, 53, 55, 56, 57}:
+            return "이슬비"
+        if code in {61, 63, 65, 66, 67, 80, 81, 82}:
+            return "비"
+        if code in {71, 73, 75, 77, 85, 86}:
+            return "눈"
+        if code in {95, 96, 99}:
+            return "뇌우"
+        return "날씨 코드 확인 필요"
+
+    @staticmethod
+    def _structured_weather_search(query: str) -> tuple[str, str] | None:
+        """Return a current public weather record for a concrete Korean place."""
+        match = _KOREAN_WEATHER_QUERY.search(query)
+        if match is None:
+            return None
+        place = " ".join(match.group("place").split())
+        try:
+            import httpx
+
+            geocoding_params = {
+                "q": place,
+                "format": "json",
+                "limit": 5,
+                "accept-language": "ko",
+            }
+            geocoding_response = httpx.get(
+                _NOMINATIM_SEARCH_URL,
+                params=geocoding_params,
+                headers={"User-Agent": "OpenJarvis/1.0"},
+                timeout=10.0,
+            )
+            geocoding_response.raise_for_status()
+            candidates = geocoding_response.json()
+            place_tokens = place.split()
+            candidate = next(
+                (
+                    item
+                    for item in candidates
+                    if all(
+                        token in str(item.get("display_name", ""))
+                        for token in place_tokens
+                    )
+                ),
+                None,
+            )
+            if candidate is None:
+                return None
+            forecast_params = {
+                "latitude": candidate["lat"],
+                "longitude": candidate["lon"],
+                "current": (
+                    "temperature_2m,apparent_temperature,precipitation,"
+                    "weather_code,wind_speed_10m"
+                ),
+                "timezone": "Asia/Seoul",
+                "forecast_days": 1,
+            }
+            forecast_response = httpx.get(
+                _OPEN_METEO_FORECAST_URL,
+                params=forecast_params,
+                timeout=10.0,
+            )
+            forecast_response.raise_for_status()
+            payload = forecast_response.json()
+            current = payload["current"]
+            units = payload["current_units"]
+            description = WebSearchTool._weather_description(
+                int(current["weather_code"])
+            )
+            summary = (
+                f"기준 시각 {current['time']}, {description}, "
+                f"기온 {current['temperature_2m']}"
+                f"{units['temperature_2m']}, 체감 기온 "
+                f"{current['apparent_temperature']}"
+                f"{units['apparent_temperature']}, 강수량 "
+                f"{current['precipitation']}{units['precipitation']}, 바람 "
+                f"{current['wind_speed_10m']}{units['wind_speed_10m']}."
+            )
+            source_url = str(
+                httpx.URL(_OPEN_METEO_FORECAST_URL, params=forecast_params)
+            )
+            content = (
+                f"### {place} 현재 날씨\nSource: {source_url}\nSummary: {summary}"
+            )
+            return content, source_url
+        except Exception:  # noqa: BLE001 - structured data falls back to web search
+            logger.debug("Structured weather lookup failed", exc_info=True)
+            return None
 
     def execute(self, **params: Any) -> ToolResult:
         query = params.get("query", "")
@@ -159,6 +270,20 @@ class WebSearchTool(BaseTool):
                 )
 
         max_results = params.get("max_results", self._max_results)
+
+        structured_weather = self._structured_weather_search(query)
+        if structured_weather is not None:
+            content, source_url = structured_weather
+            return ToolResult(
+                tool_name="web_search",
+                content=content,
+                success=True,
+                metadata={
+                    "num_results": 1,
+                    "engine": "open-meteo",
+                    "source": source_url,
+                },
+            )
 
         try:
             from tavily import TavilyClient

@@ -36,6 +36,72 @@ class TestWebSearchTool:
         assert result.success is False
         assert "No query" in result.content
 
+    def test_korean_current_weather_uses_structured_public_data(self, monkeypatch):
+        geocoding_response = MagicMock()
+        geocoding_response.raise_for_status.return_value = None
+        geocoding_response.json.return_value = [
+            {
+                "name": "과천시",
+                "display_name": "과천시, 경기도, 대한민국",
+                "lat": "37.42889",
+                "lon": "126.98917",
+            }
+        ]
+        weather_response = MagicMock()
+        weather_response.raise_for_status.return_value = None
+        weather_response.json.return_value = {
+            "current_units": {
+                "temperature_2m": "°C",
+                "apparent_temperature": "°C",
+                "precipitation": "mm",
+                "wind_speed_10m": "km/h",
+            },
+            "current": {
+                "time": "2026-08-18T20:15",
+                "temperature_2m": 24.7,
+                "apparent_temperature": 29.4,
+                "precipitation": 0.0,
+                "weather_code": 2,
+                "wind_speed_10m": 8.2,
+            },
+        }
+        get = MagicMock(side_effect=[geocoding_response, weather_response])
+        monkeypatch.setattr("httpx.get", get)
+
+        result = WebSearchTool(api_key=None).execute(
+            query="경기도 과천시 현재 날씨 기온 강수"
+        )
+
+        assert result.success is True
+        assert result.metadata["engine"] == "open-meteo"
+        assert "경기도 과천시 현재 날씨" in result.content
+        assert "기온 24.7°C" in result.content
+        assert "체감 기온 29.4°C" in result.content
+        assert "구름 조금" in result.content
+        assert "Source: https://api.open-meteo.com/" in result.content
+        assert get.call_count == 2
+
+    def test_structured_weather_failure_falls_back_to_normal_search(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr("httpx.get", MagicMock(side_effect=OSError("offline")))
+        monkeypatch.setattr(
+            WebSearchTool,
+            "_duckduckgo_search",
+            MagicMock(
+                return_value=(
+                    "### fallback\nSource: https://example.com\nSummary: ok"
+                )
+            ),
+        )
+
+        result = WebSearchTool(api_key=None).execute(
+            query="경기도 과천시 현재 날씨 기온 강수"
+        )
+
+        assert result.success is True
+        assert result.metadata["engine"] == "duckduckgo"
+
     def test_execute_no_api_key(self, monkeypatch):
         """When no API key, falls back to DuckDuckGo."""
         tool = WebSearchTool(api_key=None)
@@ -147,6 +213,32 @@ class TestWebSearchTool:
         assert "DDG Result 2" in result.content
         assert "https://example.com/1" in result.content
         assert result.metadata["engine"] == "duckduckgo"
+
+    def test_duckduckgo_uses_korean_region_for_korean_query(self, monkeypatch):
+        mock_ddgs = MagicMock()
+        mock_ddgs.text.return_value = []
+        mock_ddgs_module = MagicMock()
+        mock_ddgs_module.DDGS.return_value = mock_ddgs
+        monkeypatch.setitem(sys.modules, "ddgs", mock_ddgs_module)
+
+        WebSearchTool(api_key=None)._duckduckgo_search("과천시 현재 날씨", 5)
+
+        mock_ddgs.text.assert_called_once_with(
+            "과천시 현재 날씨",
+            max_results=5,
+            region="kr-kr",
+        )
+
+    def test_duckduckgo_keeps_default_region_for_non_korean_query(self, monkeypatch):
+        mock_ddgs = MagicMock()
+        mock_ddgs.text.return_value = []
+        mock_ddgs_module = MagicMock()
+        mock_ddgs_module.DDGS.return_value = mock_ddgs
+        monkeypatch.setitem(sys.modules, "ddgs", mock_ddgs_module)
+
+        WebSearchTool(api_key=None)._duckduckgo_search("current weather", 5)
+
+        mock_ddgs.text.assert_called_once_with("current weather", max_results=5)
 
     def test_max_results_parameter(self, monkeypatch):
         import builtins

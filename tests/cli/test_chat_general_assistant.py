@@ -6,10 +6,12 @@ from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
+from openjarvis.agents._stubs import BaseAgent
 from openjarvis.cli._assistant_preflight import AssistantPreflightResult
 from openjarvis.cli._search_evidence import EvidenceSource
 from openjarvis.cli.chat_cmd import chat
 from openjarvis.core.config import JarvisConfig
+from openjarvis.core.registry import AgentRegistry
 from openjarvis.core.types import Message, Role
 
 
@@ -27,6 +29,13 @@ class _FixedPreflight:
     ):
         self.calls.append((user_text, tuple(recent_messages), pending_clarification))
         return self.results.pop(0)
+
+
+class _SearchMustBypassAgent(BaseAgent):
+    agent_id = "search_must_bypass_agent"
+
+    def run(self, input, context=None, **kwargs):
+        raise AssertionError("grounded search must use the strict direct generator")
 
 
 def _config() -> JarvisConfig:
@@ -153,6 +162,35 @@ def test_search_uses_generic_prompt_and_renders_only_used_source():
     assert "itinerary" not in combined.casefold()
 
 
+def test_grounded_search_bypasses_the_conversational_agent():
+    AgentRegistry.register_value(
+        "search_must_bypass_agent",
+        _SearchMustBypassAgent,
+    )
+    engine = MagicMock()
+    engine.generate.return_value = {
+        "content": (
+            '{"lead":"확인했어.","blocks":[{"kind":"fact",'
+            '"text":"현재 기온은 24도야.","supports":['
+            '{"source_id":"S1","excerpt":"현재 기온 24도"}]}],'
+            '"follow_up":""}'
+        )
+    }
+    config = _config()
+    config.agent.default_agent = "search_must_bypass_agent"
+
+    result = _run(
+        engine,
+        _FixedPreflight(_weather_result()),
+        "과천시 날씨를 검색해 줘.\n/quit\n",
+        config=config,
+    )
+
+    assert result.exit_code == 0
+    assert "현재 기온은 24도야." in result.output
+    assert engine.generate.call_count == 1
+
+
 def test_malformed_search_answer_gets_one_local_repair():
     repaired = (
         '{"lead":"확인했어.","blocks":[{"kind":"fact",'
@@ -208,7 +246,7 @@ def test_action_and_search_failure_skip_final_generation_and_are_archived_once()
     assert record_exchange.call_count == 2
 
 
-def test_search_and_personal_memory_context_both_reach_generation():
+def test_grounded_search_does_not_mix_personal_memory_into_public_facts():
     engine = MagicMock()
     engine.generate.return_value = {
         "content": (
@@ -244,5 +282,5 @@ def test_search_and_personal_memory_context_both_reach_generation():
     assert result.exit_code == 0
     messages = engine.generate.call_args.args[0]
     combined = "\n".join(message.content for message in messages)
-    assert "PERSONAL MEMORY CONTEXT" in combined
+    assert "PERSONAL MEMORY CONTEXT" not in combined
     assert "UNTRUSTED WEB SEARCH RESULTS" in combined

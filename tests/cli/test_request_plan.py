@@ -52,11 +52,7 @@ def test_pending_clarification_routes_short_answer_to_planner_once():
 
 
 def test_weather_without_location_returns_one_clarifying_question():
-    engine = _FakeEngine(
-        '{"mode":"clarify","goal":"오늘 날씨 알려주기",'
-        '"clarifying_question":"어느 지역의 날씨를 볼까?",'
-        '"response_style":"direct","requirements":[]}'
-    )
+    engine = _FakeEngine()
 
     plan = RequestPlanner(engine, "test-model").plan(
         "오늘 날씨 검색해 볼래?", ()
@@ -69,6 +65,7 @@ def test_weather_without_location_returns_one_clarifying_question():
         response_style="direct",
         requirements=(),
     )
+    assert engine.calls == []
 
 
 def test_recent_public_context_resolves_follow_up_without_reasking():
@@ -89,8 +86,30 @@ def test_recent_public_context_resolves_follow_up_without_reasking():
 
     assert plan is not None
     assert plan.mode == "search"
-    assert plan.requirements[0].query == "경기도 과천시 오늘 날씨"
+    assert plan.requirements[0].query == "경기도 과천시 현재 날씨 기온 강수"
     assert "어느 지역의 날씨를 볼까?" in engine.calls[0][-1].content
+
+
+def test_translated_weather_query_preserves_public_place_and_requests_values():
+    engine = _FakeEngine(
+        '{"mode":"search","goal":"current weather in Gwacheon",'
+        '"clarifying_question":"","response_style":"direct",'
+        '"requirements":[{"id":"R1",'
+        '"query":"weather in Gwacheon Gyeonggi-do",'
+        '"required_terms":["Gwacheon","weather"]}]}'
+    )
+    history = (
+        Message(role=Role.USER, content="오늘 날씨를 검색해 줘."),
+        Message(role=Role.ASSISTANT, content="어느 지역의 날씨를 볼까?"),
+    )
+
+    plan = RequestPlanner(engine, "test-model").plan(
+        "경기도 과천시야.", history
+    )
+
+    assert plan is not None
+    assert plan.requirements[0].query == "경기도 과천시 현재 날씨 기온 강수"
+    assert plan.requirements[0].required_terms == ("경기도", "과천시", "날씨")
 
 
 def test_planner_passes_only_latest_six_non_system_messages():
@@ -184,3 +203,53 @@ def test_duplicate_or_nonsequential_requirements_fail_closed():
     engine = _FakeEngine(content, "invalid repair")
 
     assert RequestPlanner(engine, "test-model").plan("제품 비교해 줘", ()) is None
+
+
+def test_unresolved_placeholder_is_repaired_into_one_clarifying_question():
+    engine = _FakeEngine(
+        '{"mode":"search","goal":"오늘 날씨 찾기",'
+        '"clarifying_question":"","response_style":"direct",'
+        '"requirements":[{"id":"R1","query":"today weather forecast",'
+        '"required_terms":["place"]}]}',
+        '{"mode":"clarify","goal":"오늘 날씨 알려주기",'
+        '"clarifying_question":"어느 지역의 날씨를 볼까?",'
+        '"response_style":"direct","requirements":[]}',
+    )
+
+    plan = RequestPlanner(engine, "test-model").plan(
+        "인터넷에서 주변 가게를 찾아볼래?", ()
+    )
+
+    assert plan is not None
+    assert plan.mode == "clarify"
+    assert plan.clarifying_question == "어느 지역의 날씨를 볼까?"
+    repair_input = engine.calls[1][-1].content
+    assert "인터넷에서 주변 가게를 찾아볼래?" in repair_input
+    assert "today weather forecast" in repair_input
+
+
+def test_clarify_accepts_only_the_redundant_empty_requirements_omission():
+    engine = _FakeEngine(
+        '{"mode":"clarify","goal":"지역 확인",'
+        '"clarifying_question":"어느 지역을 기준으로 찾을까?",'
+        '"response_style":"direct"}'
+    )
+
+    plan = RequestPlanner(engine, "test-model").plan("주변 가게를 찾아줘", ())
+
+    assert plan is not None
+    assert plan.mode == "clarify"
+    assert plan.requirements == ()
+    assert len(engine.calls) == 1
+
+
+def test_required_terms_must_be_concrete_words_in_the_query():
+    malformed = (
+        '{"mode":"search","goal":"정보 찾기","clarifying_question":"",'
+        '"response_style":"direct","requirements":[{"id":"R1",'
+        '"query":"오늘 날씨","required_terms":["과천시"]}]}'
+    )
+    engine = _FakeEngine(malformed, "invalid repair")
+
+    assert RequestPlanner(engine, "test-model").plan("정보를 검색해 줘", ()) is None
+    assert len(engine.calls) == 2

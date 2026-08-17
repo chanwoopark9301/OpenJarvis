@@ -59,7 +59,7 @@ class AssistantPreflight:
         planner: Any,
         search_tool: Any,
         *,
-        max_results: int = 3,
+        max_results: int = 5,
         max_context_chars: int = 12_000,
     ) -> None:
         self._planner = planner

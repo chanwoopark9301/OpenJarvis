@@ -57,7 +57,8 @@ def _build_assistant_preflight(config, engine, engine_key: str, model: str):
     )
     return AssistantPreflight(
         planner,
-        WebSearchTool(max_results=3),
+        WebSearchTool(max_results=5),
+        max_results=5,
     )
 
 
@@ -438,6 +439,7 @@ def chat(
             except Exception:
                 logger.debug("Failed to inject memory context", exc_info=True)
 
+        search_context_message = None
         if assistant_result.success:
             from openjarvis.cli._grounded_response import build_grounded_prompt
 
@@ -465,6 +467,19 @@ def chat(
             if assistant_result.triggered and not assistant_result.success:
                 content = (
                     assistant_result.clarifying_question or assistant_result.error
+                )
+            elif assistant_result.success:
+                result = engine.generate(
+                    [
+                        search_context_message,
+                        Message(role=Role.USER, content=user_input),
+                    ],
+                    model=model,
+                )
+                content = (
+                    result.get("content", "")
+                    if isinstance(result, dict)
+                    else str(result)
                 )
             elif agent is not None:
                 agent_context = None

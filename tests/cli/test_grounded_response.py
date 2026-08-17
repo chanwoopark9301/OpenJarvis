@@ -229,6 +229,8 @@ def test_prompt_contains_generic_schema_request_goal_style_and_evidence():
     assert "[S1] 현재 기온 24도" in prompt
     assert '"lead"' in prompt and '"blocks"' in prompt
     assert '"excerpt"' in prompt
+    assert "include that value" in prompt
+    assert "unsupported qualitative judgment" in prompt
     assert "itinerary" not in prompt.casefold()
     assert "venue" not in prompt.casefold()
 
