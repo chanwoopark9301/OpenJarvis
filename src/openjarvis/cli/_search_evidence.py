@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+from openjarvis.cli._request_plan import PlanRequirement
+
 _LISTING_DOMAINS = (
     "diningcode.com",
     "siksinhot.com",
@@ -62,18 +64,8 @@ _NEARBY_WORDS = frozenset({"근처", "인근", "주변"})
 
 
 @dataclass(frozen=True)
-class SearchRequirement:
-    """One public-information need and the query used to satisfy it."""
-
-    id: str
-    kind: str
-    query: str
-    required_terms: tuple[str, ...]
-
-
-@dataclass(frozen=True)
 class EvidenceSource:
-    """One numbered search result that can support itinerary facts."""
+    """One numbered search result that can support an everyday factual claim."""
 
     id: str
     requirement_id: str
@@ -87,7 +79,7 @@ def _normalize(value: str) -> str:
     return re.sub(r"[^0-9a-z가-힣]", "", value.casefold())
 
 
-def _record_matches(requirement: SearchRequirement, record: EvidenceSource) -> bool:
+def _record_matches(requirement: PlanRequirement, record: EvidenceSource) -> bool:
     searchable = _normalize(f"{record.title} {record.summary} {record.url}")
     return all(_normalize(term) in searchable for term in requirement.required_terms)
 
@@ -107,7 +99,7 @@ def _query_place_anchors(query: str) -> tuple[str, ...]:
 
 
 def record_is_relevant(
-    requirement: SearchRequirement,
+    requirement: PlanRequirement,
     record: EvidenceSource,
 ) -> bool:
     """Return whether a result mentions at least one requested public term."""
@@ -135,7 +127,7 @@ def record_is_relevant(
 
 
 def _classify_source(
-    requirement: SearchRequirement,
+    requirement: PlanRequirement,
     *,
     title: str,
     url: str,
@@ -156,7 +148,7 @@ def _classify_source(
 
 
 def parse_search_content(
-    requirement: SearchRequirement,
+    requirement: PlanRequirement,
     content: str,
     *,
     start_index: int,
@@ -195,7 +187,7 @@ def parse_search_content(
 
 
 def requirement_is_met(
-    requirement: SearchRequirement,
+    requirement: PlanRequirement,
     evidence: tuple[EvidenceSource, ...],
 ) -> bool:
     """Return whether one record satisfies the requirement's public terms."""
@@ -211,7 +203,6 @@ def requirement_is_met(
 
 __all__ = [
     "EvidenceSource",
-    "SearchRequirement",
     "parse_search_content",
     "record_is_relevant",
     "requirement_is_met",

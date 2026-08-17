@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from typing import List, Optional
@@ -36,22 +37,27 @@ def _personal_memory_status(config, personal_mode: str) -> str:
     return "active"
 
 
-def _build_auto_search_preflight(config, engine, engine_key: str, model: str):
-    """Build the chat search preflight with a locally verified planner."""
-    from openjarvis.cli._auto_search import AutoSearchPreflight
+def _build_assistant_preflight(config, engine, engine_key: str, model: str):
+    """Build the generic assistant preflight with a local-only planner."""
+    from openjarvis.cli._assistant_preflight import AssistantPreflight
+    from openjarvis.cli._request_plan import RequestPlanner
     from openjarvis.memory.candidate_extractor import (
         is_local_personal_memory_engine,
     )
     from openjarvis.tools.web_search import WebSearchTool
 
-    return AutoSearchPreflight(
-        engine,
-        model,
+    class _UnavailablePlanner:
+        def plan(self, user_text, recent_messages):
+            return None
+
+    planner = (
+        RequestPlanner(engine, model)
+        if is_local_personal_memory_engine(config, engine_key)
+        else _UnavailablePlanner()
+    )
+    return AssistantPreflight(
+        planner,
         WebSearchTool(max_results=3),
-        local_planning_allowed=is_local_personal_memory_engine(
-            config,
-            engine_key,
-        ),
     )
 
 
@@ -61,61 +67,32 @@ def _safe_search_notice(search_result) -> str:
     query_lines = "\n".join(f"- {query}" for query in search_result.queries)
     query_section = f"\n\n검색한 내용:\n{query_lines}" if query_lines else ""
     return (
-        "인터넷 자료는 찾았지만, 만든 답변의 장소나 시간을 아래 출처와 "
-        "직접 연결해 확인하지 못했어. 확인되지 않은 내용은 보여주지 않을게."
+        "인터넷 자료는 찾았지만, 만든 답변의 사실을 출처와 직접 연결해 "
+        "확인하지 못했어. 확인되지 않은 내용은 보여주지 않을게."
         f"{query_section}\n\n확인한 출처:\n{source_lines}"
     )
 
 
 def _render_grounded_search_answer(content: str, search_result) -> str | None:
-    """Validate each itinerary item and render all usable steps."""
-    from openjarvis.cli._grounded_answer import (
-        parse_itinerary_json,
-        render_itinerary,
-        validate_itinerary,
+    """Validate each generic answer block and render all usable content."""
+    from openjarvis.cli._grounded_response import (
+        parse_grounded_json,
+        render_grounded_response,
+        validate_grounded_response,
     )
 
     try:
-        items = parse_itinerary_json(content)
+        response = parse_grounded_json(content)
     except ValueError:
         return None
-    if not items:
+    validated = validate_grounded_response(response, search_result.evidence)
+    if not validated.blocks:
         return None
-    validated = validate_itinerary(
-        items,
+    return render_grounded_response(
+        validated,
         search_result.evidence,
-        user_text=getattr(search_result, "request_text", ""),
+        style=search_result.response_style,
     )
-    return render_itinerary(validated, search_result.evidence)
-
-
-def _repair_grounded_json(
-    engine,
-    model: str,
-    content: str,
-    valid_source_ids: tuple[str, ...],
-) -> str:
-    """Ask the verified local engine once to repair malformed itinerary JSON."""
-    source_ids = ", ".join(valid_source_ids) or "none"
-    system_prompt = """Repair malformed itinerary output. Return only JSON with
-exactly one items array. Each item must contain string fields time, title, detail,
-venue, address, hours, status, check_before_visit and a string-list source_ids.
-Status must be confirmed, partial, or needs_check. Use only the allowed source IDs.
-Do not add facts or answer outside the JSON."""
-    user_prompt = f"Allowed source IDs: {source_ids}\n\nMalformed output:\n{content}"
-    try:
-        result = engine.generate(
-            [
-                Message(role=Role.SYSTEM, content=system_prompt),
-                Message(role=Role.USER, content=user_prompt),
-            ],
-            model=model,
-            temperature=0.0,
-            max_tokens=1200,
-        )
-    except Exception:  # noqa: BLE001 - repair is a single best-effort attempt
-        return ""
-    return result.get("content", "") if isinstance(result, dict) else str(result)
 
 
 @click.command()
@@ -326,7 +303,7 @@ def chat(
 
         memory_backend = _get_memory_backend(config)
 
-    auto_search_preflight = _build_auto_search_preflight(
+    assistant_preflight = _build_assistant_preflight(
         config,
         engine,
         engine_name,
@@ -347,6 +324,7 @@ def chat(
     history: List[Message] = []
     if system_prompt:
         history.append(Message(role=Role.SYSTEM, content=system_prompt))
+    pending_clarification = False
 
     # REPL loop
     while True:
@@ -371,6 +349,7 @@ def chat(
             history = []
             if system_prompt:
                 history.append(Message(role=Role.SYSTEM, content=system_prompt))
+            pending_clarification = False
             console.print("[dim]History cleared.[/dim]")
             continue
         elif cmd == "/model":
@@ -401,7 +380,14 @@ def chat(
         # Add user message
         history.append(Message(role=Role.USER, content=user_input))
 
-        auto_search_result = auto_search_preflight.prepare(user_input)
+        assistant_result = assistant_preflight.prepare(
+            user_input,
+            tuple(history[:-1][-6:]),
+            pending_clarification=pending_clarification,
+        )
+        pending_clarification = (
+            assistant_result.triggered and assistant_result.mode == "clarify"
+        )
         agent_context_messages: list[Message] = []
         generation_history = history
         if config.agent.context_from_memory:
@@ -452,14 +438,16 @@ def chat(
             except Exception:
                 logger.debug("Failed to inject memory context", exc_info=True)
 
-        if auto_search_result.success:
-            from openjarvis.cli._grounded_answer import build_itinerary_prompt
+        if assistant_result.success:
+            from openjarvis.cli._grounded_response import build_grounded_prompt
 
             search_context_message = Message(
                 role=Role.SYSTEM,
-                content=build_itinerary_prompt(
-                    user_input,
-                    auto_search_result.context,
+                content=build_grounded_prompt(
+                    user_text=user_input,
+                    goal=assistant_result.goal,
+                    response_style=assistant_result.response_style,
+                    context=assistant_result.context,
                 ),
                 metadata={"external_search_context": True},
             )
@@ -474,8 +462,10 @@ def chat(
 
         # Generate response even when optional memory context is unavailable.
         try:
-            if auto_search_result.triggered and not auto_search_result.success:
-                content = auto_search_result.error
+            if assistant_result.triggered and not assistant_result.success:
+                content = (
+                    assistant_result.clarifying_question or assistant_result.error
+                )
             elif agent is not None:
                 agent_context = None
                 if agent_context_messages:
@@ -496,26 +486,52 @@ def chat(
                     else str(result)
                 )
 
-            if auto_search_result.success:
+            if assistant_result.success:
                 grounded_content = _render_grounded_search_answer(
                     content,
-                    auto_search_result,
+                    assistant_result,
                 )
                 if grounded_content is None:
-                    repaired_content = _repair_grounded_json(
+                    from openjarvis.cli._grounded_response import (
+                        repair_grounded_json,
+                    )
+
+                    repaired_response = repair_grounded_json(
                         engine,
                         model,
                         content,
-                        tuple(
-                            record.id for record in auto_search_result.evidence
+                        valid_source_ids=tuple(
+                            record.id for record in assistant_result.evidence
                         ),
                     )
-                    grounded_content = _render_grounded_search_answer(
-                        repaired_content,
-                        auto_search_result,
-                    )
+                    if repaired_response is not None:
+                        repaired_content = json.dumps(
+                            {
+                                "lead": repaired_response.lead,
+                                "blocks": [
+                                    {
+                                        "kind": block.kind,
+                                        "text": block.text,
+                                        "supports": [
+                                            {
+                                                "source_id": support.source_id,
+                                                "excerpt": support.excerpt,
+                                            }
+                                            for support in block.supports
+                                        ],
+                                    }
+                                    for block in repaired_response.blocks
+                                ],
+                                "follow_up": repaired_response.follow_up,
+                            },
+                            ensure_ascii=False,
+                        )
+                        grounded_content = _render_grounded_search_answer(
+                            repaired_content,
+                            assistant_result,
+                        )
                 content = grounded_content or _safe_search_notice(
-                    auto_search_result
+                    assistant_result
                 )
 
             history.append(Message(role=Role.ASSISTANT, content=content))
