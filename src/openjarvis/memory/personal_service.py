@@ -101,6 +101,7 @@ class PersonalMemoryService:
             return
         self._running.set()
         self._archive.release_in_progress_jobs()
+        self._archive.repair_legacy_profile_candidate_lifecycle()
         self._archive.recover_stale_candidate_jobs(PERSONAL_CANDIDATE_EXTRACTOR_VERSION)
         self._archive.recover_pending_candidate_jobs()
         self._subscribe_events()

@@ -343,6 +343,107 @@ def test_startup_reprocesses_v5_zero_candidate_with_v8_lifecycle(tmp_path):
         service.stop()
 
 
+def test_restart_leaves_staged_profile_candidates_for_explicit_review(tmp_path):
+    """Startup recovery must evaluate normal evidence, not staged profile text."""
+    PersonalMemoryArchive, CandidateDraft, PersonalMemoryService, _, _ = _service_api()
+    from openjarvis.memory.personal_models import EvidenceSource
+    from openjarvis.memory.profile_migration import LegacyProfileMigrator
+
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path = tmp_path / "USER.md"
+    memory_path = tmp_path / "MEMORY.md"
+    user_path.write_text("- legacy preference", encoding="utf-8")
+    memory_path.write_text("- legacy constraint", encoding="utf-8")
+    LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    legacy_candidates = archive.find_candidates(source=EvidenceSource.LEGACY_IMPORT)
+
+    exchange = archive.record_exchange(
+        exchange_id="normal-pending",
+        user_text="I live in Gwacheon.",
+        assistant_text="Understood.",
+        source="test",
+    )
+    assert archive.claim_candidate_job(exchange.id) is not None
+    normal_candidate = archive.complete_candidate_job(
+        exchange.id,
+        [
+            CandidateDraft(
+                "fact",
+                "I live in Gwacheon.",
+                1.0,
+                1.0,
+                evidence_excerpt="I live in Gwacheon.",
+            )
+        ],
+        engine_id="ollama",
+        extractor_version="personal-memory-v8",
+    )[0]
+
+    service = PersonalMemoryService(archive, _FakeExtractor())
+    service.start()
+    try:
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not archive.get_active_claims():
+            time.sleep(0.01)
+    finally:
+        service.stop()
+
+    assert archive.get_candidate(normal_candidate.id).status.value == "accepted"
+    assert [claim.content for claim in archive.get_active_claims()] == [
+        "I live in Gwacheon."
+    ]
+    for candidate in legacy_candidates:
+        assert archive.get_candidate(candidate.id).status.value == "pending"
+        assert archive.decision_count(subject_id=candidate.id) == 0
+        assert archive.evidence_count(candidate_id=candidate.id) == 0
+    with sqlite3.connect(archive.path) as connection:
+        legacy_job_count = connection.execute(
+            """
+            SELECT COUNT(*) FROM memory_jobs AS job
+            JOIN memory_candidates AS candidate ON candidate.id = job.subject_id
+            WHERE candidate.engine_id = 'legacy-profile-stage'
+              AND candidate.extractor_version = 'legacy-profile-v1'
+            """
+        ).fetchone()[0]
+    assert legacy_job_count == 0
+
+
+def test_restart_repairs_a_staged_candidate_rejected_by_an_old_worker(tmp_path):
+    """Startup must make deterministic staged IDs reviewable again."""
+    PersonalMemoryArchive, _, PersonalMemoryService, _, _ = _service_api()
+    from openjarvis.memory.evaluator import MemoryEvaluator
+    from openjarvis.memory.personal_models import EvidenceSource
+    from openjarvis.memory.profile_migration import LegacyProfileMigrator
+
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path = tmp_path / "USER.md"
+    memory_path = tmp_path / "MEMORY.md"
+    user_path.write_text("- legacy preference", encoding="utf-8")
+    memory_path.write_text("", encoding="utf-8")
+    LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    candidate = archive.find_candidates(source=EvidenceSource.LEGACY_IMPORT)[0]
+    job = archive.enqueue_job(
+        job_type="evaluate_candidate",
+        subject_id=candidate.id,
+        idempotency_key=f"evaluate_candidate:{candidate.id}",
+    )
+    assert archive.claim_job(job.id) is not None
+    assert (
+        MemoryEvaluator(archive).evaluate(candidate.id).reason_code
+        == "unsupported_by_user_evidence"
+    )
+
+    service = PersonalMemoryService(archive, _FakeExtractor())
+    service.start()
+    service.stop()
+
+    assert archive.get_candidate(candidate.id).status.value == "pending"
+    assert archive.get_job(job.id).state.value == "complete"
+    assert archive.decision_count(subject_id=candidate.id) == 2
+    assert archive.evidence_count(candidate_id=candidate.id) == 0
+    assert archive.get_active_claims() == []
+
+
 def test_cloud_engine_cannot_build_a_personal_memory_service(tmp_path):
     """The service factory must fail closed before a cloud engine can be invoked."""
     _, _, _, build_personal_memory_service, _ = _service_api()

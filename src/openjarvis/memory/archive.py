@@ -2858,7 +2858,12 @@ class PersonalMemoryArchive:
             rows = connection.execute(
                 """
                 SELECT id FROM memory_candidates
-                WHERE status = 'pending' ORDER BY created_at ASC, id ASC
+                WHERE status = 'pending'
+                  AND NOT (
+                    engine_id = 'legacy-profile-stage'
+                    AND extractor_version = 'legacy-profile-v1'
+                  )
+                ORDER BY created_at ASC, id ASC
                 """
             ).fetchall()
         return [
@@ -2870,6 +2875,101 @@ class PersonalMemoryArchive:
             )
             for row in rows
         ]
+
+    def repair_legacy_profile_candidate_lifecycle(self) -> int:
+        """Restore staged candidates rejected by the former automatic worker path.
+
+        Staged profile rows have no direct user-evidence excerpt and require an
+        explicit review.  Older workers nevertheless enqueued them for ordinary
+        evidence evaluation.  Repair only that exact provenance when its latest
+        decision is the resulting automatic evidence rejection.
+        """
+        now = time.time()
+        repaired = 0
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT candidate.id
+                FROM memory_candidates AS candidate
+                JOIN memory_decisions AS decision
+                  ON decision.rowid = (
+                    SELECT latest.rowid
+                    FROM memory_decisions AS latest
+                    WHERE latest.subject_id = candidate.id
+                      AND latest.subject_type = 'candidate'
+                    ORDER BY latest.created_at DESC, latest.rowid DESC
+                    LIMIT 1
+                  )
+                WHERE candidate.status = 'rejected'
+                  AND candidate.engine_id = 'legacy-profile-stage'
+                  AND candidate.extractor_version = 'legacy-profile-v1'
+                  AND decision.operation = 'no_op'
+                  AND decision.reason_code = 'unsupported_by_user_evidence'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM evidence_items AS evidence
+                    WHERE evidence.candidate_id = candidate.id
+                  )
+                ORDER BY candidate.created_at ASC, candidate.id ASC
+                """
+            ).fetchall()
+            for row in rows:
+                candidate_id = str(row["id"])
+                job_rows = connection.execute(
+                    """
+                    SELECT id FROM memory_jobs
+                    WHERE job_type = 'evaluate_candidate'
+                      AND subject_id = ?
+                      AND idempotency_key = ?
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (candidate_id, f"evaluate_candidate:{candidate_id}"),
+                ).fetchall()
+                job_ids = [str(job["id"]) for job in job_rows]
+                updated = connection.execute(
+                    """
+                    UPDATE memory_candidates
+                    SET status = 'pending', updated_at = ?
+                    WHERE id = ? AND status = 'rejected'
+                    """,
+                    (now, candidate_id),
+                )
+                if updated.rowcount != 1:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE memory_jobs
+                    SET state = 'complete', error_code = '', claimed_at = 0,
+                        next_attempt_at = 0, updated_at = ?
+                    WHERE job_type = 'evaluate_candidate'
+                      AND subject_id = ?
+                      AND idempotency_key = ?
+                    """,
+                    (now, candidate_id, f"evaluate_candidate:{candidate_id}"),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO memory_decisions (
+                      id, subject_id, subject_type, operation, reason_code,
+                      affected_ids_json, details_json, created_at
+                    ) VALUES (
+                      ?, ?, 'candidate', 'repair',
+                      'legacy_profile_automatic_evaluation_repaired', ?, ?, ?
+                    )
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        candidate_id,
+                        json.dumps(job_ids, separators=(",", ":")),
+                        json.dumps(
+                            {"repair": "legacy-profile-lifecycle-v1"},
+                            separators=(",", ":"),
+                        ),
+                        now,
+                    ),
+                )
+                repaired += 1
+        return repaired
 
     def enqueue_job(
         self,

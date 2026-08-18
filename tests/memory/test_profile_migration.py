@@ -22,6 +22,7 @@ from openjarvis.core.config import (
     effective_chat_memory_files,
 )
 from openjarvis.memory.archive import PersonalMemoryArchive
+from openjarvis.memory.evaluator import MemoryEvaluator
 from openjarvis.memory.personal_models import EvidenceSource
 from openjarvis.memory.profile_migration import (
     LegacyProfileMigrator,
@@ -83,6 +84,47 @@ def test_staging_records_only_nonempty_bullets_as_low_trust_candidates(tmp_path)
         f"legacy-profile:{user_path}:4",
         f"legacy-profile:{memory_path}:3",
     ]
+
+
+def test_repair_restores_only_automatically_rejected_staged_candidates(tmp_path):
+    """A past worker rejection must not permanently erase explicit-review work."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    candidate = archive.find_candidates(source=EvidenceSource.LEGACY_IMPORT)[0]
+    job = archive.enqueue_job(
+        job_type="evaluate_candidate",
+        subject_id=candidate.id,
+        idempotency_key=f"evaluate_candidate:{candidate.id}",
+    )
+    assert archive.claim_job(job.id) is not None
+    result = MemoryEvaluator(archive).evaluate(candidate.id)
+    assert result.reason_code == "unsupported_by_user_evidence"
+    assert archive.get_candidate(candidate.id).status.value == "rejected"
+
+    assert archive.repair_legacy_profile_candidate_lifecycle() == 1
+    assert archive.repair_legacy_profile_candidate_lifecycle() == 0
+
+    assert archive.get_candidate(candidate.id).status.value == "pending"
+    assert archive.decision_count(subject_id=candidate.id) == 2
+    assert archive.evidence_count(candidate_id=candidate.id) == 0
+    assert archive.get_active_claims() == []
+    assert archive.get_job(job.id).state.value == "complete"
+    assert archive.recover_pending_candidate_jobs() == []
+
+
+def test_repair_preserves_explicit_rejection_of_a_staged_candidate(tmp_path):
+    """Only the known automatic evidence rejection is repairable."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    candidate = archive.find_candidates(source=EvidenceSource.LEGACY_IMPORT)[0]
+    assert archive.reject_candidate(candidate.id, reason_code="user_review_rejected")
+
+    assert archive.repair_legacy_profile_candidate_lifecycle() == 0
+
+    assert archive.get_candidate(candidate.id).status.value == "rejected"
+    assert archive.decision_count(subject_id=candidate.id) == 1
 
 
 def test_activation_refuses_without_readable_backups(tmp_path):
