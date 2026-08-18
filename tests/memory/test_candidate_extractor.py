@@ -214,6 +214,7 @@ def test_extractor_passes_one_strict_candidates_schema():
     assert schema["type"] == "object"
     assert schema["required"] == ["candidates"]
     assert schema["additionalProperties"] is False
+    assert schema["properties"]["candidates"]["maxItems"] == 5
     item_schema = schema["properties"]["candidates"]["items"]
     assert item_schema["additionalProperties"] is False
     assert set(item_schema["required"]) == {
@@ -272,8 +273,8 @@ def test_extractor_rejects_invalid_enums_bounds_lengths_and_extra_fields(overrid
     assert extractor.last_error_code == "invalid_output"
 
 
-def test_extractor_caps_valid_candidates_at_five():
-    """A model response cannot create more than five proposals per exchange."""
+def test_extractor_rejects_more_than_five_valid_candidates():
+    """A response outside the schema cap must not be partially salvaged."""
     PersonalCandidateExtractor, _, _ = _extractor_api()
     candidates = [
         _candidate(
@@ -283,11 +284,12 @@ def test_extractor_caps_valid_candidates_at_five():
         for index in range(6)
     ]
 
-    drafts = PersonalCandidateExtractor(
+    extractor = PersonalCandidateExtractor(
         _FakeEngine(_response(*candidates)), "qwen3.5:9b"
-    ).extract(_exchange())
+    )
 
-    assert len(drafts) == 5
+    assert extractor.extract(_exchange()) == []
+    assert extractor.last_error_code == "invalid_output"
 
 
 def test_extractor_keeps_the_verified_engine_name_for_candidate_provenance():

@@ -238,6 +238,8 @@ class PersonalCandidateExtractor:
         candidates = raw["candidates"]
         if not isinstance(candidates, list):
             return [], "invalid_output"
+        if len(candidates) > 5:
+            return [], "invalid_output"
 
         drafts: list[CandidateDraft] = []
         for item in candidates:
@@ -296,7 +298,7 @@ class PersonalCandidateExtractor:
                 )
             except (TypeError, ValueError):
                 return [], "invalid_output"
-        return drafts[:5], ""
+        return drafts, ""
 
     @staticmethod
     def _valid_score(value: Any) -> bool:
