@@ -331,3 +331,77 @@ Replaced the literal `shutil.copy2` implementation with a descriptor-only equiva
 
 - Secure staging intentionally refuses platforms without the complete no-follow/dir-fd/fd-timestamp primitive set; it does not fall back to a path-based copy.
 - The unrelated server-route fixture mismatch recorded in fix round 1 remains outside Task 5.
+
+## Fix round 4: fail-safe permission ordering, descriptor cleanup, and proactive reset
+
+### Controller ruling and status
+
+Kept the descriptor-only snapshot implementation and unsupported-platform preflight from round 3. No literal `copy2` path was restored. This round repairs private modes before fallible identity reads, treats failed `close(2)` calls as single-shot operations, narrows prompt-builder capability to keyword-compatible parameters, and makes explicit proactive loading restore both cached agent and tool registrations.
+
+No real profile, archive, installation, or external provider was changed or invoked.
+
+### RED evidence
+
+- Added the six focused round-four regressions and ran:
+  - `uv run pytest -q tests/memory/test_profile_migration.py::test_backup_root_mode_is_repaired_before_root_identity_read tests/memory/test_profile_migration.py::test_destination_mode_is_repaired_before_destination_identity_read tests/memory/test_profile_migration.py::test_failed_close_does_not_retry_a_reused_descriptor tests/cli/test_chat_cmd.py::test_prompt_builder_injection_requires_capability_and_explicit_parameter tests/cli/test_chat_cmd.py::test_requested_proactive_registration_is_lazy_and_compatible tests/agents/test_proactive_agent.py::test_explicit_proactive_request_registers_agent_and_tools_in_fresh_process`
+  - Initial result: `5 failed, 1 passed in 0.69s`.
+  - The backup-root regression observed the surviving pre-existing root at `0777` after the injected second/root `fstat` failure.
+  - The realistic close regression released the first descriptor, reused its number for an unrelated `/dev/null` descriptor, then raised. `_close_fd` retried and closed the unrelated descriptor; the assertion failed with `EBADF`. The same `ExitStack` still closed its other owned descriptor.
+  - The prompt regression showed that positional-only `prompt_builder` was incorrectly accepted. The same selection also covers and rejects a `*prompt_builder` variadic positional parameter while retaining ordinary positional-or-keyword and keyword-only receivers.
+  - The in-process reset regression imported both proactive modules, cleared `AgentRegistry` and `ToolRegistry`, and requested proactive twice. The agent returned, but `check_permission` (and the other four proactive tools) remained absent because cached decorators did not rerun.
+  - The fresh-process absence/request/present regression already passed, isolating the missing behavior to cached-module registry reset.
+- The first destination injection replaced `os.open`, which intentionally invalidated the platform capability function's callable-identity check and stopped at the unsupported-platform gate. The harness was corrected without production changes by pinning that already-covered capability check for this failure injection, then rerun:
+  - `uv run pytest -q tests/memory/test_profile_migration.py::test_destination_mode_is_repaired_before_destination_identity_read`
+  - Result: `1 failed in 0.07s` for the intended reason: the injected destination `fstat` failure left the restricted-umask file at `000` rather than exact `0600`.
+
+### GREEN evidence
+
+- Exact six-test round-four selection: `6 passed in 0.61s`.
+- Complete affected migration/chat/proactive files: `63 passed in 1.17s`.
+- Required Task 5 plus affected MonitorOperative suite:
+  - `uv run pytest -q tests/memory/test_profile_migration.py tests/memory/test_context_composer.py tests/cli/test_memory_cmd.py tests/cli/test_chat_cmd.py tests/memory/test_developmental_memory_privacy.py tests/agents/test_proactive_agent.py tests/agents/test_monitor_operative.py`
+  - `100 passed in 1.52s`.
+- Broader memory and CLI suite:
+  - `uv run pytest -q tests/memory tests/cli`
+  - `847 passed, 16 skipped, 8 warnings in 13.57s`; warnings are the existing FastAPI `on_event` deprecations.
+  - A final rerun again reached the complete `847 passed, 16 skipped, 8 warnings` summary in `13.86s`, then lingered only in the third-party PostHog client's `atexit` thread join. After the completed test summary was captured, interrupting that stale join exposed the PostHog callback and the test session returned exit code `0`.
+- Full agent suite:
+  - `uv run pytest -q tests/agents`
+  - `559 passed in 4.39s`.
+- Post-GREEN test refactor selection: `2 passed in 0.44s`; the destination failure now keys directly off the captured destination descriptor, and the fresh-process test name reflects explicit registration semantics.
+- Ruff check and Ruff format check pass on all six round-four source/test files. `git diff --check` passes. The `copy2|shutil|_copy2_private_snapshot` audit has no matches in the migration source or tests.
+
+### Permission ordering and descriptor cleanup
+
+- The safely opened backup root is forced to exact `0700` immediately, before its first `fstat`. An injected second/root `fstat` failure therefore leaves the root private and returns the descriptor count to baseline.
+- The exclusively created destination is forced to exact `0600` immediately after `open`, before its first `fstat`. A targeted restrictive-umask plus destination-`fstat` failure leaves the root and snapshot directory at `0700`, the destination at `0600`, and no leaked descriptors.
+- `_close_fd` now calls `os.close` exactly once. POSIX permits a failed close to have already released the numeric descriptor, so retrying could close an unrelated descriptor that reused the number.
+- `ExitStack` remains the owner of every root-chain, source, backup-root, snapshot, destination, and verification descriptor. Its callback unwinding continues after a close callback raises; the regression confirms the remaining owned descriptor is closed while the reused unrelated descriptor stays open.
+- Re-audited all failure paths for copy, recovery-path identity, fsync, source/root/destination/verification `fstat`, chmod, and cleanup. Surviving artifacts retain private modes and the existing failure matrix remains green.
+
+### Prompt capability and proactive lazy registration
+
+- Prompt-builder injection now accepts only `POSITIONAL_OR_KEYWORD` and `KEYWORD_ONLY` parameters named `prompt_builder`, matching the actual keyword call site. Positional-only, variadic positional, variadic keyword wrappers, missing capability flags, and absent parameters are rejected.
+- Removed the five proactive tool registration decorators from module import. Importing ordinary built-ins remains free of proactive agent/tool registrations.
+- `register_proactive_tools()` explicitly and idempotently registers `check_permission`, `queue_action`, `get_pending_actions`, `record_decision`, and `execute_pending_actions`.
+- `_ensure_requested_agent_registered("proactive")` imports the opt-in modules, restores `ProactiveAgent` if the agent registry was cleared, and invokes explicit tool registration on every request. A second request is a no-op for already-correct registrations.
+- The in-process regression exercises cached modules after both registries are cleared and checks the exact agent class plus all five tool classes. The subprocess regression verifies absence before an explicit request and complete presence after the first and second requests.
+- `ProactiveAgent` continues constructing its concrete proactive tools directly, so removing registry decorators does not alter its tool executor contents. No import cycle or unrelated global registration was introduced.
+
+### Files changed in fix round 4
+
+- `src/openjarvis/memory/profile_migration.py`
+- `src/openjarvis/cli/chat_cmd.py`
+- `src/openjarvis/tools/proactive_tools.py`
+- `tests/memory/test_profile_migration.py`
+- `tests/cli/test_chat_cmd.py`
+- `tests/agents/test_proactive_agent.py`
+- `.superpowers/sdd/2026-08-18-context-aware-personal-memory/task-5-report.md`
+
+### Self-review and concerns
+
+- The unsupported-platform gate still runs before backup-root or snapshot creation; descriptor-only copying remains the only staging implementation.
+- A failed `close` is intentionally not retried because the descriptor's post-error state is unspecified. The original cleanup error is propagated while independent stack callbacks continue.
+- Explicit proactive registration does not replace an unrelated pre-existing registry entry with the same key; normal empty/reset and repeated-request paths register the intended classes idempotently.
+- No literal `copy2`, path-based content reread, real migration, installation write, push, merge, or external request was performed.
+- The unrelated server-route fixture mismatch recorded in fix round 1 was not part of the requested round-four suites and remains outside Task 5.

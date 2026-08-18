@@ -156,15 +156,8 @@ def _directory_open_flags() -> int:
 
 
 def _close_fd(fd: int) -> None:
-    """Close one descriptor, retrying once while preserving cleanup failure."""
-    try:
-        os.close(fd)
-    except OSError:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        raise
+    """Close one descriptor without retrying an ambiguous numeric handle."""
+    os.close(fd)
 
 
 def _stack_fd(stack: ExitStack, fd: int) -> int:
@@ -234,10 +227,10 @@ def _open_private_backup_root(
         )
     except OSError as exc:
         raise ValueError("profile backup directory is unsafe") from exc
+    _force_mode(root_fd, 0o700)
     root_stat = os.fstat(root_fd)
     if not stat.S_ISDIR(root_stat.st_mode):
         raise ValueError("profile backup directory is unsafe")
-    _force_mode(root_fd, 0o700)
     return root_fd, root_stat
 
 
@@ -307,6 +300,7 @@ def _copy_private_snapshot(
             stack,
             os.open(source.name, file_flags, 0o600, dir_fd=snapshot_fd),
         )
+        _force_mode(backup_fd, 0o600)
         backup_identity = os.fstat(backup_fd)
         if not stat.S_ISREG(backup_identity.st_mode):
             raise ValueError("profile backup destination is unsafe")

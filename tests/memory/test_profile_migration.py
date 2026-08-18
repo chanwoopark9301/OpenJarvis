@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import stat
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -392,6 +393,119 @@ def test_unsupported_platform_refuses_before_backup_artifacts(tmp_path, monkeypa
 def _fd_count() -> int:
     gc.collect()
     return len(os.listdir("/dev/fd"))
+
+
+def test_backup_root_mode_is_repaired_before_root_identity_read(
+    tmp_path,
+    monkeypatch,
+):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    backup_root = tmp_path / ".canonical-profile-backups"
+    backup_root.mkdir(mode=0o700)
+    backup_root.chmod(0o777)
+    original_fstat = migration_module.os.fstat
+    calls = 0
+
+    def fail_root_fstat(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected root fstat failure")
+        return original_fstat(fd)
+
+    monkeypatch.setattr(migration_module.os, "fstat", fail_root_fstat)
+    before = _fd_count()
+
+    with pytest.raises(OSError, match="root fstat failure"):
+        LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    assert _fd_count() == before
+    assert stat.S_IMODE(backup_root.stat().st_mode) == 0o700
+
+
+def test_destination_mode_is_repaired_before_destination_identity_read(
+    tmp_path,
+    monkeypatch,
+):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    original_open = migration_module.os.open
+    original_fstat = migration_module.os.fstat
+    destination_fd: int | None = None
+
+    def open_with_restrictive_file_umask(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal destination_fd
+        if mode != 0o600:
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+        previous_umask = os.umask(0o700)
+        try:
+            destination_fd = original_open(path, flags, mode, dir_fd=dir_fd)
+            return destination_fd
+        finally:
+            os.umask(previous_umask)
+
+    def fail_destination_fstat(fd):
+        if fd == destination_fd:
+            raise OSError("injected destination fstat failure")
+        return original_fstat(fd)
+
+    monkeypatch.setattr(migration_module.os, "open", open_with_restrictive_file_umask)
+    monkeypatch.setattr(migration_module.os, "fstat", fail_destination_fstat)
+    monkeypatch.setattr(
+        migration_module,
+        "_secure_snapshot_primitives_available",
+        lambda: True,
+    )
+    before = _fd_count()
+
+    with pytest.raises(OSError, match="destination fstat failure"):
+        LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    assert _fd_count() == before
+    backup_root = tmp_path / ".canonical-profile-backups"
+    assert stat.S_IMODE(backup_root.stat().st_mode) == 0o700
+    artifacts = list(backup_root.rglob("*"))
+    assert any(path.is_file() for path in artifacts)
+    for path in artifacts:
+        expected = 0o700 if path.is_dir() else 0o600
+        assert stat.S_IMODE(path.stat().st_mode) == expected
+
+
+def test_failed_close_does_not_retry_a_reused_descriptor(monkeypatch):
+    original_close = migration_module.os.close
+    victim_fd = os.open(os.devnull, os.O_RDONLY)
+    remaining_fd = os.open(os.devnull, os.O_RDONLY)
+    reused_fd: int | None = None
+    released = False
+
+    def release_then_raise(fd):
+        nonlocal released, reused_fd
+        if fd == victim_fd and not released:
+            released = True
+            original_close(fd)
+            reused_fd = os.open(os.devnull, os.O_RDONLY)
+            assert reused_fd == victim_fd
+            raise OSError("close released descriptor before failing")
+        original_close(fd)
+
+    monkeypatch.setattr(migration_module.os, "close", release_then_raise)
+    try:
+        with pytest.raises(OSError, match="released descriptor"):
+            with ExitStack() as stack:
+                migration_module._stack_fd(stack, remaining_fd)
+                migration_module._stack_fd(stack, victim_fd)
+
+        assert reused_fd == victim_fd
+        os.fstat(reused_fd)
+        with pytest.raises(OSError):
+            os.fstat(remaining_fd)
+    finally:
+        for fd in {victim_fd, remaining_fd, reused_fd} - {None}:
+            try:
+                original_close(fd)
+            except OSError:
+                pass
 
 
 @pytest.mark.parametrize(

@@ -63,7 +63,6 @@ def get_store() -> ApprovalStore:
 # ---------------------------------------------------------------------------
 
 
-@ToolRegistry.register("check_permission")
 class CheckPermissionTool(BaseTool):
     """Look up whether the user has a remembered decision for a permission key."""
 
@@ -114,7 +113,6 @@ class CheckPermissionTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 
-@ToolRegistry.register("queue_action")
 class QueueActionTool(BaseTool):
     """Queue a proposed action for user approval or immediate execution."""
 
@@ -193,7 +191,6 @@ class QueueActionTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 
-@ToolRegistry.register("get_pending_actions")
 class GetPendingActionsTool(BaseTool):
     """Return all pending (not yet decided) actions as a JSON list."""
 
@@ -239,7 +236,6 @@ class GetPendingActionsTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 
-@ToolRegistry.register("record_decision")
 class RecordDecisionTool(BaseTool):
     """Record a user approval or denial for a queued action."""
 
@@ -329,7 +325,6 @@ class RecordDecisionTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 
-@ToolRegistry.register("execute_pending_actions")
 class ExecutePendingActionsTool(BaseTool):
     """Execute all approved (or trivial) actions and return a summary."""
 
@@ -574,6 +569,20 @@ def parse_approval_response(
     return processed
 
 
+def register_proactive_tools() -> None:
+    """Idempotently register tools only when proactive behavior is requested."""
+    proactive_tools = (
+        ("check_permission", CheckPermissionTool),
+        ("queue_action", QueueActionTool),
+        ("get_pending_actions", GetPendingActionsTool),
+        ("record_decision", RecordDecisionTool),
+        ("execute_pending_actions", ExecutePendingActionsTool),
+    )
+    for key, tool_cls in proactive_tools:
+        if not ToolRegistry.contains(key):
+            ToolRegistry.register_value(key, tool_cls)
+
+
 __all__ = [
     "CheckPermissionTool",
     "ExecutePendingActionsTool",
@@ -582,4 +591,5 @@ __all__ = [
     "RecordDecisionTool",
     "get_store",
     "parse_approval_response",
+    "register_proactive_tools",
 ]

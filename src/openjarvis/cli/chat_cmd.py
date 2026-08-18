@@ -38,17 +38,22 @@ def _supports_prompt_builder_injection(agent_cls: object) -> bool:
         )
     except (TypeError, ValueError):
         return False
-    return parameter is not None and parameter.kind != inspect.Parameter.VAR_KEYWORD
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 def _ensure_requested_agent_registered(agent_key: str) -> None:
     """Load opt-in agents without imposing their tool side effects globally."""
     if agent_key == "proactive":
         module = importlib.import_module("openjarvis.agents.proactive_agent")
+        proactive_tools = importlib.import_module("openjarvis.tools.proactive_tools")
         from openjarvis.core.registry import AgentRegistry
 
         if not AgentRegistry.contains("proactive"):
             AgentRegistry.register_value("proactive", module.ProactiveAgent)
+        proactive_tools.register_proactive_tools()
 
 
 def _read_input(prompt: str = "You> ") -> Optional[str]:

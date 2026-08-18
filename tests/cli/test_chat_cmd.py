@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from unittest import mock
 from unittest.mock import MagicMock, patch
 
@@ -38,13 +39,31 @@ def test_personal_memory_status_reports_disabled_response_injection():
 
 
 def test_prompt_builder_injection_requires_capability_and_explicit_parameter():
-    class ExplicitReceiver:
+    class KeywordOnlyReceiver:
         accepts_prompt_builder = True
 
         def __init__(self, *, prompt_builder=None):
             pass
 
-    class SwallowingWrapper(ExplicitReceiver):
+    class PositionalOrKeywordReceiver:
+        accepts_prompt_builder = True
+
+        def __init__(self, prompt_builder=None):
+            pass
+
+    class PositionalOnlyReceiver:
+        accepts_prompt_builder = True
+
+        def __init__(self, prompt_builder=None, /):
+            pass
+
+    class VariadicPositionalReceiver:
+        accepts_prompt_builder = True
+
+        def __init__(self, *prompt_builder):
+            pass
+
+    class SwallowingWrapper(KeywordOnlyReceiver):
         def __init__(self, *args, **kwargs):
             self.kwargs = kwargs
 
@@ -52,14 +71,35 @@ def test_prompt_builder_injection_requires_capability_and_explicit_parameter():
         def __init__(self, *, prompt_builder=None):
             pass
 
-    assert _supports_prompt_builder_injection(ExplicitReceiver)
+    assert _supports_prompt_builder_injection(KeywordOnlyReceiver)
+    assert _supports_prompt_builder_injection(PositionalOrKeywordReceiver)
+    assert not _supports_prompt_builder_injection(PositionalOnlyReceiver)
+    assert not _supports_prompt_builder_injection(VariadicPositionalReceiver)
     assert not _supports_prompt_builder_injection(SwallowingWrapper)
     assert not _supports_prompt_builder_injection(NoCapability)
 
 
 def test_requested_proactive_registration_is_lazy_and_compatible():
+    import openjarvis.agents.proactive_agent as proactive_module
+    import openjarvis.tools.proactive_tools as proactive_tools_module
+
+    proactive_tools = {
+        "check_permission": proactive_tools_module.CheckPermissionTool,
+        "queue_action": proactive_tools_module.QueueActionTool,
+        "get_pending_actions": proactive_tools_module.GetPendingActionsTool,
+        "record_decision": proactive_tools_module.RecordDecisionTool,
+        "execute_pending_actions": proactive_tools_module.ExecutePendingActionsTool,
+    }
+    assert "openjarvis.agents.proactive_agent" in sys.modules
+    assert "openjarvis.tools.proactive_tools" in sys.modules
+    AgentRegistry.clear()
+    ToolRegistry.clear()
+
     _ensure_requested_agent_registered("proactive")
-    assert AgentRegistry.contains("proactive")
+    _ensure_requested_agent_registered("proactive")
+
+    assert AgentRegistry.get("proactive") is proactive_module.ProactiveAgent
+    assert {key: ToolRegistry.get(key) for key in proactive_tools} == proactive_tools
 
 
 class _SimpleChatAgent(BaseAgent):

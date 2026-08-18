@@ -19,7 +19,14 @@ from openjarvis.scheduler.scheduler import TaskScheduler
 from openjarvis.scheduler.store import SchedulerStore
 
 
-def test_builtin_agent_import_registers_proactive_in_fresh_process():
+def test_explicit_proactive_request_registers_agent_and_tools_in_fresh_process():
+    proactive_tool_keys = (
+        "check_permission",
+        "queue_action",
+        "get_pending_actions",
+        "record_decision",
+        "execute_pending_actions",
+    )
     result = subprocess.run(
         [
             sys.executable,
@@ -29,11 +36,15 @@ def test_builtin_agent_import_registers_proactive_in_fresh_process():
                 "from openjarvis.cli.chat_cmd import "
                 "_ensure_requested_agent_registered; "
                 "from openjarvis.core.registry import AgentRegistry, ToolRegistry; "
+                f"keys = {proactive_tool_keys!r}; "
                 "print(AgentRegistry.contains('proactive'), "
-                "ToolRegistry.contains('check_permission')); "
+                "all(ToolRegistry.contains(key) for key in keys)); "
                 "_ensure_requested_agent_registered('proactive'); "
                 "print(AgentRegistry.contains('proactive'), "
-                "ToolRegistry.contains('check_permission'))"
+                "all(ToolRegistry.contains(key) for key in keys)); "
+                "_ensure_requested_agent_registered('proactive'); "
+                "print(AgentRegistry.contains('proactive'), "
+                "all(ToolRegistry.contains(key) for key in keys))"
             ),
         ],
         check=True,
@@ -41,7 +52,11 @@ def test_builtin_agent_import_registers_proactive_in_fresh_process():
         text=True,
     )
 
-    assert result.stdout.splitlines() == ["False False", "True True"]
+    assert result.stdout.splitlines() == [
+        "False False",
+        "True True",
+        "True True",
+    ]
 
 
 def test_proactive_prompt_uses_shared_prompt_builder_not_global_profile(
