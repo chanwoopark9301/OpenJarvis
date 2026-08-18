@@ -68,9 +68,7 @@ def test_new_user_correction_supersedes_its_explicit_target():
             subject="",
             target_claim_id="old-preference",
         ),
-        active_claims=[
-            _claim("old-preference", "Offer study coaching proactively.")
-        ],
+        active_claims=[_claim("old-preference", "Offer study coaching proactively.")],
         related_schemas=[],
     )
 

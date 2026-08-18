@@ -208,9 +208,7 @@ class PersonalMemoryInspector:
         include_evidence: bool,
     ) -> MemorySubjectView:
         evidence = (
-            self.archive.evidence_texts(claim.evidence_ids)
-            if include_evidence
-            else ()
+            self.archive.evidence_texts(claim.evidence_ids) if include_evidence else ()
         )
         return MemorySubjectView(
             id=claim.id,

@@ -52,9 +52,7 @@ def test_sensitive_gap_requires_consent_even_when_external_mode_is_allowed():
 
 def test_question_requires_a_concrete_decision_effect(tmp_path):
     """The assistant must not offload every vague thought as a user question."""
-    coordinator = QuestionCoordinator(
-        PersonalMemoryArchive(tmp_path / "personal.db")
-    )
+    coordinator = QuestionCoordinator(PersonalMemoryArchive(tmp_path / "personal.db"))
 
     with pytest.raises(ValueError, match="decision effect"):
         coordinator.create(
