@@ -137,6 +137,71 @@ class TestBoundaryGuardCheckOutbound:
         with pytest.raises(SecurityBlockError):
             guard.check_outbound(tc)
 
+    def test_blocks_normalized_copy_of_private_context_without_scanners(self) -> None:
+        from openjarvis.security.boundary import BoundaryGuard, SecurityBlockError
+
+        guard = BoundaryGuard(mode="redact", scanners=[])
+        tc = ToolCall(
+            id="private-copy",
+            name="web_search",
+            arguments=('{"query": "과천 날씨와 민지는, 내 여자친구다 관련 정보"}'),
+        )
+
+        with pytest.raises(SecurityBlockError, match="Private context"):
+            guard.check_outbound(
+                tc,
+                private_context=("민지는 내 여자친구다",),
+            )
+
+    def test_private_context_does_not_block_independent_public_query(self) -> None:
+        from openjarvis.security.boundary import BoundaryGuard
+
+        guard = BoundaryGuard(mode="redact", scanners=[])
+        tc = ToolCall(
+            id="public-query",
+            name="web_search",
+            arguments='{"query": "과천시 오늘 날씨"}',
+        )
+
+        result = guard.check_outbound(
+            tc,
+            private_context=("민지는 내 여자친구다",),
+        )
+
+        assert result == tc
+
+    def test_blocks_exact_copy_of_short_private_profile_value(self) -> None:
+        from openjarvis.security.boundary import BoundaryGuard, SecurityBlockError
+
+        guard = BoundaryGuard(mode="redact", scanners=[])
+        tc = ToolCall(
+            id="short-private-copy",
+            name="web_search",
+            arguments='{"query": "공박사 관련 정보 검색"}',
+        )
+
+        with pytest.raises(SecurityBlockError, match="Private context"):
+            guard.check_outbound(tc, private_context=("공박사",))
+
+    def test_current_user_copy_is_allowed_when_pending_context_matches(self) -> None:
+        from openjarvis.security.boundary import BoundaryGuard
+
+        current_query = "오늘 과천시 날씨를 알려줘"
+        guard = BoundaryGuard(mode="redact", scanners=[])
+        tc = ToolCall(
+            id="current-public-query",
+            name="web_search",
+            arguments='{"query": "오늘 과천시 날씨를 알려줘"}',
+        )
+
+        result = guard.check_outbound(
+            tc,
+            private_context=(current_query,),
+            public_context=current_query,
+        )
+
+        assert result == tc
+
 
 class TestBoundaryGuardDisabled:
     """When disabled, BoundaryGuard should pass everything through."""

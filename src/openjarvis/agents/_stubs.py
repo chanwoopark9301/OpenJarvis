@@ -347,6 +347,7 @@ class ToolUsingAgent(BaseAgent):
         max_tokens: Optional[int] = None,
         loop_guard_config: Optional[Any] = None,
         capability_policy: Optional[Any] = None,
+        boundary_guard: Optional[Any] = None,
         agent_id: Optional[str] = None,
         interactive: bool = False,
         confirm_callback: Optional[Any] = None,
@@ -373,6 +374,7 @@ class ToolUsingAgent(BaseAgent):
             bus=bus,
             capability_policy=capability_policy,
             agent_id=_aid,
+            boundary_guard=boundary_guard,
             interactive=interactive,
             confirm_callback=confirm_callback,
         )
@@ -399,6 +401,63 @@ class ToolUsingAgent(BaseAgent):
                 self._loop_guard = LoopGuard(loop_guard_config, bus=bus)
         except ImportError:
             pass
+
+    def configure_tool_security(
+        self,
+        *,
+        capability_policy: Optional[Any],
+        boundary_guard: Optional[Any],
+    ) -> None:
+        """Apply chat's configured security to every tool-using subclass."""
+        self._executor.configure_security(
+            capability_policy=capability_policy,
+            boundary_guard=boundary_guard,
+        )
+
+    def _private_outbound_context(
+        self,
+        context: Optional[AgentContext],
+    ) -> tuple[str, ...]:
+        """Collect only private sources that were supplied to this model turn."""
+        sources: list[str] = []
+        if self._prompt_builder is not None:
+            persona_sections = getattr(
+                self._prompt_builder,
+                "persona_sections",
+                None,
+            )
+            if callable(persona_sections):
+                persona = persona_sections()
+                if persona and str(persona).strip():
+                    sources.append(str(persona))
+
+        if context is not None:
+            explicit = context.metadata.get("private_outbound_context", ())
+            if isinstance(explicit, str):
+                explicit = (explicit,)
+            sources.extend(str(value) for value in explicit if str(value).strip())
+            sources.extend(
+                message.text
+                for message in context.conversation.messages
+                if message.text
+                and (
+                    message.metadata.get("memory_context")
+                    or message.metadata.get("personal_memory_context")
+                )
+            )
+
+        return tuple(dict.fromkeys(sources))
+
+    def prepare_tool_security_context(
+        self,
+        input: str,
+        context: Optional[AgentContext],
+    ) -> None:
+        """Bind private prompt sources and the explicit current user input."""
+        self._executor.set_outbound_context(
+            private_context=self._private_outbound_context(context),
+            public_context=input,
+        )
 
 
 __all__ = ["AgentContext", "AgentResult", "BaseAgent", "ToolUsingAgent"]

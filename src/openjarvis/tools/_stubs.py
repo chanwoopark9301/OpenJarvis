@@ -12,7 +12,7 @@ import json
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import ToolCall, ToolResult
@@ -116,8 +116,36 @@ class ToolExecutor:
         self._capability_policy = capability_policy
         self._agent_id = agent_id
         self._boundary_guard = boundary_guard
+        self._outbound_private_context: tuple[str, ...] = ()
+        self._outbound_public_context = ""
 
-    def execute(self, tool_call: ToolCall) -> ToolResult:
+    def configure_security(
+        self,
+        *,
+        capability_policy: Optional[Any],
+        boundary_guard: Optional[Any],
+    ) -> None:
+        """Apply the configured security objects before this executor is used."""
+        self._capability_policy = capability_policy
+        self._boundary_guard = boundary_guard
+
+    def set_outbound_context(
+        self,
+        *,
+        private_context: Sequence[str],
+        public_context: str,
+    ) -> None:
+        """Set immutable data-flow sources for the next managed agent turn."""
+        self._outbound_private_context = tuple(private_context)
+        self._outbound_public_context = public_context
+
+    def execute(
+        self,
+        tool_call: ToolCall,
+        *,
+        private_context: Optional[Sequence[str]] = None,
+        public_context: Optional[str] = None,
+    ) -> ToolResult:
         """Parse arguments, dispatch to tool, measure latency, emit events."""
         tool = self._tools.get(tool_call.name)
         if tool is None:
@@ -136,11 +164,36 @@ class ToolExecutor:
                 content=f"Invalid arguments JSON: {exc}",
                 success=False,
             )
+        if not isinstance(params, dict):
+            return ToolResult(
+                tool_name=tool_call.name,
+                content=(
+                    f"Tool argument schema error for '{tool_call.name}' at $: "
+                    "arguments must be a JSON object"
+                ),
+                success=False,
+            )
+
+        resolved_private_context = (
+            self._outbound_private_context
+            if private_context is None
+            else tuple(private_context)
+        )
+        resolved_public_context = (
+            self._outbound_public_context if public_context is None else public_context
+        )
 
         # Boundary guard: scan external tool arguments
         if self._boundary_guard is not None and not getattr(tool, "is_local", True):
             try:
-                tool_call = self._boundary_guard.check_outbound(tool_call)
+                if resolved_private_context:
+                    tool_call = self._boundary_guard.check_outbound(
+                        tool_call,
+                        private_context=resolved_private_context,
+                        public_context=resolved_public_context,
+                    )
+                else:
+                    tool_call = self._boundary_guard.check_outbound(tool_call)
                 # Re-parse arguments after potential redaction
                 params = json.loads(tool_call.arguments) if tool_call.arguments else {}
             except Exception as exc:
@@ -149,6 +202,14 @@ class ToolExecutor:
                     content=f"Security block: {exc}",
                     success=False,
                 )
+
+        schema_error = self._validate_arguments(tool, params)
+        if schema_error is not None:
+            return ToolResult(
+                tool_name=tool_call.name,
+                content=schema_error,
+                success=False,
+            )
 
         # RBAC capability check
         if self._capability_policy and tool.spec.required_capabilities:
@@ -301,6 +362,44 @@ class ToolExecutor:
             )
 
         return result
+
+    @staticmethod
+    def _validate_arguments(tool: BaseTool, params: Dict[str, Any]) -> str | None:
+        """Return a stable model-facing error for invalid tool arguments."""
+        schema = tool.spec.parameters
+        if not schema:
+            return None
+
+        from jsonschema.exceptions import SchemaError
+        from jsonschema.validators import validator_for
+
+        try:
+            validator_cls = validator_for(schema)
+            validator_cls.check_schema(schema)
+            error = next(
+                iter(
+                    sorted(
+                        validator_cls(schema).iter_errors(params),
+                        key=lambda item: tuple(
+                            str(part) for part in item.absolute_path
+                        ),
+                    )
+                ),
+                None,
+            )
+        except SchemaError as exc:
+            return (
+                f"Tool argument schema error for '{tool.spec.name}' at $: "
+                f"tool declared an invalid schema ({exc.message})"
+            )
+
+        if error is None:
+            return None
+        path = ".".join(str(part) for part in error.absolute_path) or "$"
+        return (
+            f"Tool argument schema error for '{tool.spec.name}' at {path}: "
+            f"{error.message}"
+        )
 
     @staticmethod
     def _json_safe_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:

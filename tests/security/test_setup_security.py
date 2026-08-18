@@ -62,6 +62,12 @@ class TestSetupSecurityEnabled:
         # Audit logger should always work (no Rust dependency)
         assert sec.audit_logger is not None
 
+    def test_returns_outbound_boundary_guard(self) -> None:
+        engine = _make_mock_engine()
+        sec = setup_security(_make_config(), engine)
+
+        assert sec.boundary_guard is not None
+
     def test_graceful_without_rust(self) -> None:
         """Scanners fail gracefully when Rust is unavailable."""
         engine = _make_mock_engine()
@@ -80,3 +86,4 @@ class TestSetupSecurityDisabled:
         assert sec.engine is engine
         assert sec.capability_policy is None
         assert sec.audit_logger is None
+        assert sec.boundary_guard is None

@@ -134,12 +134,13 @@ class TestToolExecutor:
         assert result.success is False
         assert "Invalid arguments JSON" in result.content
 
-    def test_execute_empty_arguments(self):
+    def test_execute_empty_arguments_rejects_missing_required_field(self):
         executor = ToolExecutor([_EchoTool()])
         call = ToolCall(id="1", name="echo", arguments="")
         result = executor.execute(call)
-        assert result.success is True
-        assert result.content == ""
+        assert result.success is False
+        assert "Tool argument schema error" in result.content
+        assert "required property" in result.content
 
     def test_execute_tool_error(self):
         executor = ToolExecutor([_ErrorTool()])

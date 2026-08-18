@@ -32,6 +32,7 @@ dependencies = [
     "datasets>=4.5.0",
     "ddgs>=9.11.4",
     "httpx>=0.27",
+    "jsonschema>=4.23",
     "openai>=1.30",
     "nvidia-ml-py>=12.560.30",
     "posthog>=3.0",

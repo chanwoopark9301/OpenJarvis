@@ -36,6 +36,7 @@ class SecurityContext:
     engine: Any
     capability_policy: Any = None
     audit_logger: Any = None
+    boundary_guard: Any = None
 
 
 def setup_security(
@@ -51,8 +52,8 @@ def setup_security(
         return SecurityContext(engine=engine)
 
     # Scanners + engine wrapping
+    scanners: list[BaseScanner] = []
     try:
-        scanners: list[BaseScanner] = []
         if config.security.secret_scanner:
             scanners.append(SecretScanner())
         if config.security.pii_scanner:
@@ -70,6 +71,21 @@ def setup_security(
             )
     except Exception as exc:
         logger.debug("Failed to set up security scanners: %s", exc)
+
+    # External tools are device boundaries just like cloud engines. Reuse the
+    # same configured scanner set so setup_security() remains the single
+    # composition point for both kinds of outbound traffic.
+    boundary_guard = None
+    try:
+        from openjarvis.security.boundary import BoundaryGuard
+
+        boundary_guard = BoundaryGuard(
+            mode=config.security.mode,
+            bus=bus,
+            scanners=scanners,
+        )
+    except Exception as exc:
+        logger.debug("Failed to set up outbound boundary guard: %s", exc)
 
     # Capability policy
     cap_policy = None
@@ -97,6 +113,7 @@ def setup_security(
         engine=engine,
         capability_policy=cap_policy,
         audit_logger=audit,
+        boundary_guard=boundary_guard,
     )
 
 

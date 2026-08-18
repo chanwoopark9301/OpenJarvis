@@ -7,7 +7,11 @@ or external tool calls.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
+import unicodedata
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional
 
@@ -105,7 +109,13 @@ class BoundaryGuard:
 
         return content
 
-    def check_outbound(self, tool_call: ToolCall) -> ToolCall:
+    def check_outbound(
+        self,
+        tool_call: ToolCall,
+        *,
+        private_context: Sequence[str] = (),
+        public_context: str = "",
+    ) -> ToolCall:
         """Scan tool call arguments before execution.
 
         Returns a new ToolCall with redacted arguments if needed.
@@ -113,12 +123,93 @@ class BoundaryGuard:
         if not self._enabled or not tool_call.arguments:
             return tool_call
 
+        destination = f"tool:{tool_call.name}"
+        if self._contains_private_context(
+            tool_call.arguments,
+            private_context,
+            public_context,
+        ):
+            self._emit_alert(destination, tool_call.arguments)
+            raise SecurityBlockError(
+                f"Private context detected in outbound content to {destination}"
+            )
+
         redacted_args = self.scan_outbound(
-            tool_call.arguments, destination=f"tool:{tool_call.name}"
+            tool_call.arguments,
+            destination=destination,
         )
         if redacted_args != tool_call.arguments:
             return replace(tool_call, arguments=redacted_args)
         return tool_call
+
+    @classmethod
+    def _contains_private_context(
+        cls,
+        arguments: str,
+        private_context: Sequence[str],
+        public_context: str = "",
+    ) -> bool:
+        """Detect copied private prompt data without inferring user intent.
+
+        Only turn-local strings that were actually supplied as private prompt
+        context are considered. Matching is Unicode-normalized and requires a
+        substantive contiguous fragment, so an independent current-user query
+        such as a public location/weather lookup remains eligible for tools.
+        """
+        if not private_context:
+            return False
+        outbound_tokens = cls._normalized_tokens(cls._argument_text(arguments))
+        if not outbound_tokens:
+            return False
+        outbound = f" {' '.join(outbound_tokens)} "
+        public_tokens = cls._normalized_tokens(public_context)
+        public = f" {' '.join(public_tokens)} "
+        for source in private_context:
+            for fragment in cls._private_fragments(str(source)):
+                normalized = f" {' '.join(fragment)} "
+                if normalized in outbound and normalized not in public:
+                    return True
+        return False
+
+    @staticmethod
+    def _argument_text(arguments: str) -> str:
+        """Return decoded string values from JSON arguments for comparison."""
+        try:
+            decoded = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError):
+            return arguments
+
+        def strings(value: object) -> Iterable[str]:
+            if isinstance(value, str):
+                yield value
+            elif isinstance(value, dict):
+                for item in value.values():
+                    yield from strings(item)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from strings(item)
+
+        return "\n".join(strings(decoded))
+
+    @staticmethod
+    def _normalized_tokens(text: str) -> tuple[str, ...]:
+        normalized = unicodedata.normalize("NFKC", text).casefold()
+        return tuple(re.findall(r"[\w가-힣]+", normalized, flags=re.UNICODE))
+
+    @classmethod
+    def _private_fragments(cls, source: str) -> Iterable[tuple[str, ...]]:
+        """Yield deterministic, substantive token windows from private text."""
+        for line in source.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            stripped = re.sub(r"^\s*(?:[-*+] |\d+[.)]\s+)", "", stripped)
+            tokens = cls._normalized_tokens(stripped)
+            if len(tokens) > 3:
+                for index in range(len(tokens) - 2):
+                    yield tokens[index : index + 3]
+            elif tokens:
+                yield tokens
 
     def _emit_alert(self, destination: str, content: str) -> None:
         if self._bus is None:

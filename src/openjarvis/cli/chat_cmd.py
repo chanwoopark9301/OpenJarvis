@@ -197,6 +197,10 @@ def chat(
         sys.exit(1)
 
     engine_name, engine = resolved
+    from openjarvis.security import setup_security
+
+    security = setup_security(config, engine, bus)
+    engine = security.engine
     from openjarvis.memory.candidate_extractor import (
         is_local_personal_memory_engine,
     )
@@ -283,6 +287,13 @@ def chat(
                 if getattr(execution_cls, "accepts_tools", False):
                     kwargs["tools"] = tool_instances
                     kwargs["max_turns"] = config.agent.max_turns
+                    constructor_parameters = inspect.signature(
+                        execution_cls.__init__
+                    ).parameters
+                    if "capability_policy" in constructor_parameters:
+                        kwargs["capability_policy"] = security.capability_policy
+                    if "boundary_guard" in constructor_parameters:
+                        kwargs["boundary_guard"] = security.boundary_guard
 
                     def _confirm(prompt: str) -> bool:
                         console.print(
@@ -305,6 +316,16 @@ def chat(
                     )
 
                 agent = execution_cls(engine, model, **kwargs)
+                configure_tool_security = getattr(
+                    agent,
+                    "configure_tool_security",
+                    None,
+                )
+                if callable(configure_tool_security):
+                    configure_tool_security(
+                        capability_policy=security.capability_policy,
+                        boundary_guard=security.boundary_guard,
+                    )
         except Exception as exc:
             console.print(f"[yellow]Agent '{agent_key}' failed: {exc}[/yellow]")
 
@@ -520,6 +541,13 @@ def chat(
                 agent_context = _build_chat_agent_context(
                     history[:-1], agent_context_messages
                 )
+                prepare_tool_security_context = getattr(
+                    agent,
+                    "prepare_tool_security_context",
+                    None,
+                )
+                if callable(prepare_tool_security_context):
+                    prepare_tool_security_context(user_input, agent_context)
                 response = agent.run(user_input, context=agent_context)
                 content = (
                     response.content if hasattr(response, "content") else str(response)

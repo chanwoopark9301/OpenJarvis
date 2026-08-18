@@ -61,6 +61,8 @@ class OrchestratorAgent(ToolUsingAgent):
         parallel_tools: bool = True,
         interactive: bool = False,
         confirm_callback=None,
+        capability_policy: Optional[Any] = None,
+        boundary_guard: Optional[Any] = None,
     ) -> None:
         super().__init__(
             engine,
@@ -72,6 +74,8 @@ class OrchestratorAgent(ToolUsingAgent):
             max_tokens=max_tokens,
             interactive=interactive,
             confirm_callback=confirm_callback,
+            capability_policy=capability_policy,
+            boundary_guard=boundary_guard,
             prompt_builder=prompt_builder,
         )
         self._mode = mode
@@ -111,6 +115,7 @@ class OrchestratorAgent(ToolUsingAgent):
             sys_prompt = build_system_prompt(tools=self._tools)
 
         messages = self._build_messages(input, context, system_prompt=sys_prompt)
+        self.prepare_tool_security_context(input, context)
 
         all_tool_results: list[ToolResult] = []
         turns = 0
@@ -221,6 +226,7 @@ class OrchestratorAgent(ToolUsingAgent):
             context,
             system_prompt=self._system_prompt,
         )
+        self.prepare_tool_security_context(input, context)
 
         # Get OpenAI-format tool definitions
         openai_tools = self._executor.get_openai_tools() if self._tools else []
