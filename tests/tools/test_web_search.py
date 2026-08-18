@@ -92,6 +92,7 @@ class TestWebSearchTool:
             ("오늘의 날씨", None),
             ("오늘 과천시의 날씨는 어떤지", "과천시"),
             ("과천시 오늘의 날씨", "과천시"),
+            ("과천의 날씨", "과천"),
         ],
     )
     def test_korean_weather_query_extracts_whole_place_tokens(
@@ -111,6 +112,18 @@ class TestWebSearchTool:
         result = WebSearchTool().execute(query="과천 오늘 날씨")
         assert result.metadata["engine"] == "open-meteo"
         assert "기온 24.7°C" in result.content
+
+    def test_bare_location_possessive_is_removed_before_public_geocoding(
+        self, monkeypatch
+    ):
+        import httpx
+
+        mock_geocoder_and_forecast(monkeypatch, place="과천", temperature=24.7)
+
+        result = WebSearchTool().execute(query="과천의 날씨")
+
+        assert result.metadata["engine"] == "open-meteo"
+        assert httpx.get.call_args_list[0].kwargs["params"]["q"] == "과천"
 
     def test_model_generated_korean_weather_connective_uses_structured_data(
         self, monkeypatch
