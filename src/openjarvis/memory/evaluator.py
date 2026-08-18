@@ -142,7 +142,7 @@ class MemoryEvaluator:
         user_text: str,
     ) -> bool:
         excerpt = candidate.evidence_excerpt
-        return bool(excerpt) and excerpt in user_text
+        return bool(excerpt.strip()) and excerpt in user_text
 
 
 __all__ = ["EvaluationResult", "MemoryEvaluator"]

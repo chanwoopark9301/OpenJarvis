@@ -65,7 +65,7 @@ def test_new_user_correction_supersedes_its_explicit_target():
             1.0,
             1.0,
             temporal_scope="until_changed",
-            subject="assistant_behavior",
+            subject="",
             target_claim_id="old-preference",
         ),
         active_claims=[
@@ -114,6 +114,63 @@ def test_correction_without_target_supersedes_active_direct_claims_in_subject():
 
     assert result.operation is AdaptationOperation.ACCOMMODATE_SUPERSEDE
     assert result.superseded_claim_ids == ("old-name",)
+
+
+def test_correction_with_generic_subject_requires_explicit_target():
+    """The fallback subject sentinel must never select unrelated direct rules."""
+    result = SchemaAdaptationEngine().decide(
+        candidate=CandidateDraft(
+            CandidateKind.CORRECTION,
+            "The assistant name is 공박사.",
+            1.0,
+            1.0,
+            subject="",
+        ),
+        active_claims=[
+            _claim(
+                "generic-name",
+                "The assistant name is 조비서.",
+                kind=CandidateKind.ROLE_PREFERENCE,
+                subject_scope="user",
+            ),
+            _claim(
+                "generic-style",
+                "Keep replies concise.",
+                kind=CandidateKind.ROLE_PREFERENCE,
+                subject_scope="user",
+            ),
+        ],
+        related_schemas=[],
+    )
+
+    assert result.operation is AdaptationOperation.ACCOMMODATE_CREATE
+    assert result.superseded_claim_ids == ()
+
+
+def test_invalid_explicit_target_does_not_fall_through_to_subject_match():
+    """A supplied target remains authoritative even when it cannot be selected."""
+    result = SchemaAdaptationEngine().decide(
+        candidate=CandidateDraft(
+            CandidateKind.CORRECTION,
+            "The assistant name is 공박사.",
+            1.0,
+            1.0,
+            subject="assistant.name",
+            target_claim_id="missing-target",
+        ),
+        active_claims=[
+            _claim(
+                "old-name",
+                "The assistant name is 조비서.",
+                kind=CandidateKind.ROLE_PREFERENCE,
+                subject_scope="assistant.name",
+            )
+        ],
+        related_schemas=[],
+    )
+
+    assert result.operation is AdaptationOperation.ACCOMMODATE_CREATE
+    assert result.superseded_claim_ids == ()
 
 
 def test_non_correction_with_same_subject_does_not_implicitly_supersede():

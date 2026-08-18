@@ -119,7 +119,7 @@ def test_evaluator_rejects_assistant_only_claim(tmp_path):
     assert archive.get_candidate(candidate.id).status == "rejected"
 
 
-@pytest.mark.parametrize("evidence_excerpt", ["", "I like timers."])
+@pytest.mark.parametrize("evidence_excerpt", ["", "   ", "I like timers."])
 def test_evaluator_rejects_empty_or_unlinked_evidence_excerpt(
     tmp_path,
     evidence_excerpt,
@@ -129,7 +129,7 @@ def test_evaluator_rejects_empty_or_unlinked_evidence_excerpt(
     candidate = _candidate(
         archive,
         exchange_id="negative",
-        user_text="I do not like timers.",
+        user_text="I do not like timers.   ",
         assistant_text="",
         draft=CandidateDraft(
             CandidateKind.PREFERENCE,
@@ -152,7 +152,7 @@ def test_evaluator_uses_exact_user_excerpt_not_normalized_claim_text(tmp_path):
     candidate = _candidate(
         archive,
         exchange_id="exact-excerpt",
-        user_text="공박사라고.",
+        user_text="아니,  공박사라고.  꼭 기억해.",
         assistant_text="알겠습니다.",
         draft=CandidateDraft(
             CandidateKind.ROLE_PREFERENCE,
@@ -160,7 +160,7 @@ def test_evaluator_uses_exact_user_excerpt_not_normalized_claim_text(tmp_path):
             1.0,
             1.0,
             subject="assistant.name",
-            evidence_excerpt="공박사라고.",
+            evidence_excerpt="  공박사라고.  ",
         ),
     )
 
@@ -168,7 +168,7 @@ def test_evaluator_uses_exact_user_excerpt_not_normalized_claim_text(tmp_path):
     claim = archive.get_active_claims()[0]
 
     assert result.applied is True
-    assert archive.evidence_texts(claim.evidence_ids) == ("공박사라고.",)
+    assert archive.evidence_texts(claim.evidence_ids) == ("  공박사라고.  ",)
 
 
 def test_new_direct_rule_supersedes_explicit_target_atomically(tmp_path):
@@ -265,21 +265,38 @@ def test_correction_supersedes_active_direct_claim_with_same_subject(tmp_path):
     assert archive.evidence_texts(active_claim.evidence_ids) == ("공박사라고.",)
 
 
-def test_audit_insert_failure_rolls_back_evidence_and_claim(tmp_path):
-    """A partial transaction must never expose a claim without its audit decision."""
+def test_audit_failure_rolls_back_selected_supersession_evidence_and_claim(tmp_path):
+    """The old active rule must survive if correction audit persistence fails."""
     archive = PersonalMemoryArchive(tmp_path / "personal.db")
-    candidate = _candidate(
+    old_candidate = _candidate(
         archive,
-        exchange_id="e5",
-        user_text="Keep answers short.",
+        exchange_id="old-response-style",
+        user_text="Use detailed answers.",
         assistant_text="Okay.",
         draft=CandidateDraft(
-            CandidateKind.PREFERENCE,
-            "Keep answers short.",
-            0.8,
+            CandidateKind.ROLE_PREFERENCE,
+            "Use detailed answers.",
+            1.0,
             1.0,
             subject="response_style",
-            evidence_excerpt="Keep answers short.",
+            evidence_excerpt="Use detailed answers.",
+        ),
+    )
+    evaluator = MemoryEvaluator(archive)
+    assert evaluator.evaluate(old_candidate.id).applied is True
+    old_claim = archive.get_active_claims()[0]
+    correction = _candidate(
+        archive,
+        exchange_id="correct-response-style",
+        user_text="Actually, keep answers short.",
+        assistant_text="Okay.",
+        draft=CandidateDraft(
+            CandidateKind.CORRECTION,
+            "Keep answers short.",
+            1.0,
+            1.0,
+            subject="response_style",
+            evidence_excerpt="keep answers short.",
         ),
     )
     with sqlite3.connect(archive.path) as connection:
@@ -294,11 +311,14 @@ def test_audit_insert_failure_rolls_back_evidence_and_claim(tmp_path):
         )
 
     with pytest.raises(sqlite3.IntegrityError, match="audit unavailable"):
-        MemoryEvaluator(archive).evaluate(candidate.id)
+        evaluator.evaluate(correction.id)
 
-    assert archive.get_candidate(candidate.id).status == "pending"
-    assert archive.get_active_claims() == []
-    assert archive.evidence_count(candidate_id=candidate.id) == 0
+    assert archive.get_candidate(correction.id).status == "pending"
+    assert archive.get_claim(old_claim.id).state.value == "active"
+    assert [claim.id for claim in archive.get_active_claims()] == [old_claim.id]
+    assert len(archive.list_claims()) == 1
+    assert archive.evidence_count(candidate_id=correction.id) == 0
+    assert archive.decision_count(subject_id=correction.id) == 0
 
 
 def test_contradiction_challenges_schema_and_leaves_auditable_conflict(tmp_path):

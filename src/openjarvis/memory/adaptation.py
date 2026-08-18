@@ -45,6 +45,7 @@ _BROAD_SUBJECT_MARKERS = frozenset(
         "relationship_motive",
     }
 )
+_GENERIC_SUBJECT = "user"
 _SOURCE_PRIORITY = {
     EvidenceSource.USER_CONFIRMED: 4,
     EvidenceSource.USER_DIRECT: 3,
@@ -163,7 +164,10 @@ class SchemaAdaptationEngine:
                 for claim in active_claims
                 if claim.state.value == "active" and claim.id == explicit_target
             )
-        elif candidate.kind is CandidateKind.CORRECTION:
+        elif (
+            candidate.kind is CandidateKind.CORRECTION
+            and candidate.subject != _GENERIC_SUBJECT
+        ):
             superseded = tuple(
                 claim.id
                 for claim in active_claims
