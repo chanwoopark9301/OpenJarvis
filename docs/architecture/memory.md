@@ -4,25 +4,34 @@ The Memory primitive provides **persistent, searchable storage** for documents a
 
 ## Personal Memory Harness (local only)
 
-Personal conversation archiving is a separate system from document retrieval
-and automatic JSONL fact memory. When `[personal_memory]` is enabled, OpenJarvis
-first stores each completed chat exchange in `~/.openjarvis/personal_memory.db`.
-Only after the SQLite write succeeds does it publish the existing completion
-event and schedule candidate extraction.
+Personal memory is separate from document retrieval and legacy JSONL Fact
+Memory. When its local service starts successfully, OpenJarvis stores a
+completed exchange in local SQLite before scheduling asynchronous model
+interpretation. The model receives bounded recent dialogue and proposes typed,
+schema-constrained candidates. The harness accepts only exact evidence copied
+from the current user message and persists evaluation, supersession, and
+provenance as an auditable lifecycle.
 
-The database contains `conversation_exchanges` (the original user/assistant
-text and durable candidate-job state) and `memory_candidates` (provisional
-`fact` or `episode` suggestions with the exact supporting exchange, confidence,
-importance, engine ID, and extractor version). Candidate review status is
-independent of the worker-job state, so a failed model call cannot delete the
-raw conversation.
+Provisional candidates never enter a prompt directly. `ContextComposer` selects
+active direct rules, relevant current-state and episode claims, eligible
+schemas, and unresolved questions under fixed caps. In `jarvis chat`, up to six
+incomplete user messages may also cross a restart as `user`-role dialogue,
+never as system instructions or evidence. Assistant text is not projected as
+restart evidence.
 
-Candidate extraction accepts only known engines configured with a loopback host
-(`localhost`, `127.0.0.1`, or `::1`), or an existing local `gemma_cpp` model
-path. Cloud, multi-engine, unknown, and network-host configurations are
-rejected without a fallback call. Candidates are **not** added to prompt
-context, Fact Memory, or document RAG in this release. Reflection, Pattern
-Memory, Core User Model, and promotion/deletion commands remain future work.
+Extraction and personal-context composition require an allowlisted local engine
+on loopback (or an existing local `gemma_cpp` path), with no cloud fallback.
+Optional external reflection is separately gated by explicit request, consent,
+and deidentification; its results remain external knowledge rather than personal
+claims.
+
+Canonical-profile staging creates private, hash-manifested snapshots of static
+`USER.md` and `MEMORY.md` and imports their bullets only as low-trust legacy
+candidates. Explicit activation makes the SQLite archive the changing profile
+authority for `jarvis chat`: `SOUL.md` remains, while static dynamic profile
+files and legacy JSONL facts no longer compete with canonical context. See
+[Personal Memory Harness](personal-memory-harness.md) for lifecycle, modes,
+user controls, migration checks, privacy limits, and recovery procedures.
 
 ---
 

@@ -1,166 +1,291 @@
 # Personal Memory Harness
 
-## Status
+## Status and purpose
 
-Implemented first slice: local conversation archive and asynchronous memory
-candidates. Pattern memory and the core user model are explicitly deferred.
+The personal-memory harness is a local archive for changing user and assistant
+context. Its default path is `~/.openjarvis/personal_memory.db`. It complements
+document retrieval and the legacy JSONL Fact Memory; it does not replace either
+storage primitive. After canonical-profile activation, it is the changing
+profile authority for `jarvis chat` when response-time memory context is enabled.
 
-## Goal
+The model owns semantic interpretation. The harness supplies bounded dialogue,
+requires a typed proposal, verifies exact user evidence, applies deterministic
+lifecycle rules, and projects only accepted state. It does not use
+language-specific phrase rules to decide what the user meant.
 
-Extend OpenJarvis without replacing its existing document-retrieval store or
-automatic JSONL fact memory. Every completed personal conversation must first
-be retained as local, auditable source material. A local model may then derive
-provisional memory candidates from that source material without affecting reply
-latency or injecting unverified claims into future prompts.
+## Responsibility boundary
 
-## Decisions
+The local model decides:
 
-- Personal conversation and memory data stay on the local machine.
-- Memory processing must use a local engine. An unavailable or non-local
-  engine prevents candidate generation; it must never fall back to a cloud
-  provider.
-- The existing `memory_facts.jsonl` store and document RAG backends remain
-  compatible and operational.
-- A memory candidate is not a fact. It is unavailable to prompt injection
-  until a later evaluation/promotion phase accepts it.
-- The initial archive is a separate SQLite database at
-  `~/.openjarvis/personal_memory.db`, rather than a new table in the document
-  retrieval database.
+- whether the current user message contains durable personal information;
+- the candidate kind, stable dotted subject, temporal scope, and correction
+  target;
+- whether a new observation supports, contradicts, or qualifies an existing
+  schema when reflection is enabled.
 
-## Scope
+The harness decides only enforceable boundaries:
 
-### Included
+- the response has the required schema and bounded sizes;
+- confidence and importance are finite numbers from `0.0` through `1.0`;
+- every `evidence_excerpt` is an exact substring of the current user message;
+- assistant text and earlier dialogue cannot become evidence;
+- only allowed state transitions are persisted;
+- optional external reflection never automatically submits archive or profile
+  bodies, and known sensitive patterns must pass its deidentification gate.
 
-1. A durable local archive for completed exchanges.
-2. An idempotent, asynchronous candidate-generation queue backed by the
-   archive.
-3. Candidate provenance, state, importance, and extraction metadata.
-4. Integration hooks for both standard chat and managed Companion agent turns.
-5. Local-engine enforcement and observable failure states.
-6. Unit and integration tests for durability, deduplication, queue pressure,
-   and local-only processing.
+This split lets a short correction use conversational meaning without turning
+the harness into an ever-growing intent router.
 
-### Deferred
-
-- Automatic promotion of candidates into Fact, Episode, Pattern, or Core User
-  Model memory.
-- Reflection scheduling and cross-exchange pattern discovery.
-- Candidate retrieval and prompt injection.
-- Migration of the existing JSONL fact store.
-- Redesign of the experimental behavior-analysis tools.
-
-## Architecture
-
-The write path must make the raw exchange durable before any lossy or
-best-effort operation occurs:
+## Durable lifecycle
 
 ```text
-completed chat or Companion turn
-  -> record_and_publish_completed_exchange()
-  -> PersonalMemoryArchive (SQLite transaction)
-  -> CHAT_EXCHANGE_COMPLETED event containing exchange_id
-  -> PersonalMemoryService background worker
-  -> memory_candidates row (pending)
+completed user/assistant exchange
+  -> archive the raw exchange in local SQLite
+  -> publish CHAT_EXCHANGE_COMPLETED
+  -> enqueue durable work by exchange ID
+  -> local model proposes schema-constrained candidates
+  -> validate exact current-user evidence
+  -> evaluate and apply an auditable state transition
+  -> project bounded active memory into a later response
 ```
 
-`record_and_publish_completed_exchange()` is the shared boundary used by server routes,
-CLI chat, and the managed-agent executor. It accepts user text, assistant text,
-source, and optional agent/session identifiers. It first writes the exchange
-and only then publishes the event. Replaying a call with the same exchange ID
-is a no-op.
+`record_and_publish_completed_exchange()` is shared by CLI, server, and
+managed-agent completion paths. Archiving happens before the completion event;
+replaying the same exchange ID is idempotent. The personal-memory worker queues
+durable IDs rather than raw conversation text. The common completion event
+still carries the existing compatibility payload used by other memory
+consumers.
 
-`PersonalMemoryService` subscribes to the completed-exchange event. Its queue
-is only a scheduling mechanism: the archive is the source of truth. A queue
-overflow or worker restart leaves the exchange archived and eligible for a
-future retry; it cannot discard the conversation itself.
+SQLite is the source of truth. The in-memory queue is only a wake-up mechanism.
+`memory_jobs` retains idempotency keys, priority, attempts, retry time, and
+state. Startup returns interrupted work to the queue, requeues zero-candidate
+results created by an older extractor version, and schedules unevaluated
+candidates. A queue overflow, shutdown, invalid model response, or engine error
+therefore cannot erase the archived exchange.
 
-## Local Data Model
+## Proposal and evidence contract
 
-### `conversation_exchanges`
+Extractor version 5 receives the current completed exchange and at most six
+earlier exchanges in chronological order, scoped to the same session when a
+session ID exists and otherwise to the same source. The earlier user/assistant
+turns provide meaning only. The current user message is the sole evidence
+source.
 
-- `id`: stable exchange UUID, primary key.
-- `created_at`: UTC timestamp.
-- `source`: `cli.chat`, `server.chat`, or managed-agent source.
-- `agent_id` and `session_id`: optional origin identifiers.
-- `user_text` and `assistant_text`: original exchange contents.
-- `content_hash`: deterministic hash for diagnostics and duplicate detection.
-- `archived_at`: timestamp of successful local persistence.
-- `candidate_state`, `candidate_attempts`, `candidate_error`, and
-  `candidate_claimed_at`: durable worker state (`pending`, `processing`,
-  `failed`, or `complete`), separate from candidate-review status.
+The model may propose up to five atomic candidates from this closed set:
 
-### `memory_candidates`
+- `fact`
+- `episode`
+- `preference`
+- `constraint`
+- `correction`
+- `role_preference`
+- `capability_boundary`
+- `hypothesis`
 
-- `id`: candidate UUID, primary key.
-- `exchange_id`: foreign key to the supporting exchange.
-- `kind`: initially `fact` or `episode`.
-- `content`: structured candidate text.
-- `importance` and `confidence`: bounded numeric estimates.
-- `status`: `pending`, `accepted`, `rejected`, or `superseded`.
-- `engine_id` and `extractor_version`: local provenance.
-- `created_at` and `updated_at`.
+Each candidate includes content, importance, confidence, temporal scope, a
+stable subject, an optional target claim, and an exact evidence excerpt.
+The proposal prompt directs the model to return no personal-memory candidate for
+a request that only seeks current external-world information, and to return an
+empty array for greetings or messages without useful personal evidence. The
+validator continues to enforce structure and exact evidence rather than
+reclassifying meaning itself.
 
-An exchange can have zero or more candidates. Candidates always point back to
-the exact conversation that supports them.
+Malformed output is never partially salvaged. It records a bounded error code
+and remains retryable; the harness does not invent a semantic fallback.
 
-## Candidate Processing
+## Evaluation, correction, and supersession
 
-The worker loads an archived exchange by ID and calls a deterministic,
-local-only extractor prompt. It accepts only the configured loopback host of a
-known local engine (or an existing local `gemma_cpp` model path); cloud,
-multi-engine, and non-loopback configurations fail closed. It validates the
-structured response, stores each candidate transactionally, and records the job
-outcome. Errors use the exchange ID rather than conversation text and leave the
-exchange in an eligible-for-retry state. Candidate generation must never block
-or fail a user-facing response.
+A candidate is provisional until `MemoryEvaluator` rechecks the supporting
+exchange and evidence excerpt. Accepted atomic claims link to immutable evidence
+and an auditable decision.
 
-The first slice does not claim that a candidate is true. It only records what
-the local extractor proposes and the evidence from which it was derived.
+Direct user rules (`constraint`, `correction`, `role_preference`, and
+`capability_boundary`) can take effect immediately after provenance validation.
+A correction supersedes an explicitly targeted active claim. If no stored claim
+ID was available to the model, a correction with a non-generic stable subject
+supersedes active direct claims with that same subject. The old claim and its
+evidence remain stored in `superseded` state; they are not rewritten.
 
-## Integration Boundaries
+Accepted non-direct facts and preferences first remain atomic claims. Schema
+consolidation and reflection run only after recurrent cross-session evidence or
+a conflict trigger. A model-proposed ambiguous or contradictory relation to an
+existing schema is held as disequilibrium. Broad identity, health,
+mental-health, personality, and relationship-motive interpretations require
+user confirmation before a schema can activate.
 
-OpenJarvis already publishes `CHAT_EXCHANGE_COMPLETED` for standard CLI and
-server chat, and `MemoryService` uses it for best-effort Fact extraction. The
-new shared record boundary will preserve that compatibility while enriching the
-event payload with an `exchange_id` and optional origin metadata.
+## Response-time projection
 
-Managed agents persist messages in the agent manager. On successful
-finalization, a pending user message and its response now pass through the same
-completion boundary once. Scheduled ticks without a pending user message create
-no personal exchange. This does not inject candidates or alter existing
-Fact/RAG prompt behavior in this slice.
+`ContextComposer` builds a bounded view rather than copying the archive into
+the prompt:
 
-The current working-tree Companion additions are intentionally not copied into
-this feature branch. Their integration point is specified here so it can be
-applied when those independent changes are committed or merged.
+| Section | Selection | Default cap |
+|---|---|---:|
+| Direct user rules | Every active direct rule, newest first | 5 |
+| Current state | Relevant non-direct claims with `temporal_scope=current` | 3 |
+| Confirmed schemas | Relevant active schemas and their conditions | 8 |
+| Episodes | Relevant non-current episode claims | 5 |
+| Unresolved | A relevant pending clarification, when needed | 1 |
 
-## Privacy and Operations
+Current states, schemas, episodes, and pending clarification use a conservative
+local relevance check. Direct rules do not depend on query keywords. Raw
+evidence is not rendered into this system context.
 
-- Database paths are under the OpenJarvis local configuration directory.
-- Archive and candidate generation reject non-local engine configuration.
-- No network synchronization, cloud fallback, or external telemetry is added.
-- Future management commands must support listing and deleting personal-memory
-  records, but destructive operations are outside this first slice.
-- Logs must use exchange IDs and status, not conversation body text.
+Separately, `jarvis chat` carries at most six incomplete user messages across a
+restart as chronological `user`-role dialogue. They are not system rules, are
+not evidence for a new candidate, and never include assistant text. This
+continuity window allows an immediate restart to preserve the context needed
+for a short follow-up while unfinished extraction remains retryable.
 
-## Acceptance Criteria
+All personal context composition requires an allowlisted local response engine.
+If `agent.context_from_memory=false`, collection may continue but personal
+context is not injected.
 
-1. Each completed standard chat exchange is stored once locally before
-   candidate work begins.
-2. A duplicate exchange ID never creates a second archive row or duplicate
-   candidates.
-3. A full worker queue, malformed extractor output, worker exception, or
-   restart cannot remove an already archived exchange.
-4. Candidate processing refuses non-local engines and makes no cloud fallback.
-5. Existing automatic Fact extraction, Fact listing, document memory retrieval,
-   CLI chat, and server chat continue to work.
-6. Managed-agent integration is generic and records only completed turns that
-   began with a pending user message; unrelated Companion files remain outside
-   this feature branch.
+## Modes and canonical authority
 
-## Follow-up Sequence
+`personal_memory.mode` has three behaviors:
 
-After this slice is stable, add evaluator-driven promotion, then scheduled
-reflection over accepted evidence, then Pattern Memory and an explainable Core
-User Model. Each stage must add a test corpus and explicit promotion criteria
-before its data is injected into prompts.
+- `off`: no personal-memory service or response context;
+- `shadow` before canonical activation: collect and evaluate, but expose only
+  active `assistant_behavior` constraints, role preferences, and capability
+  boundaries to responses;
+- `active`: expose the full composed context only after the separate legacy
+  rollout gate is release-ready.
+
+After `canonical_profile_active=1`, canonical context is the dynamic authority
+even when the configured mode remains `shadow`; the pre-cutover narrow shadow
+filter no longer hides accepted canonical state. Canonical-profile activation
+and the legacy JSONL rollout flag are independent controls.
+
+For `jarvis chat`, canonical activation keeps `SOUL.md` but excludes `USER.md`,
+`MEMORY.md`, and their named-persona equivalents from prompt construction.
+Legacy JSONL facts are also suppressed in that CLI path, so the SQLite archive
+is the only changing profile authority. The server prompt path has not yet been
+cut over by this helper; operators must not assume activation changes every
+entry point.
+
+Before cutover, confirm `[personal_memory]` is enabled, its mode is not `off`,
+and `agent.context_from_memory=true`. Activation still excludes static
+`USER.md`/`MEMORY.md` when context injection is false; in that configuration
+`jarvis chat` retains `SOUL.md` but receives no dynamic personal context.
+
+## Reversible profile cutover
+
+Run staging before activation:
+
+```text
+jarvis memory stage-canonical-profile
+```
+
+Staging does not activate anything and does not alter the source profile files.
+For each configured regular `USER.md` or `MEMORY.md`, it creates a private
+descriptor-based snapshot under
+`<archive-directory>/.canonical-profile-backups/`, forces directories to
+`0700` and files to `0600`, and records source path, backup path, and SHA-256 in
+the archive manifest. Symlinks, non-regular files, invalid UTF-8, unsafe path
+changes, and platforms without the required no-follow POSIX operations fail
+closed. Non-empty bullets are imported only as low-trust `LEGACY_IMPORT`
+candidates with `0.1` confidence and importance; they do not become active
+automatically.
+
+Before activating, confirm that:
+
+1. the archive is a readable, non-symlink SQLite file and its integrity check is
+   `ok`;
+2. every manifest backup is a regular non-symlink file;
+3. backup paths match the manifest in exact order;
+4. each snapshot SHA-256 still matches;
+5. direct corrections needed at cutover are active and conflicting claims are
+   superseded.
+
+Then run:
+
+```text
+jarvis memory activate-canonical-profile
+```
+
+With no options, the command uses the stored manifest. Repeated
+`--backup-path` values are accepted only when they exactly match that manifest.
+Successful activation records the manifest hash and an audit decision.
+
+Activation performs the archive, ordered-path, file-type, and hash checks above
+internally. The staging command prints aggregate counts, not manifest paths or
+hashes; independent inspection currently requires trusted local maintenance
+tooling because there is no dedicated manifest-inspection CLI.
+
+The snapshots preserve the original bytes, but there is currently no supported
+single-command rollback, `deactivate-canonical-profile`, or automatic restore.
+Restoring a file alone does not clear the canonical marker or re-enable static
+injection; a complete rollback requires code-level maintenance of both the file
+and canonical metadata. Preserve the archive, manifest, and snapshots for that
+recovery path. Do not use `personal-delete-all` as rollback: it intentionally
+retains archive metadata and filesystem backups.
+
+## Privacy boundary
+
+- The archive and extractor remain local. Extraction accepts known local
+  engines only when they use loopback addresses (or an existing local
+  `gemma_cpp` model path); there is no cloud or remote-network fallback.
+- In `jarvis chat`, a non-local response engine receives the user's live request
+  as part of that response path, but it does not receive personal-memory context
+  or static `USER.md`/`MEMORY.md`. Other prompt entry points are not covered by
+  this CLI-specific guarantee.
+- Optional external reflection requires an explicit analysis request, a
+  deidentified general query, and mode-appropriate consent. Sensitive requests
+  require consent even in `allowed` mode. External results are stored separately
+  as external knowledge and never become personal evidence automatically. The
+  deidentification check recognizes bounded sensitive patterns; it is a
+  heuristic guard, not proof that arbitrary text is anonymous.
+- Logs and background errors use IDs, counts, and bounded reason codes rather
+  than conversation bodies.
+- The archive is local storage, not an encryption guarantee. Snapshot
+  permissions are enforced, but the SQLite archive is neither encrypted nor
+  forced to mode `0600` by this feature; its file mode depends on the operating
+  system and process umask.
+- Personal-memory HTTP controls accept loopback clients only.
+- `personal-list` and `personal-explain` intentionally print stored material;
+  use them only in a private terminal.
+
+## Inspection and user controls
+
+```text
+jarvis memory personal-list
+jarvis memory personal-explain SUBJECT_ID
+jarvis memory personal-suppress SUBJECT_ID [--reason TEXT]
+jarvis memory personal-restore SUBJECT_ID
+jarvis memory personal-correct SUBJECT_ID REPLACEMENT --user-text TEXT
+jarvis memory personal-delete SUBJECT_ID [--include-raw-evidence]
+jarvis memory personal-delete-all --confirm-token "DELETE ALL PERSONAL MEMORY"
+```
+
+`personal-correct` records the supplied user text as new user-confirmed
+evidence. For a claim it creates a correction and supersedes the old claim
+without rewriting history; for a schema it creates a refined schema version.
+Suppression affects the next composition without deleting evidence.
+Single-subject deletion retains raw evidence by default. Deletion with
+`--include-raw-evidence` can be refused when that evidence is still linked to
+another schema. Bulk deletion requires the exact confirmation token shown
+above.
+
+Legacy JSONL Fact Memory uses separate commands:
+
+```text
+jarvis memory personal-import-legacy [--path PATH] [--backup|--no-backup]
+jarvis memory personal-rollout-status --backup-path PATH [--manual-override] [--activate]
+```
+
+That rollout gate is not the canonical profile cutover described above.
+
+## Failure behavior
+
+- The user-facing answer does not wait for candidate extraction.
+- Invalid output, engine failure, queue pressure, and interrupted shutdown leave
+  raw exchanges durable and work retryable.
+- Direct corrections are never discarded merely because they are direct rules.
+- Evidence absent from the current user message is rejected, even when it
+  appears in assistant text or recent dialogue.
+- External reflection that lacks request, consent, or deidentification remains
+  local and performs no provider call.
+- If an existing canonical archive is unreadable or corrupt, static dynamic
+  files are not silently reintroduced as a competing authority. A missing
+  archive is treated as inactive, so operators must preserve the archive during
+  recovery.
