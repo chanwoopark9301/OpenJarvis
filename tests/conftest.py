@@ -71,6 +71,22 @@ def _no_update_check(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_external_analytics(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests from starting real PostHog workers.
+
+    Server construction normally honours the user's analytics setting.  Tests
+    often build an app without running its ASGI lifespan, so a real SDK client
+    would never receive the matching shutdown event and could block interpreter
+    exit while its network worker drains.  Patch only the test process's server
+    enablement boundary; production configuration and client lifecycle stay
+    unchanged.
+    """
+    import openjarvis.analytics as analytics
+
+    monkeypatch.setattr(analytics, "is_analytics_enabled", lambda _config: False)
+
+
+@pytest.fixture(autouse=True)
 def _clean_registries() -> None:
     """Ensure each test starts with empty registries and a fresh event bus."""
     ModelRegistry.clear()

@@ -35,6 +35,7 @@ def _app_with_claim(tmp_path):
                 1.0,
                 temporal_scope="until_changed",
                 subject="topic:timer",
+                evidence_excerpt=text,
             )
         ],
         engine_id="ollama",
