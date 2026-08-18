@@ -1,286 +1,168 @@
-"""Integration tests for the generic assistant path in ``jarvis chat``."""
+"""User-shaped behavioral regressions for the model-led chat path."""
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
-from openjarvis.agents._stubs import BaseAgent
-from openjarvis.cli._assistant_preflight import AssistantPreflightResult
-from openjarvis.cli._search_evidence import EvidenceSource
+from openjarvis.agents._stubs import AgentContext, AgentResult, BaseAgent
 from openjarvis.cli.chat_cmd import chat
 from openjarvis.core.config import JarvisConfig
-from openjarvis.core.registry import AgentRegistry
-from openjarvis.core.types import Message, Role
+from openjarvis.core.registry import AgentRegistry, ToolRegistry
+from openjarvis.core.types import ToolResult
+from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 
-class _FixedPreflight:
-    def __init__(self, *results: AssistantPreflightResult):
-        self.results = list(results)
-        self.calls = []
+class _ModelLedChatAgent(BaseAgent):
+    """Plain chat agent deliberately upgraded by the managed tool runtime."""
 
-    def prepare(
+    agent_id = "model_led_general_chat_agent"
+    supports_managed_tool_fallback = True
+
+    def run(
         self,
-        user_text,
-        recent_messages=(),
-        *,
-        pending_clarification=False,
-    ):
-        self.calls.append((user_text, tuple(recent_messages), pending_clarification))
-        return self.results.pop(0)
+        input: str,
+        context: AgentContext | None = None,
+        **kwargs,
+    ) -> AgentResult:
+        raise AssertionError("the managed tool runtime must own this chat turn")
 
 
-class _SearchMustBypassAgent(BaseAgent):
-    agent_id = "search_must_bypass_agent"
+class _SearchTool(BaseTool):
+    tool_id = "web_search"
 
-    def run(self, input, context=None, **kwargs):
-        raise AssertionError("grounded search must use the strict direct generator")
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.queries: list[str] = []
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name=self.tool_id,
+            description="Search the public web for current information.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        )
+
+    def execute(self, **params) -> ToolResult:
+        self.queries.append(params["query"])
+        return ToolResult(tool_name=self.tool_id, content=self.content)
 
 
-def _config() -> JarvisConfig:
+def run_model_led_chat(
+    request: str,
+    *,
+    tool_query: str | None = None,
+    tool_content: str = "",
+    final_content: str | None = None,
+    direct_content: str | None = None,
+):
+    """Run one chat turn with scripted model function-calling output."""
+    if tool_query is None:
+        assert direct_content is not None
+        responses = [{"content": direct_content}]
+    else:
+        assert final_content is not None
+        responses = [
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search-1",
+                        "name": "web_search",
+                        "arguments": json.dumps({"query": tool_query}),
+                    }
+                ],
+            },
+            {"content": final_content},
+        ]
+
+    engine = MagicMock()
+    engine.engine_id = "mock"
+    engine.generate.side_effect = responses
+    search_tool = _SearchTool(tool_content)
     config = JarvisConfig()
     config.intelligence.default_model = "test-model"
-    config.agent.default_agent = "none"
+    config.tools.enabled = "web_search"
+    config.agent.max_turns = 3
     config.agent.context_from_memory = False
     config.memory.enabled = False
     config.personal_memory.enabled = False
-    return config
+    AgentRegistry.register_value("model_led_general_chat_agent", _ModelLedChatAgent)
+    ToolRegistry.register_value("web_search", search_tool)
 
-
-def _weather_result() -> AssistantPreflightResult:
-    evidence = EvidenceSource(
-        "S1",
-        "R1",
-        "과천시 오늘 날씨",
-        "https://weather.example/gwacheon",
-        "현재 기온 24도, 저녁에는 흐림",
-        "official",
-    )
-    return AssistantPreflightResult(
-        triggered=True,
-        mode="search",
-        response_style="direct",
-        goal="과천시 오늘 날씨 안내",
-        success=True,
-        queries=("과천시 오늘 날씨",),
-        sources=(evidence.url,),
-        evidence=(evidence,),
-        context="UNTRUSTED WEB SEARCH RESULTS\n[S1] 현재 기온 24도",
-        request_text="과천시야.",
-    )
-
-
-def _run(engine, preflight, user_input, *, config=None):
-    active_config = config or _config()
     with (
-        patch("openjarvis.cli.chat_cmd.load_config", return_value=active_config),
+        patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
         patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
         patch("openjarvis.intelligence.register_builtin_models"),
-        patch(
-            "openjarvis.cli.chat_cmd._build_assistant_preflight",
-            return_value=preflight,
-        ),
     ):
-        return CliRunner().invoke(
+        result = CliRunner().invoke(
             chat,
-            ["--model", "test-model"],
-            input=user_input,
+            ["--agent", "model_led_general_chat_agent", "--model", "test-model"],
+            input=f"{request}\n/quit\n",
         )
 
-
-def test_ordinary_chat_keeps_the_single_generation_fast_path():
-    engine = MagicMock()
-    engine.generate.return_value = {"content": "안녕, 오늘은 어땠어?"}
-    preflight = _FixedPreflight(AssistantPreflightResult(triggered=False))
-
-    result = _run(engine, preflight, "안녕?\n/quit\n")
-
-    assert result.exit_code == 0
-    assert "오늘은 어땠어?" in result.output
-    assert engine.generate.call_count == 1
-    assert preflight.calls[0][2] is False
+    return result, engine, search_tool
 
 
-def test_clarification_is_direct_and_only_the_next_turn_is_pending():
-    engine = MagicMock()
-    engine.generate.return_value = {
-        "content": (
-            '{"lead":"과천시 날씨를 확인했어.","blocks":['
-            '{"kind":"fact","text":"현재 기온은 24도야.","supports":['
-            '{"source_id":"S1","excerpt":"현재 기온 24도"}]}],'
-            '"follow_up":""}'
-        )
-    }
-    preflight = _FixedPreflight(
-        AssistantPreflightResult(
-            triggered=True,
-            mode="clarify",
-            clarifying_question="어느 지역의 날씨를 볼까?",
-        ),
-        _weather_result(),
-    )
-
-    result = _run(
-        engine,
-        preflight,
-        "오늘 날씨를 검색해 줘.\n경기도 과천시야.\n/quit\n",
+@pytest.mark.parametrize(
+    "user_request",
+    [
+        "오늘 과천시의 날씨는 어떤지 검색해볼래?",
+        "오늘 과천시 날씨를 알려달라고.",
+        "인터넷에서 과천시 날씨를 찾아줘.",
+    ],
+)
+def test_current_information_requests_can_reach_web_search(user_request):
+    result, engine, search_tool = run_model_led_chat(
+        user_request,
+        tool_query="과천시 날씨",
+        tool_content="기온 24도",
+        final_content="과천시 기온은 24도야.",
     )
 
     assert result.exit_code == 0
-    assert "어느 지역의 날씨를 볼까?" in result.output
-    assert "현재 기온은 24도야." in result.output
-    assert engine.generate.call_count == 1
-    assert preflight.calls[0][2] is False
-    assert preflight.calls[1][2] is True
-    recent = preflight.calls[1][1]
-    assert any("어느 지역의 날씨를 볼까?" in message.content for message in recent)
+    assert search_tool.queries == ["과천시 날씨"]
+    assert "24도" in result.output
 
 
-def test_search_uses_generic_prompt_and_renders_only_used_source():
-    engine = MagicMock()
-    engine.generate.return_value = {
-        "content": (
-            '{"lead":"확인했어.","blocks":['
-            '{"kind":"fact","text":"현재 기온은 24도야.","supports":['
-            '{"source_id":"S1","excerpt":"현재 기온 24도"}]},'
-            '{"kind":"advice","text":"얇은 겉옷을 챙겨.","supports":[]}],'
-            '"follow_up":""}'
-        )
-    }
-    preflight = _FixedPreflight(_weather_result())
-
-    result = _run(engine, preflight, "과천시 오늘 날씨를 검색해 줘.\n/quit\n")
-
-    assert result.exit_code == 0
-    assert "현재 기온은 24도야." in result.output
-    assert "https://weather.example/gwacheon" in result.output
-    messages = engine.generate.call_args.args[0]
-    combined = "\n".join(message.content for message in messages)
-    assert '"blocks"' in combined
-    assert "UNTRUSTED WEB SEARCH RESULTS" in combined
-    assert "itinerary" not in combined.casefold()
-
-
-def test_grounded_search_bypasses_the_conversational_agent():
-    AgentRegistry.register_value(
-        "search_must_bypass_agent",
-        _SearchMustBypassAgent,
-    )
-    engine = MagicMock()
-    engine.generate.return_value = {
-        "content": (
-            '{"lead":"확인했어.","blocks":[{"kind":"fact",'
-            '"text":"현재 기온은 24도야.","supports":['
-            '{"source_id":"S1","excerpt":"현재 기온 24도"}]}],'
-            '"follow_up":""}'
-        )
-    }
-    config = _config()
-    config.agent.default_agent = "search_must_bypass_agent"
-
-    result = _run(
-        engine,
-        _FixedPreflight(_weather_result()),
-        "과천시 날씨를 검색해 줘.\n/quit\n",
-        config=config,
+def test_greeting_does_not_call_web_search():
+    result, engine, search_tool = run_model_led_chat(
+        "안녕? 좋은 하루야.",
+        direct_content="안녕! 좋은 하루야.",
     )
 
     assert result.exit_code == 0
-    assert "현재 기온은 24도야." in result.output
+    assert search_tool.queries == []
     assert engine.generate.call_count == 1
 
 
-def test_malformed_search_answer_gets_one_local_repair():
-    repaired = (
-        '{"lead":"확인했어.","blocks":[{"kind":"fact",'
-        '"text":"현재 기온은 24도야.","supports":['
-        '{"source_id":"S1","excerpt":"현재 기온 24도"}]}],'
-        '"follow_up":""}'
-    )
-    engine = MagicMock()
-    engine.generate.side_effect = [
-        {"content": "형식이 잘못된 답"},
-        {"content": repaired},
-    ]
-
-    result = _run(
-        engine,
-        _FixedPreflight(_weather_result()),
-        "과천시 날씨를 검색해 줘.\n/quit\n",
+def test_missing_tool_value_is_not_replaced_by_a_harness_fact():
+    result, engine, search_tool = run_model_led_chat(
+        "오늘 과천시 날씨를 알려줘.",
+        tool_query="과천시 날씨",
+        tool_content="검색 결과에 현재 기온 값이 없음",
+        final_content="검색 결과에서 현재 기온을 확인하지 못했어.",
     )
 
-    assert result.exit_code == 0
-    assert "현재 기온은 24도야." in result.output
-    assert engine.generate.call_count == 2
+    assert "확인하지 못했어" in result.output
+    assert "3도" not in result.output
 
 
-def test_action_and_search_failure_skip_final_generation_and_are_archived_once():
-    engine = MagicMock()
-    action = AssistantPreflightResult(
-        triggered=True,
-        mode="action",
-        error="웹사이트나 앱을 직접 조작하는 기능은 아직 연결되지 않았어.",
-    )
-    failure = AssistantPreflightResult(
-        triggered=True,
-        mode="search",
-        success=False,
-        error="인터넷에서 필요한 정보를 확인하지 못했어.",
-    )
-    preflight = _FixedPreflight(action, failure)
-
-    with patch(
-        "openjarvis.cli.chat_cmd.record_and_publish_completed_exchange"
-    ) as record_exchange:
-        result = _run(
-            engine,
-            preflight,
-            "쿠팡에서 음료수를 주문해 줘.\n날씨를 검색해 줘.\n/quit\n",
-        )
-
-    assert result.exit_code == 0
-    assert "직접 조작하는 기능은 아직 연결되지 않았어" in result.output
-    assert "필요한 정보를 확인하지 못했어" in result.output
-    engine.generate.assert_not_called()
-    assert record_exchange.call_count == 2
-
-
-def test_grounded_search_does_not_mix_personal_memory_into_public_facts():
-    engine = MagicMock()
-    engine.generate.return_value = {
-        "content": (
-            '{"lead":"확인했어.","blocks":[{"kind":"fact",'
-            '"text":"현재 기온은 24도야.","supports":['
-            '{"source_id":"S1","excerpt":"현재 기온 24도"}]}],'
-            '"follow_up":""}'
-        )
-    }
-    config = _config()
-    config.agent.context_from_memory = True
-    memory_message = Message(
-        role=Role.SYSTEM,
-        content="PERSONAL MEMORY CONTEXT\ndirect user rule",
-        metadata={"memory_context": True},
+def test_private_relationship_context_is_not_added_to_public_query():
+    request = "내 여자친구를 데리러 가기 전에 과천시 날씨를 검색해줘."
+    result, engine, search_tool = run_model_led_chat(
+        request,
+        tool_query="과천시 날씨",
+        tool_content="기온 24도",
+        final_content="과천시 기온은 24도야.",
     )
 
-    with (
-        patch("openjarvis.memory.build_memory_service", return_value=None),
-        patch("openjarvis.cli.ask._get_memory_backend", return_value=None),
-        patch(
-            "openjarvis.tools.storage.context.inject_context",
-            return_value=[memory_message],
-        ),
-    ):
-        result = _run(
-            engine,
-            _FixedPreflight(_weather_result()),
-            "과천시 날씨를 검색해 줘.\n/quit\n",
-            config=config,
-        )
-
-    assert result.exit_code == 0
-    messages = engine.generate.call_args.args[0]
-    combined = "\n".join(message.content for message in messages)
-    assert "PERSONAL MEMORY CONTEXT" not in combined
-    assert "UNTRUSTED WEB SEARCH RESULTS" in combined
+    assert search_tool.queries == ["과천시 날씨"]
+    assert "여자친구" not in search_tool.queries[0]
