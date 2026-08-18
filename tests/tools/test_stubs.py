@@ -5,6 +5,7 @@ from __future__ import annotations
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import ToolCall, ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolExecutor, ToolSpec
+from openjarvis.tools.think import ThinkTool
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -141,6 +142,15 @@ class TestToolExecutor:
         assert result.success is False
         assert "Tool argument schema error" in result.content
         assert "required property" in result.content
+
+    def test_execute_empty_arguments_when_tool_declares_them_optional(self):
+        executor = ToolExecutor([ThinkTool()])
+        call = ToolCall(id="1", name="think", arguments="")
+
+        result = executor.execute(call)
+
+        assert result.success is True
+        assert result.content == ""
 
     def test_execute_tool_error(self):
         executor = ToolExecutor([_ErrorTool()])

@@ -31,7 +31,6 @@ class ThinkTool(BaseTool):
                         "description": "Your reasoning or thought process.",
                     },
                 },
-                "required": ["thought"],
             },
             category="reasoning",
             cost_estimate=0.0,
