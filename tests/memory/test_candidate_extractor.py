@@ -18,6 +18,32 @@ class _FakeEngine:
         return self.response
 
 
+class _CanonicalSubjectGuidanceEngine:
+    """Model double that needs an explicit stable-subject contract."""
+
+    def generate(self, messages, **kwargs):
+        system_prompt = messages[0].content
+        has_guidance = (
+            "assistant.name" in system_prompt
+            and "same subject" in system_prompt.casefold()
+            and "assistant identity or role" in system_prompt.casefold()
+            and "never percentages" in system_prompt.casefold()
+        )
+        return {
+            "content": _response(
+                _candidate(
+                    kind="correction" if has_guidance else "preference",
+                    content="The assistant name is 공박사.",
+                    importance=1.0 if has_guidance else 10,
+                    confidence=1.0 if has_guidance else 95,
+                    temporal_scope="until_changed",
+                    subject="assistant.name" if has_guidance else "name_preference",
+                    evidence_excerpt="공박사라고.",
+                )
+            )
+        }
+
+
 def _extractor_api():
     try:
         from openjarvis.memory.candidate_extractor import (
@@ -109,6 +135,28 @@ def test_bare_name_correction_uses_recent_dialogue():
     assert prompt.index("너의 이름은 조visor가 아니야. 공박사야.") < prompt.index(
         "공박사라고."
     )
+
+
+def test_bare_correction_receives_stable_subject_guidance():
+    """Without a stable subject, restart processing cannot supersede identity."""
+    PersonalCandidateExtractor, _, _ = _extractor_api()
+    drafts = PersonalCandidateExtractor(
+        _CanonicalSubjectGuidanceEngine(),
+        "qwen3.5:9b",
+    ).extract(
+        _exchange("공박사라고.", "네, 공박사입니다.", created_at=3.0),
+        recent_exchanges=(
+            _exchange(
+                "너의 이름은 조visor가 아니야. 공박사야.",
+                "알겠습니다.",
+                exchange_id="exchange-0",
+                created_at=2.0,
+            ),
+        ),
+    )
+
+    assert drafts[0].kind.value == "correction"
+    assert drafts[0].subject == "assistant.name"
 
 
 def test_evidence_excerpt_copied_only_from_assistant_text_is_rejected():
