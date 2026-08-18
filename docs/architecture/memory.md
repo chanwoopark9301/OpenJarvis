@@ -29,7 +29,9 @@ Canonical-profile staging creates private, hash-manifested snapshots of static
 `USER.md` and `MEMORY.md` and imports their bullets only as low-trust legacy
 candidates. Explicit activation makes the SQLite archive the changing profile
 authority for `jarvis chat`: `SOUL.md` remains, while static dynamic profile
-files and legacy JSONL facts no longer compete with canonical context. See
+files and legacy JSONL facts no longer compete with canonical context. Safe
+deactivation revalidates the exact attested backups and atomically clears that
+authority without restoring or overwriting the current static files. See
 [Personal Memory Harness](personal-memory-harness.md) for lifecycle, modes,
 user controls, migration checks, privacy limits, and recovery procedures.
 

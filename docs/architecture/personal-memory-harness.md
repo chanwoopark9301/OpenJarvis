@@ -65,11 +65,16 @@ therefore cannot erase the archived exchange.
 
 ## Proposal and evidence contract
 
-Extractor version 5 receives the current completed exchange and at most six
+Extractor version 8 receives the current completed exchange and at most six
 earlier exchanges in chronological order, scoped to the same session when a
 session ID exists and otherwise to the same source. The earlier user/assistant
 turns provide meaning only. The current user message is the sole evidence
 source.
+
+Each material proposal-prompt revision advances this provenance version.
+Startup may therefore reopen a completed zero-candidate exchange from an older
+version through the ordinary durable job lifecycle; a successful version-8 run
+then prevents the same exchange/version pair from being scheduled again.
 
 The model may propose up to five atomic candidates from this closed set:
 
@@ -105,6 +110,15 @@ A correction supersedes an explicitly targeted active claim. If no stored claim
 ID was available to the model, a correction with a non-generic stable subject
 supersedes active direct claims with that same subject. The old claim and its
 evidence remain stored in `superseded` state; they are not rewritten.
+
+Delayed background evaluation cannot reverse a newer direct statement for the
+same subject. The archive orders direct evidence by source-exchange time and
+exchange ID, then by candidate/evidence time and ID for a deterministic tie.
+Inside the same write transaction, an older direct rule is rejected when a
+newer direct rule is active; an older direct-source fact or preference is also
+rejected when a newer correction is active. A genuinely newer explicit
+correction still applies normally. Stale attempts and the active claim remain
+auditable without rewriting evidence.
 
 Accepted non-direct facts and preferences first remain atomic claims. Schema
 consolidation and reflection run only after recurrent cross-session evidence or
@@ -207,18 +221,33 @@ With no options, the command uses the stored manifest. Repeated
 `--backup-path` values are accepted only when they exactly match that manifest.
 Successful activation records the manifest hash and an audit decision.
 
-Activation performs the archive, ordered-path, file-type, and hash checks above
-internally. The staging command prints aggregate counts, not manifest paths or
-hashes; independent inspection currently requires trusted local maintenance
-tooling because there is no dedicated manifest-inspection CLI.
+Activation performs the archive, ordered-path, file-type, hash, private-mode,
+owner, and descriptor-identity checks internally. It records the validated
+backup identities with the canonical marker. The staging command prints
+aggregate counts, not manifest paths or hashes; independent inspection
+currently requires trusted local maintenance tooling because there is no
+dedicated manifest-inspection CLI.
 
-The snapshots preserve the original bytes, but there is currently no supported
-single-command rollback, `deactivate-canonical-profile`, or automatic restore.
-Restoring a file alone does not clear the canonical marker or re-enable static
-injection; a complete rollback requires code-level maintenance of both the file
-and canonical metadata. Preserve the archive, manifest, and snapshots for that
-recovery path. Do not use `personal-delete-all` as rollback: it intentionally
-retains archive metadata and filesystem backups.
+To leave canonical mode without overwriting the profile files that currently
+exist, run:
+
+```text
+jarvis memory deactivate-canonical-profile
+```
+
+The command repeats the exact ordered-manifest, SHA-256, `0700` directory,
+`0600` file, owner, non-symlink, regular-file, and descriptor-identity checks.
+It also requires every backup identity to match the activation attestation.
+Only then does one archive transaction clear the canonical marker and append a
+non-content audit decision. Current `USER.md` and `MEMORY.md` bytes are never
+restored or overwritten; those current sources simply become eligible for
+static injection again. Missing, modified, replaced, or permission-weakened
+backups fail closed and leave both canonical metadata and audit state unchanged.
+
+Preserve the archive, manifest, and snapshots after deactivation. This command
+is a safe authority rollback, not an automatic file restore. Do not use
+`personal-delete-all` as rollback: it intentionally retains archive metadata
+and filesystem backups.
 
 ## Privacy boundary
 
