@@ -86,6 +86,24 @@ class TestWebSearchTool:
         assert result.success is False
         assert "No query" in result.content
 
+    @pytest.mark.parametrize(
+        ("query", "expected_place"),
+        [
+            ("오늘의 날씨", None),
+            ("오늘 과천시의 날씨는 어떤지", "과천시"),
+            ("과천시 오늘의 날씨", "과천시"),
+        ],
+    )
+    def test_korean_weather_query_extracts_whole_place_tokens(
+        self, query, expected_place
+    ):
+        from openjarvis.tools.web_search import _KOREAN_WEATHER_QUERY
+
+        match = _KOREAN_WEATHER_QUERY.search(query)
+        place = " ".join(match.group("place").split()) if match else None
+
+        assert place == expected_place
+
     def test_korean_weather_without_administrative_suffix_uses_structured_data(
         self, monkeypatch
     ):
