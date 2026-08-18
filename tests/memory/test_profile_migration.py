@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import stat
 from pathlib import Path
 
 import pytest
@@ -196,9 +198,9 @@ def test_staging_imports_exact_backup_snapshot_not_mutable_source(
     original_copy2 = __import__("shutil").copy2
     copy_count = 0
 
-    def mutate_after_copy(source, target):
+    def mutate_after_copy(source, target, *args, **kwargs):
         nonlocal copy_count
-        copied = original_copy2(source, target)
+        copied = original_copy2(source, target, *args, **kwargs)
         copy_count += 1
         if copy_count == 1:
             Path(source).write_text("- MUTATED LIVE SOURCE", encoding="utf-8")
@@ -239,8 +241,10 @@ def test_staging_rejects_backup_destination_collision_without_overwrite(
     user_path, memory_path = _legacy_files(tmp_path)
     backup_dir = tmp_path / ".canonical-profile-backups"
     backup_dir.mkdir()
-    collision = backup_dir / "USER.md.fixed.backup"
-    collision.write_text("must remain", encoding="utf-8")
+    collision = backup_dir / "fixed"
+    collision.mkdir()
+    marker = collision / "must-remain"
+    marker.write_text("must remain", encoding="utf-8")
     monkeypatch.setattr(
         "openjarvis.memory.profile_migration.uuid.uuid4", lambda: FixedUuid()
     )
@@ -248,8 +252,50 @@ def test_staging_rejects_backup_destination_collision_without_overwrite(
     with pytest.raises(ValueError, match="collision"):
         LegacyProfileMigrator(archive).stage(user_path, memory_path)
 
-    assert collision.read_text(encoding="utf-8") == "must remain"
+    assert marker.read_text(encoding="utf-8") == "must remain"
     assert archive.find_candidates() == []
+
+
+def test_copy_boundary_symlink_swap_cannot_overwrite_victim(tmp_path, monkeypatch):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("must remain untouched", encoding="utf-8")
+    original_copy2 = __import__("shutil").copy2
+
+    def attempt_swap(source, target, *args, **kwargs):
+        try:
+            Path(target).unlink(missing_ok=True)
+            Path(target).symlink_to(victim)
+        except OSError:
+            pass
+        return original_copy2(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "openjarvis.memory.profile_migration.shutil.copy2", attempt_swap
+    )
+
+    result = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    assert victim.read_text(encoding="utf-8") == "must remain untouched"
+    assert result.backup_paths[0].read_bytes() == user_path.read_bytes()
+
+
+def test_snapshot_permissions_are_private(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+
+    result = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    backup_root = tmp_path / ".canonical-profile-backups"
+    assert stat.S_IMODE(backup_root.stat().st_mode) == 0o700
+    assert all(
+        stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+        for path in result.backup_paths
+    )
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o600 for path in result.backup_paths
+    )
 
 
 def test_invalid_utf8_staging_is_atomic(tmp_path):
@@ -329,6 +375,29 @@ def test_existing_corrupt_archive_fails_closed_for_static_profile(tmp_path):
     )
 
     effective = effective_chat_memory_files(config, original)
+
+    assert effective.soul_path == original.soul_path
+    assert effective.user_path == ""
+    assert effective.memory_path == ""
+
+
+def test_supplied_archive_sqlite_error_fails_closed_for_static_profile(tmp_path):
+    class CorruptArchive:
+        def get_metadata(self, key, default=""):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+    user_path, memory_path = _legacy_files(tmp_path)
+    original = MemoryFilesConfig(
+        soul_path=str(tmp_path / "SOUL.md"),
+        user_path=str(user_path),
+        memory_path=str(memory_path),
+    )
+
+    effective = effective_chat_memory_files(
+        JarvisConfig(),
+        original,
+        CorruptArchive(),
+    )
 
     assert effective.soul_path == original.soul_path
     assert effective.user_path == ""

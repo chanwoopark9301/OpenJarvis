@@ -11,6 +11,7 @@ import functools
 import os
 import platform
 import shutil
+import sqlite3
 import subprocess
 from dataclasses import dataclass, field, is_dataclass, replace
 from pathlib import Path
@@ -1524,8 +1525,6 @@ def canonical_profile_is_active(config: object, archive: object | None = None) -
         if not archive_path.is_file():
             return False
         try:
-            import sqlite3
-
             uri = f"{archive_path.resolve().as_uri()}?mode=ro"
             with sqlite3.connect(uri, uri=True) as connection:
                 row = connection.execute(
@@ -1539,7 +1538,7 @@ def canonical_profile_is_active(config: object, archive: object | None = None) -
             return True
     try:
         return selected_archive.get_metadata("canonical_profile_active", "0") == "1"
-    except (AttributeError, OSError):
+    except (AttributeError, OSError, sqlite3.Error):
         return True
 
 

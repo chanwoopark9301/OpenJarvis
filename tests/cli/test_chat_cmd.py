@@ -13,7 +13,12 @@ from openjarvis.agents._stubs import (
     BaseAgent,
     ToolUsingAgent,
 )
-from openjarvis.cli.chat_cmd import _personal_memory_status, _read_input, chat
+from openjarvis.cli.chat_cmd import (
+    _constructor_forwards_keyword,
+    _personal_memory_status,
+    _read_input,
+    chat,
+)
 from openjarvis.core.config import JarvisConfig
 from openjarvis.core.events import Event, EventBus, EventType
 from openjarvis.core.registry import AgentRegistry, ToolRegistry
@@ -29,6 +34,27 @@ def test_personal_memory_status_reports_disabled_response_injection():
     assert _personal_memory_status(config, "shadow") == (
         "collecting; response injection disabled"
     )
+
+
+def test_constructor_keyword_audit_follows_kwargs_chain_safely():
+    class AcceptingBase:
+        def __init__(self, *, prompt_builder=None):
+            pass
+
+    class SafeForwarder(AcceptingBase):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+    class RejectingBase:
+        def __init__(self, *, bus=None):
+            pass
+
+    class UnsafeForwarder(RejectingBase):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+    assert _constructor_forwards_keyword(SafeForwarder, "prompt_builder")
+    assert not _constructor_forwards_keyword(UnsafeForwarder, "prompt_builder")
 
 
 class _SimpleChatAgent(BaseAgent):

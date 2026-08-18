@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import sys
 from collections import Counter
@@ -22,6 +23,29 @@ from openjarvis.core.types import Message, Role
 from openjarvis.memory import record_and_publish_completed_exchange
 
 logger = logging.getLogger(__name__)
+
+
+def _constructor_forwards_keyword(agent_cls: object, keyword: str) -> bool:
+    """Verify that each ``**kwargs`` hop reaches an explicit keyword receiver."""
+    if not isinstance(agent_cls, type):
+        return False
+    for current in agent_cls.__mro__:
+        constructor = current.__dict__.get("__init__")
+        if constructor is None:
+            continue
+        try:
+            parameters = inspect.signature(constructor).parameters
+        except (TypeError, ValueError):
+            return False
+        if keyword in parameters:
+            return True
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            continue
+        return False
+    return False
 
 
 def _read_input(prompt: str = "You> ") -> Optional[str]:
@@ -255,19 +279,7 @@ def chat(
                     kwargs["interactive"] = True
                     kwargs["confirm_callback"] = _confirm
 
-                import inspect as _inspect
-
-                constructor_parameters = _inspect.signature(
-                    execution_cls.__init__
-                ).parameters
-                accepts_prompt_builder = (
-                    "prompt_builder" in constructor_parameters
-                    or any(
-                        parameter.kind == _inspect.Parameter.VAR_KEYWORD
-                        for parameter in constructor_parameters.values()
-                    )
-                )
-                if accepts_prompt_builder:
+                if _constructor_forwards_keyword(execution_cls, "prompt_builder"):
                     from openjarvis.prompt.builder import SystemPromptBuilder
 
                     kwargs["prompt_builder"] = SystemPromptBuilder(

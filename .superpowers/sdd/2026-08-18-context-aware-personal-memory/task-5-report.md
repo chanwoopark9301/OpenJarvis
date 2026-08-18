@@ -183,3 +183,64 @@ Remediated all nine review findings without operating the user's installed profi
 - No network provider was called; external privacy tests intercept the model payload.
 - The trusted manifest is the sole activation authority. The legacy `canonical_profile_backup_paths` value remains only as compatibility/recovery metadata and is never consulted by activation.
 - The only known regression outside the green Task 5 and broader memory/CLI suites is the pre-existing server-route fixture mismatch described above.
+
+## Fix round 2: race-safe snapshots and supplied-archive fail-closed handling
+
+### RED evidence
+
+- `uv run pytest -q tests/memory/test_profile_migration.py -k 'copy_boundary or snapshot_permissions or supplied_archive_sqlite_error or destination_collision'`
+  - Initial result: `3 failed, 1 passed, 16 deselected`.
+  - The deterministic `copy2` boundary hook replaced the unchecked destination with a symlink, causing the prior implementation to follow it before detecting the unsafe path.
+  - A supplied archive raising `sqlite3.DatabaseError` escaped `canonical_profile_is_active` instead of returning the fail-closed state.
+- `uv run pytest -q tests/cli/test_chat_cmd.py -k constructor_keyword_audit`
+  - Initial result: collection error because no constructor-chain audit existed.
+- `uv run pytest -q tests/agents/test_proactive_agent.py -k fresh_process`
+  - Initial result: `1 failed, 7 deselected`; importing built-in agents in a fresh process did not register `proactive`, showing that the prior CLI test's direct class import masked the real registry path.
+
+### GREEN evidence
+
+- Focused migration suite: `20 passed in 0.17s`.
+- Focused constructor/registration/proactive prompt tests: `4 passed, 24 deselected`.
+- Required migration/context/CLI/chat/privacy/proactive suite:
+  - `uv run pytest -q tests/memory/test_profile_migration.py tests/memory/test_context_composer.py tests/cli/test_memory_cmd.py tests/cli/test_chat_cmd.py tests/memory/test_developmental_memory_privacy.py tests/agents/test_proactive_agent.py`
+  - `80 passed in 0.98s`.
+- Broader memory and CLI regression suite:
+  - `uv run pytest -q tests/memory tests/cli`
+  - `832 passed, 16 skipped, 8 warnings in 12.37s`.
+- Ruff check passed after formatting all seven round-two source/test files. `git diff --check` passed.
+
+### Race-safe backup boundary
+
+- The archive-adjacent backup root is atomically created, opened with directory and no-follow flags where supported, verified as a directory through its file descriptor, and forced to mode `0700`.
+- Every snapshot receives an atomically created UUID directory and an exclusively reserved `O_EXCL | O_NOFOLLOW` regular file.
+- Before `shutil.copy2`, both directory levels are temporarily made non-writable. Root, snapshot-directory, and destination device/inode identities are verified against their open descriptors immediately before the copy.
+- `copy2(..., follow_symlinks=False)` retains the required backup metadata semantics. The destination inode is checked again afterward, restricted to `0600`, and fsynced.
+- Candidate import bytes are read from a duplicate of the still-open reserved file descriptor, not from a newly resolved path. This closes the post-copy read/symlink race as well as the original check-then-copy race.
+- Directory modes are restored to `0700` in `finally` cleanup. Tests assert both directory levels are `0700`, files are `0600`, an injected symlink swap cannot alter its victim, and a deterministic UUID collision cannot overwrite an existing directory.
+
+### Supplied archive fail-closed behavior
+
+- `sqlite3` is now module-scoped in configuration handling, and the supplied-archive metadata branch catches `sqlite3.Error` alongside filesystem/access errors.
+- A corrupt or closed supplied archive therefore suppresses USER/MEMORY and legacy fact authority instead of aborting chat or failing open.
+
+### Prompt-builder constructor and registry audit
+
+- The previous broad `**kwargs` check could inject `prompt_builder` into wrappers whose next concrete base rejected it (for example hybrid `LocalCloudAgent` subclasses).
+- `_constructor_forwards_keyword` now walks only constructors defined along the class MRO: every `**kwargs` hop must eventually reach an explicit `prompt_builder` receiver before any rejecting signature. This keeps ProactiveAgent and MorningDigestAgent safe while excluding hybrid wrappers that do not forward to a compatible base.
+- A focused synthetic-chain test covers safe and unsafe forwarding. The existing registered proactive external-provider interception remains green.
+- The audit also found that `openjarvis.agents` omitted the proactive registration in a fresh process. The built-in import list now includes `proactive_agent`, and a subprocess regression proves `jarvis chat --agent proactive` resolves without a test-only pre-import.
+
+### Files changed in fix round 2
+
+- `src/openjarvis/memory/profile_migration.py`
+- `src/openjarvis/core/config.py`
+- `src/openjarvis/cli/chat_cmd.py`
+- `src/openjarvis/agents/__init__.py`
+- `tests/memory/test_profile_migration.py`
+- `tests/cli/test_chat_cmd.py`
+- `tests/agents/test_proactive_agent.py`
+
+### Concerns
+
+- The secure destination implementation uses directory-relative file operations and POSIX permission/inode guarantees available on the supported local Unix execution path. No real installation paths were touched.
+- The unrelated server-route fixture mismatch recorded in fix round 1 remains outside Task 5; the required and broader covering suites are green.

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
+import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,28 +50,27 @@ class LegacyProfileMigrator:
             Path(path).expanduser().absolute() for path in (user_path, memory_path)
         )
         backup_dir = self.archive.path.parent / ".canonical-profile-backups"
-        if backup_dir.is_symlink():
-            raise ValueError("profile backup directory must not be a symlink")
-        backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        backup_dir.chmod(0o700)
+        backup_root_fd = _open_private_backup_root(backup_dir)
         snapshots: list[tuple[Path, Path, bytes]] = []
-        for source in sources:
-            if not source.exists():
-                continue
-            if source.is_symlink():
-                raise ValueError(f"legacy profile path must not be a symlink: {source}")
-            if not source.is_file():
-                raise ValueError(f"legacy profile path is not a file: {source}")
-            backup = backup_dir / f"{source.name}.{uuid.uuid4().hex}.backup"
-            if backup.exists() or backup.is_symlink():
-                raise ValueError("profile backup destination collision")
-            shutil.copy2(source, backup)
-            if backup.is_symlink() or not backup.is_file():
-                raise ValueError("profile backup destination is unsafe")
-            backup.chmod(0o600)
-            snapshot = backup.read_bytes()
-            snapshot.decode("utf-8")
-            snapshots.append((source, backup.absolute(), snapshot))
+        try:
+            for source in sources:
+                if not source.exists():
+                    continue
+                if source.is_symlink():
+                    raise ValueError(
+                        f"legacy profile path must not be a symlink: {source}"
+                    )
+                if not source.is_file():
+                    raise ValueError(f"legacy profile path is not a file: {source}")
+                backup, snapshot = _copy2_private_snapshot(
+                    source,
+                    backup_dir,
+                    backup_root_fd,
+                )
+                snapshot.decode("utf-8")
+                snapshots.append((source, backup, snapshot))
+        finally:
+            os.close(backup_root_fd)
 
         old_manifest = _read_manifest(self.archive)
         merged = {
@@ -129,6 +130,92 @@ class LegacyProfileMigrator:
             imported=imported,
             skipped=skipped,
         )
+
+
+def _directory_open_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_private_backup_root(backup_dir: Path) -> int:
+    """Open or atomically create the non-symlink private backup root."""
+    try:
+        os.mkdir(backup_dir, mode=0o700)
+    except FileExistsError:
+        pass
+    try:
+        root_fd = os.open(backup_dir, _directory_open_flags())
+    except OSError as exc:
+        raise ValueError("profile backup directory is unsafe") from exc
+    root_stat = os.fstat(root_fd)
+    if not stat.S_ISDIR(root_stat.st_mode):
+        os.close(root_fd)
+        raise ValueError("profile backup directory is unsafe")
+    os.fchmod(root_fd, 0o700)
+    return root_fd
+
+
+def _copy2_private_snapshot(
+    source: Path,
+    backup_dir: Path,
+    backup_root_fd: int,
+) -> tuple[Path, bytes]:
+    """Reserve an unreplaceable destination, then copy metadata and bytes."""
+    snapshot_name = uuid.uuid4().hex
+    try:
+        os.mkdir(snapshot_name, mode=0o700, dir_fd=backup_root_fd)
+    except FileExistsError as exc:
+        raise ValueError("profile backup destination collision") from exc
+    snapshot_fd = os.open(
+        snapshot_name,
+        _directory_open_flags(),
+        dir_fd=backup_root_fd,
+    )
+    backup = (backup_dir / snapshot_name / source.name).absolute()
+    file_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        backup_fd = os.open(source.name, file_flags, 0o600, dir_fd=snapshot_fd)
+    except Exception:
+        os.close(snapshot_fd)
+        raise
+    root_identity = os.fstat(backup_root_fd)
+    snapshot_identity = os.fstat(snapshot_fd)
+    backup_identity = os.fstat(backup_fd)
+    try:
+        # Removing directory write permission makes the reserved inode impossible
+        # to replace between the validation and copy2's destination open.
+        os.fchmod(snapshot_fd, 0o500)
+        os.fchmod(backup_root_fd, 0o500)
+        path_root = os.lstat(backup_dir)
+        path_snapshot = os.lstat(backup.parent)
+        path_backup = os.lstat(backup)
+        if (
+            (path_root.st_dev, path_root.st_ino)
+            != (root_identity.st_dev, root_identity.st_ino)
+            or (path_snapshot.st_dev, path_snapshot.st_ino)
+            != (snapshot_identity.st_dev, snapshot_identity.st_ino)
+            or (path_backup.st_dev, path_backup.st_ino)
+            != (backup_identity.st_dev, backup_identity.st_ino)
+            or not stat.S_ISREG(path_backup.st_mode)
+        ):
+            raise ValueError("profile backup destination is unsafe")
+        shutil.copy2(source, backup, follow_symlinks=False)
+        copied = os.lstat(backup)
+        if (copied.st_dev, copied.st_ino) != (
+            backup_identity.st_dev,
+            backup_identity.st_ino,
+        ) or not stat.S_ISREG(copied.st_mode):
+            raise ValueError("profile backup destination is unsafe")
+        os.fchmod(backup_fd, 0o600)
+        os.fsync(backup_fd)
+        os.lseek(backup_fd, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(backup_fd), "rb") as snapshot_handle:
+            snapshot = snapshot_handle.read()
+    finally:
+        os.fchmod(snapshot_fd, 0o700)
+        os.fchmod(backup_root_fd, 0o700)
+        os.close(backup_fd)
+        os.close(snapshot_fd)
+    return backup, snapshot
 
 
 def _read_manifest(archive: PersonalMemoryArchive) -> dict:

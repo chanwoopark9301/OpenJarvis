@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,6 +17,25 @@ from openjarvis.agents.proactive_agent import (
 from openjarvis.core.registry import ChannelRegistry
 from openjarvis.scheduler.scheduler import TaskScheduler
 from openjarvis.scheduler.store import SchedulerStore
+
+
+def test_builtin_agent_import_registers_proactive_in_fresh_process():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import openjarvis.agents; "
+                "from openjarvis.core.registry import AgentRegistry; "
+                "print(AgentRegistry.contains('proactive'))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "True"
 
 
 def test_proactive_prompt_uses_shared_prompt_builder_not_global_profile(
