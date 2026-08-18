@@ -173,3 +173,79 @@ def test_memory_clear_empty(tmp_path: Path, monkeypatch):
     result = CliRunner().invoke(cli, ["memory", "clear"])
     assert result.exit_code == 0
     assert "No memory facts to clear" in result.output
+
+
+def test_stage_canonical_profile_cli_keeps_personal_text_out_of_output(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from openjarvis.core.config import JarvisConfig
+    from openjarvis.memory.archive import PersonalMemoryArchive
+
+    config = JarvisConfig()
+    config.personal_memory.archive_path = str(tmp_path / "personal.db")
+    config.memory_files.user_path = str(tmp_path / "USER.md")
+    config.memory_files.memory_path = str(tmp_path / "MEMORY.md")
+    Path(config.memory_files.user_path).write_text(
+        "- private profile marker",
+        encoding="utf-8",
+    )
+    Path(config.memory_files.memory_path).write_text(
+        "- private memory marker",
+        encoding="utf-8",
+    )
+    mod = importlib.import_module("openjarvis.cli.memory_cmd")
+    monkeypatch.setattr(mod, "load_config", lambda: config)
+
+    result = CliRunner().invoke(cli, ["memory", "stage-canonical-profile"])
+
+    assert result.exit_code == 0
+    assert "private profile marker" not in result.output
+    assert "private memory marker" not in result.output
+    archive = PersonalMemoryArchive(config.personal_memory.archive_path)
+    assert archive.get_metadata("canonical_profile_backup_paths", "")
+    assert archive.get_metadata("canonical_profile_active", "0") == "0"
+
+
+def test_activate_canonical_profile_cli_uses_staged_backups(tmp_path, monkeypatch):
+    from openjarvis.core.config import JarvisConfig
+    from openjarvis.memory.archive import PersonalMemoryArchive
+
+    config = JarvisConfig()
+    config.personal_memory.archive_path = str(tmp_path / "personal.db")
+    config.memory_files.user_path = str(tmp_path / "USER.md")
+    config.memory_files.memory_path = str(tmp_path / "MEMORY.md")
+    Path(config.memory_files.user_path).write_text("- private user", encoding="utf-8")
+    Path(config.memory_files.memory_path).write_text(
+        "- private memory",
+        encoding="utf-8",
+    )
+    mod = importlib.import_module("openjarvis.cli.memory_cmd")
+    monkeypatch.setattr(mod, "load_config", lambda: config)
+    runner = CliRunner()
+    assert runner.invoke(cli, ["memory", "stage-canonical-profile"]).exit_code == 0
+
+    result = runner.invoke(cli, ["memory", "activate-canonical-profile"])
+
+    assert result.exit_code == 0
+    assert "private user" not in result.output
+    assert "private memory" not in result.output
+    archive = PersonalMemoryArchive(config.personal_memory.archive_path)
+    assert archive.get_metadata("canonical_profile_active", "0") == "1"
+
+
+def test_activate_canonical_profile_cli_refuses_without_staging(
+    tmp_path,
+    monkeypatch,
+):
+    from openjarvis.core.config import JarvisConfig
+
+    config = JarvisConfig()
+    config.personal_memory.archive_path = str(tmp_path / "personal.db")
+    mod = importlib.import_module("openjarvis.cli.memory_cmd")
+    monkeypatch.setattr(mod, "load_config", lambda: config)
+
+    result = CliRunner().invoke(cli, ["memory", "activate-canonical-profile"])
+
+    assert result.exit_code != 0
+    assert "backup" in result.output.lower()

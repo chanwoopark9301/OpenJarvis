@@ -11,7 +11,11 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 from openjarvis.cli._tool_names import resolve_tool_names
-from openjarvis.core.config import load_config
+from openjarvis.core.config import (
+    canonical_profile_is_active,
+    effective_chat_memory_files,
+    load_config,
+)
 from openjarvis.core.events import EventBus
 from openjarvis.core.types import Message, Role
 from openjarvis.memory import record_and_publish_completed_exchange
@@ -49,6 +53,37 @@ def _build_chat_agent_context(
         if message.role != Role.SYSTEM:
             context.conversation.add(message)
     return context
+
+
+def _pending_user_dialogue_messages(
+    personal_context: object | None,
+    *,
+    local_response_engine: bool,
+) -> list[Message]:
+    """Project local pending user turns as dialogue, never instructions."""
+    if not local_response_engine or personal_context is None:
+        return []
+    return [
+        Message(
+            role=Role.USER,
+            content=text,
+            metadata={"personal_memory_context": "recent_dialogue"},
+        )
+        for text in getattr(personal_context, "recent_pending_user_messages", ())
+        if str(text).strip()
+    ]
+
+
+def _prepend_pending_dialogue(
+    messages: list[Message],
+    pending: list[Message],
+) -> list[Message]:
+    """Place restart dialogue after system identity and before live history."""
+    if not pending:
+        return messages
+    system = [message for message in messages if message.role == Role.SYSTEM]
+    dialogue = [message for message in messages if message.role != Role.SYSTEM]
+    return [*system, *pending, *dialogue]
 
 
 @click.command()
@@ -90,7 +125,7 @@ def chat(
 
     import dataclasses as _dc
 
-    effective_mf = (
+    requested_mf = (
         _dc.replace(config.memory_files, persona_name=persona_name)
         if persona_name is not None
         else config.memory_files
@@ -108,6 +143,17 @@ def chat(
         sys.exit(1)
 
     engine_name, engine = resolved
+    from openjarvis.memory.candidate_extractor import (
+        is_local_personal_memory_engine,
+    )
+
+    local_response_engine = is_local_personal_memory_engine(config, engine_name)
+    canonical_profile_active = canonical_profile_is_active(config)
+    effective_mf = effective_chat_memory_files(
+        config,
+        requested_mf,
+        personal_context_allowed=local_response_engine,
+    )
     model = model_name or config.intelligence.default_model
     if not model:
         from openjarvis.engine import discover_engines, discover_models
@@ -364,20 +410,20 @@ def chat(
                     facts = load_configured_facts(config)
                 from openjarvis.memory.store import legacy_fact_context_enabled
 
-                if not legacy_fact_context_enabled(config):
+                if (
+                    not local_response_engine
+                    or canonical_profile_active
+                    or not legacy_fact_context_enabled(config)
+                ):
                     facts = []
                 ctx_cfg = ContextConfig(
                     top_k=config.memory.context_top_k,
                     min_score=config.memory.context_min_score,
                     max_context_tokens=config.memory.context_max_tokens,
                 )
-                context_messages = inject_context(
-                    user_input,
-                    [] if agent is not None else history,
-                    memory_backend,
-                    config=ctx_cfg,
-                    facts=facts,
-                    personal_context=compose_configured_personal_context(
+                personal_context = None
+                if local_response_engine:
+                    personal_context = compose_configured_personal_context(
                         config,
                         user_input,
                         engine_key=engine_name,
@@ -386,10 +432,28 @@ def chat(
                             if personal_memory_service is not None
                             else None
                         ),
-                    ),
+                    )
+                pending_dialogue = _pending_user_dialogue_messages(
+                    personal_context,
+                    local_response_engine=local_response_engine,
+                )
+                base_messages = [] if agent is not None else history
+                if agent is None:
+                    base_messages = _prepend_pending_dialogue(
+                        base_messages,
+                        pending_dialogue,
+                    )
+                context_messages = inject_context(
+                    user_input,
+                    base_messages,
+                    memory_backend,
+                    config=ctx_cfg,
+                    facts=facts,
+                    personal_context=personal_context,
                 )
                 if agent is not None:
                     agent_context_messages.extend(context_messages)
+                    agent_context_messages.extend(pending_dialogue)
                 else:
                     generation_history = context_messages
             except Exception:

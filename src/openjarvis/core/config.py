@@ -12,7 +12,7 @@ import os
 import platform
 import shutil
 import subprocess
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field, is_dataclass, replace
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -1515,6 +1515,55 @@ class MemoryFilesConfig:
     persona_name: str = ""  # named persona dir under <config-dir>/personas/<name>/
 
 
+def canonical_profile_is_active(config: object, archive: object | None = None) -> bool:
+    """Read the local archive's explicit canonical-profile activation flag."""
+    selected_archive = archive
+    if selected_archive is None:
+        personal = getattr(config, "personal_memory", None)
+        archive_path = Path(getattr(personal, "archive_path", "")).expanduser()
+        if not archive_path.is_file():
+            return False
+        try:
+            import sqlite3
+
+            uri = f"{archive_path.resolve().as_uri()}?mode=ro"
+            with sqlite3.connect(uri, uri=True) as connection:
+                row = connection.execute(
+                    "SELECT value FROM archive_metadata WHERE key = ?",
+                    ("canonical_profile_active",),
+                ).fetchone()
+            return row is not None and str(row[0]) == "1"
+        except (OSError, ValueError, sqlite3.Error):
+            return False
+    try:
+        return selected_archive.get_metadata("canonical_profile_active", "0") == "1"
+    except (AttributeError, OSError):
+        return False
+
+
+def effective_chat_memory_files(
+    config: object,
+    original_files: MemoryFilesConfig,
+    archive: object | None = None,
+    *,
+    personal_context_allowed: bool = True,
+) -> MemoryFilesConfig:
+    """Keep SOUL while removing legacy dynamic profile files after activation."""
+    if personal_context_allowed and not canonical_profile_is_active(config, archive):
+        return original_files
+    resolved_files = original_files
+    if original_files.persona_name:
+        from openjarvis.prompt.builder import SystemPromptBuilder
+
+        resolved_files = SystemPromptBuilder._resolve_persona(original_files)
+    return replace(
+        resolved_files,
+        memory_path="",
+        user_path="",
+        persona_name="",
+    )
+
+
 @dataclass(slots=True)
 class SystemPromptConfig:
     """Limits and strategy for system-prompt assembly."""
@@ -2311,7 +2360,9 @@ __all__ = [
     "WhatsAppBaileysChannelConfig",
     "WhatsAppChannelConfig",
     "WorkflowConfig",
+    "canonical_profile_is_active",
     "detect_hardware",
+    "effective_chat_memory_files",
     "generate_default_toml",
     "generate_minimal_toml",
     "load_config",

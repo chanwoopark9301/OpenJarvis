@@ -62,6 +62,7 @@ class ComposedMemoryContext:
     user_overlay: str
     sections: tuple[ContextSection, ...]
     suggestions: tuple[str, ...] = ()
+    recent_pending_user_messages: tuple[str, ...] = ()
 
     def render(self) -> str:
         """Render only evaluated memory; raw overlays stay in the user channel."""
@@ -175,6 +176,10 @@ class ContextComposer:
             unresolved=unresolved,
             user_overlay=self.archive.get_latest_unevaluated_user_text(),
             sections=sections,
+            recent_pending_user_messages=tuple(
+                exchange.user_text
+                for exchange in self.archive.recent_incomplete_exchanges(limit=6)
+            ),
         )
 
     @staticmethod

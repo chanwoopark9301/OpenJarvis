@@ -839,6 +839,27 @@ class PersonalMemoryArchive:
             ).fetchone()
         return str(row["user_text"]) if row is not None else ""
 
+    def recent_incomplete_exchanges(
+        self,
+        *,
+        limit: int = 6,
+    ) -> list[ConversationExchange]:
+        """Return newest durable incomplete user exchanges in chronological order."""
+        count = max(0, int(limit))
+        if count == 0:
+            return []
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM conversation_exchanges
+                WHERE candidate_state != 'complete' AND TRIM(user_text) != ''
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (count,),
+            ).fetchall()
+        return [self._exchange_from_row(row) for row in reversed(rows)]
+
     def get_candidate(self, candidate_id: str) -> MemoryCandidate | None:
         """Return one provisional candidate by stable ID."""
         with self._lock, self._connect() as connection:

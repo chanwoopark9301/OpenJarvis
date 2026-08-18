@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -390,6 +391,60 @@ def personal_rollout_status(
         raise click.ClickException(f"Rollout gates failed: {failures}")
     status = "activated" if activate else "passed"
     Console().print(f"[green]Rollout gates {status}.[/green]")
+
+
+@memory.command(name="stage-canonical-profile")
+def stage_canonical_profile() -> None:
+    """Back up and stage legacy profile bullets without activating them."""
+    from openjarvis.memory.archive import PersonalMemoryArchive
+    from openjarvis.memory.profile_migration import LegacyProfileMigrator
+
+    config = load_config()
+    archive = PersonalMemoryArchive(config.personal_memory.archive_path)
+    try:
+        result = LegacyProfileMigrator(archive).stage(
+            Path(config.memory_files.user_path),
+            Path(config.memory_files.memory_path),
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    Console().print(
+        "[green]Canonical profile staged:[/green] "
+        f"{len(result.backup_paths)} backup(s), "
+        f"{result.imported} candidate(s)."
+    )
+
+
+@memory.command(name="activate-canonical-profile")
+@click.option(
+    "--backup-path",
+    "backup_paths",
+    multiple=True,
+    type=click.Path(path_type=Path),
+    help="Readable recovery backup; may be repeated.",
+)
+def activate_canonical_profile_command(backup_paths: tuple[Path, ...]) -> None:
+    """Stop static USER/MEMORY injection after explicit backup validation."""
+    from openjarvis.memory.archive import PersonalMemoryArchive
+    from openjarvis.memory.profile_migration import activate_canonical_profile
+
+    config = load_config()
+    archive = PersonalMemoryArchive(config.personal_memory.archive_path)
+    selected_backups = backup_paths
+    if not selected_backups:
+        try:
+            stored = json.loads(
+                archive.get_metadata("canonical_profile_backup_paths", "[]")
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            stored = []
+        if isinstance(stored, list):
+            selected_backups = tuple(Path(str(path)) for path in stored)
+    try:
+        activate_canonical_profile(archive, backup_paths=selected_backups)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    Console().print("[green]Canonical profile activated.[/green]")
 
 
 @memory.command()

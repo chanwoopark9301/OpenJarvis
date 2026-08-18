@@ -17,7 +17,7 @@ from openjarvis.cli.chat_cmd import _personal_memory_status, _read_input, chat
 from openjarvis.core.config import JarvisConfig
 from openjarvis.core.events import Event, EventBus, EventType
 from openjarvis.core.registry import AgentRegistry, ToolRegistry
-from openjarvis.core.types import ToolCall, ToolResult
+from openjarvis.core.types import Role, ToolCall, ToolResult
 from openjarvis.memory.store import LocalFactStore
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
@@ -115,6 +115,59 @@ def test_agent_receives_prior_user_and_assistant_turns() -> None:
     ]
 
 
+def test_agent_receives_pending_memory_as_user_only_dialogue() -> None:
+    from openjarvis.memory.context_composer import ComposedMemoryContext
+
+    _ContextSpyChatAgent.contexts = []
+    engine = MagicMock()
+    engine.engine_id = "ollama"
+    config = JarvisConfig()
+    config.intelligence.default_model = "test-model"
+    config.agent.context_from_memory = True
+    AgentRegistry.register_value("context_spy_chat_agent", _ContextSpyChatAgent)
+    personal = ComposedMemoryContext(
+        constraints=(),
+        current_states=(),
+        schemas=(),
+        episodes=(),
+        raw_evidence=(),
+        unresolved=(),
+        user_overlay="",
+        sections=(),
+        recent_pending_user_messages=(
+            "older pending user message",
+            "newer pending user message",
+        ),
+    )
+
+    with (
+        patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+        patch("openjarvis.engine.get_engine", return_value=("ollama", engine)),
+        patch("openjarvis.intelligence.register_builtin_models"),
+        patch("openjarvis.memory.build_memory_service", return_value=None),
+        patch("openjarvis.memory.build_personal_memory_service", return_value=None),
+        patch("openjarvis.cli.ask._get_memory_backend", return_value=None),
+        patch(
+            "openjarvis.memory.context_composer.compose_configured_personal_context",
+            return_value=personal,
+        ),
+    ):
+        result = CliRunner().invoke(
+            chat,
+            ["--agent", "context_spy_chat_agent", "--model", "test-model"],
+            input="current request\n/quit\n",
+        )
+
+    assert result.exit_code == 0
+    assert [
+        (message.role, message.content)
+        for message in _ContextSpyChatAgent.contexts[0].conversation.messages
+    ] == [
+        (Role.USER, "older pending user message"),
+        (Role.USER, "newer pending user message"),
+    ]
+
+
 class TestChatCommand:
     """Test the Click command definition and help output."""
 
@@ -155,7 +208,62 @@ class TestReadInput:
 
 
 class TestChatAgents:
-    def test_direct_chat_injects_auto_memory_facts(self, tmp_path) -> None:
+    def test_canonical_profile_keeps_only_soul_for_external_provider(
+        self,
+        tmp_path,
+    ) -> None:
+        from openjarvis.memory.archive import PersonalMemoryArchive
+
+        soul = tmp_path / "SOUL.md"
+        user = tmp_path / "USER.md"
+        memory = tmp_path / "MEMORY.md"
+        facts = tmp_path / "facts.jsonl"
+        soul.write_text("SOUL MARKER", encoding="utf-8")
+        user.write_text("PRIVATE USER MARKER", encoding="utf-8")
+        memory.write_text("PRIVATE MEMORY MARKER", encoding="utf-8")
+        LocalFactStore(facts).add("PRIVATE LEGACY FACT MARKER")
+        archive = PersonalMemoryArchive(tmp_path / "personal.db")
+        archive.set_metadata("canonical_profile_active", "1")
+
+        engine = MagicMock()
+        engine.engine_id = "openai"
+        engine.generate.return_value = {"content": "safe reply"}
+        config = JarvisConfig()
+        config.intelligence.default_model = "test-model"
+        config.personal_memory.archive_path = str(archive.path)
+        config.memory.enabled = True
+        config.memory.facts_path = str(facts)
+        config.memory_files.soul_path = str(soul)
+        config.memory_files.user_path = str(user)
+        config.memory_files.memory_path = str(memory)
+
+        with (
+            patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+            patch("openjarvis.engine.get_engine", return_value=("openai", engine)),
+            patch("openjarvis.intelligence.register_builtin_models"),
+            patch("openjarvis.memory.build_memory_service", return_value=None),
+            patch("openjarvis.memory.build_personal_memory_service", return_value=None),
+            patch("openjarvis.cli.ask._get_memory_backend", return_value=None),
+            patch(
+                "openjarvis.memory.context_composer.compose_configured_personal_context"
+            ) as compose_personal,
+        ):
+            result = CliRunner().invoke(
+                chat,
+                ["--model", "test-model"],
+                input="hello\n/quit\n",
+            )
+
+        assert result.exit_code == 0
+        messages = engine.generate.call_args.args[0]
+        rendered = "\n".join(message.content for message in messages)
+        assert "SOUL MARKER" in rendered
+        assert "PRIVATE USER MARKER" not in rendered
+        assert "PRIVATE MEMORY MARKER" not in rendered
+        assert "PRIVATE LEGACY FACT MARKER" not in rendered
+        compose_personal.assert_not_called()
+
+    def test_local_direct_chat_injects_auto_memory_facts(self, tmp_path) -> None:
         facts_path = tmp_path / "facts.jsonl"
         LocalFactStore(facts_path).add(
             "The user's favorite color is blue",
@@ -173,7 +281,7 @@ class TestChatAgents:
 
         with (
             patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
-            patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
+            patch("openjarvis.engine.get_engine", return_value=("ollama", engine)),
             patch("openjarvis.intelligence.register_builtin_models"),
             patch("openjarvis.memory.build_memory_service", return_value=None),
             patch("openjarvis.cli.ask._get_memory_backend", return_value=None),

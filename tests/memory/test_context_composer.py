@@ -215,6 +215,59 @@ def test_latest_unevaluated_text_is_a_user_overlay_not_a_system_rule(tmp_path):
     assert "definitely a runner" not in context.user_overlay
 
 
+def test_recent_incomplete_user_messages_are_bounded_and_chronological(tmp_path):
+    """Restart context keeps the newest six pending user turns in order."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    for index in range(1, 9):
+        archive.record_exchange(
+            exchange_id=f"pending-{index}",
+            user_text=f"user message {index}",
+            assistant_text=f"assistant instruction {index}",
+            source="cli.chat",
+        )
+    with sqlite3.connect(archive.path) as connection:
+        for index in range(1, 9):
+            connection.execute(
+                "UPDATE conversation_exchanges SET created_at = ? WHERE id = ?",
+                (float(index), f"pending-{index}"),
+            )
+
+    context = ContextComposer(archive).compose("continue")
+
+    assert context.recent_pending_user_messages == tuple(
+        f"user message {index}" for index in range(3, 9)
+    )
+    assert "assistant instruction" not in " ".join(context.recent_pending_user_messages)
+    assert "user message" not in context.render()
+
+
+def test_completed_and_empty_user_messages_are_not_pending_dialogue(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    archive.record_exchange(
+        exchange_id="completed",
+        user_text="already evaluated",
+        assistant_text="assistant",
+        source="cli.chat",
+    )
+    assert archive.claim_candidate_job("completed") is not None
+    archive.complete_candidate_job(
+        "completed",
+        [],
+        engine_id="ollama",
+        extractor_version="v2",
+    )
+    archive.record_exchange(
+        exchange_id="legacy",
+        user_text="",
+        assistant_text="",
+        source="legacy-profile:/tmp/USER.md:1",
+    )
+
+    context = ContextComposer(archive).compose("continue")
+
+    assert context.recent_pending_user_messages == ()
+
+
 def test_pending_clarification_is_exposed_without_becoming_a_claim(tmp_path):
     archive = PersonalMemoryArchive(tmp_path / "personal.db")
     insight = archive.store_insight_candidate(
