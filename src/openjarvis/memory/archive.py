@@ -2369,24 +2369,10 @@ class PersonalMemoryArchive:
                     candidate.created_at,
                     candidate.id,
                 )
-                if candidate.kind is CandidateKind.CORRECTION:
-                    chronology_keys = active_source_keys
-                elif candidate.kind in DIRECT_RULE_KINDS:
-                    chronology_keys = {
-                        claim_id: source_key
-                        for claim_id, source_key in active_source_keys.items()
-                        if active_kinds[claim_id] in DIRECT_RULE_KINDS
-                    }
-                else:
-                    chronology_keys = {
-                        claim_id: source_key
-                        for claim_id, source_key in active_source_keys.items()
-                        if active_kinds[claim_id] is CandidateKind.CORRECTION
-                    }
                 newer_claim_ids = tuple(
                     sorted(
                         claim_id
-                        for claim_id, source_key in chronology_keys.items()
+                        for claim_id, source_key in active_source_keys.items()
                         if source_key >= candidate_source_key
                     )
                 )

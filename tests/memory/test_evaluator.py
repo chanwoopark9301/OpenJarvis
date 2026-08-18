@@ -326,6 +326,65 @@ def test_delayed_older_direct_claim_cannot_replace_newer_active_correction(
     assert archive.decision_count(subject_id=older.id) == 1
 
 
+@pytest.mark.parametrize(
+    "older_kind",
+    (CandidateKind.FACT, CandidateKind.PREFERENCE),
+)
+def test_delayed_older_direct_observation_cannot_coexist_with_newer_role(
+    tmp_path,
+    monkeypatch,
+    older_kind,
+):
+    """A retry must not revive older evidence after a newer direct identity."""
+    clock = [10.0]
+    monkeypatch.setattr(archive_module.time, "time", lambda: clock[0])
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    older = _candidate(
+        archive,
+        exchange_id="older-name",
+        user_text="Call yourself 조비서.",
+        assistant_text="Okay.",
+        draft=CandidateDraft(
+            older_kind,
+            "The assistant name is 조비서.",
+            1.0,
+            1.0,
+            subject="assistant.name",
+            evidence_excerpt="Call yourself 조비서.",
+        ),
+    )
+    clock[0] = 20.0
+    newer = _candidate(
+        archive,
+        exchange_id="newer-name",
+        user_text="Call yourself 공박사.",
+        assistant_text="Okay.",
+        draft=CandidateDraft(
+            CandidateKind.ROLE_PREFERENCE,
+            "The assistant name is 공박사.",
+            1.0,
+            1.0,
+            subject="assistant.name",
+            evidence_excerpt="Call yourself 공박사.",
+        ),
+    )
+    evaluator = MemoryEvaluator(archive)
+    clock[0] = 30.0
+    assert evaluator.evaluate(newer.id).applied is True
+
+    clock[0] = 40.0
+    delayed = evaluator.evaluate(older.id)
+
+    assert delayed.applied is False
+    assert delayed.reason_code == "stale_direct_evidence"
+    assert archive.get_candidate(older.id).status.value == "rejected"
+    assert [(claim.kind, claim.content) for claim in archive.get_active_claims()] == [
+        (CandidateKind.ROLE_PREFERENCE, "The assistant name is 공박사.")
+    ]
+    assert archive.evidence_count(candidate_id=older.id) == 0
+    assert archive.decision_count(subject_id=older.id) == 1
+
+
 def test_direct_claim_chronology_breaks_exchange_timestamp_ties_by_id(
     tmp_path,
     monkeypatch,
