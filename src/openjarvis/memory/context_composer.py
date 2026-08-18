@@ -216,6 +216,9 @@ def compose_configured_personal_context(
     selected_archive = archive or PersonalMemoryArchive(
         getattr(personal, "archive_path", "")
     )
+    canonical_profile_active = (
+        selected_archive.get_metadata("canonical_profile_active", "0") == "1"
+    )
     if mode == "active" and not selected_archive.rollout_is_active():
         return None
     started = time.perf_counter()
@@ -226,7 +229,7 @@ def compose_configured_personal_context(
         max_episodes=getattr(personal, "context_episodes", 5),
         max_raw_evidence=getattr(personal, "context_raw_evidence", 3),
     ).compose(current_user_text)
-    if mode == "shadow":
+    if mode == "shadow" and not canonical_profile_active:
         selected_archive.record_shadow_composition(
             latency_ms=(time.perf_counter() - started) * 1000,
             constraint_count=len(context.constraints),
