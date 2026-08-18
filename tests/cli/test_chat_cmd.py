@@ -17,7 +17,7 @@ from openjarvis.cli.chat_cmd import _personal_memory_status, _read_input, chat
 from openjarvis.core.config import JarvisConfig
 from openjarvis.core.events import Event, EventBus, EventType
 from openjarvis.core.registry import AgentRegistry, ToolRegistry
-from openjarvis.core.types import Role, ToolCall, ToolResult
+from openjarvis.core.types import Message, Role, ToolCall, ToolResult
 from openjarvis.memory.store import LocalFactStore
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
@@ -99,9 +99,7 @@ def run_chat_with_spy_agent(input_text: str):
 
 
 def test_agent_receives_prior_user_and_assistant_turns() -> None:
-    result, spy = run_chat_with_spy_agent(
-        "내 이름은 찬우야.\n내 이름이 뭐야?\n/quit\n"
-    )
+    result, spy = run_chat_with_spy_agent("내 이름은 찬우야.\n내 이름이 뭐야?\n/quit\n")
 
     assert result.exit_code == 0
     second_context = spy.contexts[1].conversation.messages
@@ -168,6 +166,108 @@ def test_agent_receives_pending_memory_as_user_only_dialogue() -> None:
     ]
 
 
+def test_agent_deduplicates_pending_against_live_history_by_multiplicity() -> None:
+    from openjarvis.memory.context_composer import ComposedMemoryContext
+
+    _ContextSpyChatAgent.contexts = []
+    engine = MagicMock()
+    engine.engine_id = "ollama"
+    config = JarvisConfig()
+    config.intelligence.default_model = "test-model"
+    config.agent.context_from_memory = True
+    AgentRegistry.register_value("context_spy_chat_agent", _ContextSpyChatAgent)
+    personal = ComposedMemoryContext(
+        constraints=(),
+        current_states=(),
+        schemas=(),
+        episodes=(),
+        raw_evidence=(),
+        unresolved=(),
+        user_overlay="",
+        sections=(),
+        recent_pending_user_messages=("same message", "same message", "other pending"),
+    )
+
+    with (
+        patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+        patch("openjarvis.engine.get_engine", return_value=("ollama", engine)),
+        patch("openjarvis.intelligence.register_builtin_models"),
+        patch("openjarvis.memory.build_memory_service", return_value=None),
+        patch("openjarvis.memory.build_personal_memory_service", return_value=None),
+        patch("openjarvis.cli.ask._get_memory_backend", return_value=None),
+        patch(
+            "openjarvis.memory.context_composer.compose_configured_personal_context",
+            return_value=personal,
+        ),
+    ):
+        result = CliRunner().invoke(
+            chat,
+            ["--agent", "context_spy_chat_agent", "--model", "test-model"],
+            input="same message\nnext request\n/quit\n",
+        )
+
+    assert result.exit_code == 0
+    second = _ContextSpyChatAgent.contexts[1].conversation.messages
+    pending = [
+        message.content
+        for message in second
+        if message.metadata.get("personal_memory_context") == "recent_dialogue"
+    ]
+    assert pending == ["same message", "other pending"]
+
+
+def test_direct_chat_deduplicates_pending_against_live_history() -> None:
+    from openjarvis.memory.context_composer import ComposedMemoryContext
+
+    engine = MagicMock()
+    engine.engine_id = "ollama"
+    engine.generate.return_value = {"content": "reply"}
+    config = JarvisConfig()
+    config.intelligence.default_model = "test-model"
+    config.agent.context_from_memory = True
+    personal = ComposedMemoryContext(
+        constraints=(),
+        current_states=(),
+        schemas=(),
+        episodes=(),
+        raw_evidence=(),
+        unresolved=(),
+        user_overlay="",
+        sections=(),
+        recent_pending_user_messages=("same message", "other pending"),
+    )
+    with (
+        patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+        patch("openjarvis.engine.get_engine", return_value=("ollama", engine)),
+        patch("openjarvis.intelligence.register_builtin_models"),
+        patch("openjarvis.memory.build_memory_service", return_value=None),
+        patch("openjarvis.memory.build_personal_memory_service", return_value=None),
+        patch("openjarvis.cli.ask._get_memory_backend", return_value=None),
+        patch(
+            "openjarvis.tools.storage.context.inject_context",
+            side_effect=lambda _q, messages, *_a, **_kw: messages,
+        ),
+        patch(
+            "openjarvis.memory.context_composer.compose_configured_personal_context",
+            return_value=personal,
+        ),
+    ):
+        result = CliRunner().invoke(
+            chat,
+            ["--model", "test-model"],
+            input="same message\nnext request\n/quit\n",
+        )
+
+    assert result.exit_code == 0
+    second_messages = engine.generate.call_args_list[1].args[0]
+    pending = [
+        message.content
+        for message in second_messages
+        if message.metadata.get("personal_memory_context") == "recent_dialogue"
+    ]
+    assert pending == ["other pending"]
+
+
 class TestChatCommand:
     """Test the Click command definition and help output."""
 
@@ -208,6 +308,65 @@ class TestReadInput:
 
 
 class TestChatAgents:
+    def test_registered_proactive_agent_obeys_external_prompt_boundary(
+        self,
+        tmp_path,
+    ) -> None:
+        from openjarvis.agents.proactive_agent import ProactiveAgent
+        from openjarvis.memory.archive import PersonalMemoryArchive
+
+        soul = tmp_path / "SOUL.md"
+        user = tmp_path / "USER.md"
+        memory = tmp_path / "MEMORY.md"
+        soul.write_text("SOUL MARKER", encoding="utf-8")
+        user.write_text("PRIVATE USER MARKER", encoding="utf-8")
+        memory.write_text("PRIVATE MEMORY MARKER", encoding="utf-8")
+        archive = PersonalMemoryArchive(tmp_path / "personal.db")
+        archive.set_metadata("canonical_profile_active", "1")
+        engine = MagicMock()
+        engine.engine_id = "openai"
+        engine.generate.return_value = {"content": "[]"}
+        config = JarvisConfig()
+        config.intelligence.default_model = "test-model"
+        config.personal_memory.enabled = False
+        config.personal_memory.archive_path = str(archive.path)
+        config.agent.context_from_memory = False
+        config.memory_files.soul_path = str(soul)
+        config.memory_files.user_path = str(user)
+        config.memory_files.memory_path = str(memory)
+
+        def run_with_real_prompt(self, input, context=None, **kwargs):
+            self._engine.generate(
+                [
+                    Message(role=Role.SYSTEM, content=self._build_system_prompt()),
+                    Message(role=Role.USER, content=input),
+                ],
+                model=self._model,
+            )
+            return AgentResult(content="safe reply", turns=1)
+
+        with (
+            patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+            patch("openjarvis.engine.get_engine", return_value=("openai", engine)),
+            patch("openjarvis.intelligence.register_builtin_models"),
+            patch.object(ProactiveAgent, "run", run_with_real_prompt),
+            patch("openjarvis.memory.build_memory_service", return_value=None),
+            patch("openjarvis.memory.build_personal_memory_service", return_value=None),
+        ):
+            result = CliRunner().invoke(
+                chat,
+                ["--agent", "proactive", "--model", "test-model"],
+                input="hello\n/quit\n",
+            )
+
+        assert result.exit_code == 0
+        payload = "\n".join(
+            message.content for message in engine.generate.call_args.args[0]
+        )
+        assert "SOUL MARKER" in payload
+        assert "PRIVATE USER MARKER" not in payload
+        assert "PRIVATE MEMORY MARKER" not in payload
+
     def test_canonical_profile_keeps_only_soul_for_external_provider(
         self,
         tmp_path,

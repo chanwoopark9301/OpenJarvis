@@ -39,12 +39,10 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from openjarvis.agents._stubs import AgentContext, AgentResult, ToolUsingAgent
 from openjarvis.core.config import load_config
-from openjarvis.core.paths import get_config_dir
 from openjarvis.core.registry import AgentRegistry
 from openjarvis.core.types import Message, Role, ToolCall
 from openjarvis.tools.approval_store import (
@@ -141,10 +139,6 @@ calendar duplicates — these are the items the user wants triaged.
 
 User context is provided below — use it to tailor decisions to their patterns.
 """
-
-
-def _load_md_file(path: Path) -> str:
-    return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
 def _extract_json_block(text: str) -> Optional[List[Dict[str, Any]]]:
@@ -371,21 +365,12 @@ class ProactiveAgent(ToolUsingAgent):
         return self._approval_store
 
     def _build_system_prompt(self) -> str:
-        user_md = _load_md_file(get_config_dir() / "USER.md")
-        memory_md = _load_md_file(get_config_dir() / "MEMORY.md")
         now = datetime.now()
-        context_block = ""
-        if user_md or memory_md:
-            context_block = "\n\n---\nUSER CONTEXT:\n"
-            if user_md:
-                context_block += f"\n{user_md.strip()}\n"
-            if memory_md:
-                context_block += f"\n{memory_md.strip()}\n"
-        return (
+        prompt = (
             _SYSTEM_PROMPT
             + f"\nToday is {now.strftime('%A, %B %d, %Y')} ({self._timezone})."
-            + context_block
         )
+        return self._apply_persona(prompt) or prompt
 
     def run(
         self,

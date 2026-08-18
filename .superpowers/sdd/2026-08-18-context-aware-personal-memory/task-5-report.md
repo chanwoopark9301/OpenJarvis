@@ -105,3 +105,81 @@ Implemented in the isolated `feature/developmental-personal-model` worktree base
 - The repository's full CLI suite has three environment-dependent init download-prompt failures described above; they are outside this change and reproduce independently of Task 5 paths.
 - Other prompt construction entry points (for example `ask` and server-managed agents) are outside the Task 5 file/interface brief. This task gates `chat_cmd` as specified; extending canonical-profile activation globally should be a separately tested follow-up if desired.
 - The worktree remains preserved; no push, merge, or operational activation was performed.
+
+## Fix round 1: trusted activation and shared prompt boundary
+
+### Status
+
+Remediated all nine review findings without operating the user's installed profile or archive. The implementation remains local-only and the staging command remains explicit and reversible.
+
+### RED evidence
+
+- Trusted migration/activation tests initially produced `9 failed, 10 passed, 11 deselected`. Failures demonstrated that an unrelated readable file could activate, changed backups were accepted, imports reread mutable sources, symlinks were accepted, invalid UTF-8 left a partial candidate, no trusted manifest existed, case-only changes collided, activation was unaudited, and the CLI created a missing archive before refusal.
+- Prompt/fail-closed/deduplication tests initially produced `4 failed, 1 passed, 52 deselected`. Failures demonstrated that corrupt existing archives restored static profile authority, durable pending messages duplicated live history on direct and agent paths, and `ProactiveAgent` read global USER/MEMORY instead of the shared builder.
+- The registered `jarvis chat --agent proactive` external-provider interception test failed separately because the `**kwargs` constructor was not recognized as accepting `prompt_builder`, so SOUL and the gated memory-file configuration never reached the agent.
+
+### GREEN evidence
+
+- Required migration/context/CLI/chat/privacy/proactive suite:
+  - `uv run pytest -q tests/memory/test_profile_migration.py tests/memory/test_context_composer.py tests/cli/test_memory_cmd.py tests/cli/test_chat_cmd.py tests/memory/test_developmental_memory_privacy.py tests/agents/test_proactive_agent.py`
+  - `75 passed in 0.66s`.
+- Broader memory and CLI regression suite:
+  - `uv run pytest -q tests/memory tests/cli`
+  - `828 passed, 16 skipped, 8 warnings in 12.73s`.
+- Full repository stop-on-first-failure run:
+  - `5951 passed, 70 skipped, 126 warnings` before one unrelated server-route fixture failure at `tests/server/test_personal_memory_routes.py:43` (`unsupported_by_user_evidence`).
+  - The isolated server-route file reproduces as `4 failed`; its fixture creates a direct candidate without the evidence excerpt now required by earlier developmental-memory evaluation work. Task 5 does not modify that route, evaluator, or fixture.
+- Ruff check and format check pass on all eleven changed source/test files. `git diff --check` passes.
+
+### Backup, snapshot, and staging guarantees
+
+- Staging rejects source symlinks, backup-directory symlinks, non-files, and pre-existing collision targets.
+- Every backup is created under a private archive-adjacent `.canonical-profile-backups` directory, copied with `shutil.copy2`, then restricted to mode `0600`; the directory is restricted to `0700`.
+- Candidate extraction reads the exact copied backup bytes. A source mutation immediately after `copy2` cannot change the imported candidate.
+- Every staged entry records the configured absolute source path, exact absolute backup path, and SHA-256 of the snapshot in versioned `canonical_profile_staging_manifest` metadata.
+- All snapshots are read and UTF-8 decoded before any candidate, exchange, extraction-run, or manifest write. Candidate/exchange rows and manifest publication then occur in one `BEGIN IMMEDIATE` SQLite transaction.
+- An invalid second snapshot therefore leaves no partial USER import and does not damage the prior manifest. Filesystem backup artifacts may remain for recovery, but they are not trusted or activatable unless published in the committed manifest.
+- Zero-source staging leaves an existing trusted manifest unchanged. Partial staging replaces only entries for sources actually copied and preserves the other trusted recovery entries.
+- Provenance identity hashes exact case-sensitive content plus source and line. `US` and `us` now produce distinct legacy candidates.
+
+### Activation refusal, metadata, and audit
+
+- The CLI validates the configured archive through a SQLite `mode=ro` connection before constructing `PersonalMemoryArchive`; a missing archive is refused without creating a file.
+- Read-only validation requires a regular non-symlink file, successful SQLite integrity check, and the canonical `archive_metadata` table.
+- Activation accepts only the complete ordered backup list recorded in the trusted staging manifest. An unrelated readable file, partial list, reordered list, missing file, symlink, or hash-mismatched snapshot is refused.
+- Successful activation atomically records the active flag, activation timestamp, active manifest digest, and an append-only `canonical_profile_activated` decision. Repeated activation remains auditable; it does not silently collapse into an unaudited no-op.
+- CLI output remains aggregate-only and never prints staged bullet contents or prompt payloads.
+
+### Prompt authority and privacy audit
+
+- A never-created archive remains inactive for backward compatibility. An existing archive that is unreadable, corrupt, or lacks readable activation metadata fails closed: USER/MEMORY and legacy facts do not regain prompt authority.
+- `ProactiveAgent` no longer reads global USER.md or MEMORY.md. Its specialized system prompt calls the common `_apply_persona` boundary.
+- Chat constructor inspection now treats an explicit `prompt_builder` parameter or `**kwargs` as prompt-builder-capable, covering the registered proactive class.
+- The external-provider `jarvis chat --agent proactive` interception test observes SOUL identity but no USER/MEMORY markers. Canonical personal context and pending dialogue remain local-engine-only.
+
+### Pending dialogue ordering and deduplication
+
+- Equal timestamps are ordered deterministically by exchange ID and returned chronologically.
+- Before direct or agent injection, pending user messages are compared with prior live user history using occurrence counts. Only already-represented occurrences are removed, so a legitimate repeated user message retains its remaining multiplicity.
+- The current request is excluded from deduplication, preserving a genuinely repeated current turn. Assistant and system content remain excluded from durable pending projection.
+
+### Files changed in fix round 1
+
+- `src/openjarvis/memory/profile_migration.py`
+- `src/openjarvis/memory/archive.py`
+- `src/openjarvis/core/config.py`
+- `src/openjarvis/cli/memory_cmd.py`
+- `src/openjarvis/cli/chat_cmd.py`
+- `src/openjarvis/agents/proactive_agent.py`
+- `tests/memory/test_profile_migration.py`
+- `tests/memory/test_context_composer.py`
+- `tests/cli/test_memory_cmd.py`
+- `tests/cli/test_chat_cmd.py`
+- `tests/agents/test_proactive_agent.py`
+
+### Self-review and concerns
+
+- No real installation path was staged or activated; every migration test uses a temporary directory.
+- No network provider was called; external privacy tests intercept the model payload.
+- The trusted manifest is the sole activation authority. The legacy `canonical_profile_backup_paths` value remains only as compatibility/recovery metadata and is never consulted by activation.
+- The only known regression outside the green Task 5 and broader memory/CLI suites is the pre-existing server-route fixture mismatch described above.

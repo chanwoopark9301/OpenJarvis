@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections import Counter
 from typing import List, Optional
 
 import click
@@ -40,9 +41,7 @@ def _personal_memory_status(config, personal_mode: str) -> str:
     return "active"
 
 
-def _build_chat_agent_context(
-    history: list[Message], dynamic_messages: list[Message]
-):
+def _build_chat_agent_context(history: list[Message], dynamic_messages: list[Message]):
     """Build an agent context from dynamic memory and prior dialogue."""
     from openjarvis.agents._stubs import AgentContext
 
@@ -84,6 +83,22 @@ def _prepend_pending_dialogue(
     system = [message for message in messages if message.role == Role.SYSTEM]
     dialogue = [message for message in messages if message.role != Role.SYSTEM]
     return [*system, *pending, *dialogue]
+
+
+def _deduplicate_pending_dialogue(
+    pending: list[Message], live_history: list[Message]
+) -> list[Message]:
+    """Remove only the pending occurrences already represented in live history."""
+    represented = Counter(
+        message.content for message in live_history if message.role == Role.USER
+    )
+    deduplicated: list[Message] = []
+    for message in pending:
+        if represented[message.content] > 0:
+            represented[message.content] -= 1
+        else:
+            deduplicated.append(message)
+    return deduplicated
 
 
 @click.command()
@@ -189,11 +204,8 @@ def chat(
                 kwargs: dict = {"bus": bus}
                 tool_instances = []
 
-                if (
-                    getattr(configured_cls, "accepts_tools", False)
-                    or getattr(
-                        configured_cls, "supports_managed_tool_fallback", False
-                    )
+                if getattr(configured_cls, "accepts_tools", False) or getattr(
+                    configured_cls, "supports_managed_tool_fallback", False
                 ):
                     tool_names_list = resolve_tool_names(
                         tools,
@@ -245,10 +257,17 @@ def chat(
 
                 import inspect as _inspect
 
-                if (
-                    "prompt_builder"
-                    in _inspect.signature(execution_cls.__init__).parameters
-                ):
+                constructor_parameters = _inspect.signature(
+                    execution_cls.__init__
+                ).parameters
+                accepts_prompt_builder = (
+                    "prompt_builder" in constructor_parameters
+                    or any(
+                        parameter.kind == _inspect.Parameter.VAR_KEYWORD
+                        for parameter in constructor_parameters.values()
+                    )
+                )
+                if accepts_prompt_builder:
                     from openjarvis.prompt.builder import SystemPromptBuilder
 
                     kwargs["prompt_builder"] = SystemPromptBuilder(
@@ -436,6 +455,10 @@ def chat(
                 pending_dialogue = _pending_user_dialogue_messages(
                     personal_context,
                     local_response_engine=local_response_engine,
+                )
+                pending_dialogue = _deduplicate_pending_dialogue(
+                    pending_dialogue,
+                    history[:-1],
                 )
                 base_messages = [] if agent is not None else history
                 if agent is None:

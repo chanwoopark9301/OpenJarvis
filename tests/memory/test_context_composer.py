@@ -241,6 +241,27 @@ def test_recent_incomplete_user_messages_are_bounded_and_chronological(tmp_path)
     assert "user message" not in context.render()
 
 
+def test_pending_messages_with_equal_timestamps_use_stable_exchange_order(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    for exchange_id in ("pending-a", "pending-b", "pending-c"):
+        archive.record_exchange(
+            exchange_id=exchange_id,
+            user_text=exchange_id,
+            assistant_text="assistant text",
+            source="cli.chat",
+        )
+    with sqlite3.connect(archive.path) as connection:
+        connection.execute("UPDATE conversation_exchanges SET created_at = 10")
+
+    context = ContextComposer(archive).compose("continue")
+
+    assert context.recent_pending_user_messages == (
+        "pending-a",
+        "pending-b",
+        "pending-c",
+    )
+
+
 def test_completed_and_empty_user_messages_are_not_pending_dialogue(tmp_path):
     archive = PersonalMemoryArchive(tmp_path / "personal.db")
     archive.record_exchange(
@@ -286,9 +307,7 @@ def test_pending_clarification_is_exposed_without_becoming_a_claim(tmp_path):
 
     context = ContextComposer(archive).compose("Does running affect my mood?")
 
-    assert context.unresolved == (
-        "Does this proposed pattern fit your experience?",
-    )
+    assert context.unresolved == ("Does this proposed pattern fit your experience?",)
     assert context.schemas == ()
     assert "UNRESOLVED" in context.render()
 
@@ -317,9 +336,7 @@ def test_configured_context_allows_loopback_response_engine(tmp_path):
     config.personal_memory.enabled = True
     config.personal_memory.mode = "active"
     config.personal_memory.archive_path = str(tmp_path / "personal.db")
-    PersonalMemoryArchive(tmp_path / "personal.db").set_metadata(
-        "release_ready", "1"
-    )
+    PersonalMemoryArchive(tmp_path / "personal.db").set_metadata("release_ready", "1")
 
     context = compose_configured_personal_context(
         config,
@@ -338,11 +355,14 @@ def test_active_context_refuses_unactivated_rollout(tmp_path):
     config.personal_memory.mode = "active"
     config.personal_memory.archive_path = str(tmp_path / "personal.db")
 
-    assert compose_configured_personal_context(
-        config,
-        "hello",
-        engine_key="ollama",
-    ) is None
+    assert (
+        compose_configured_personal_context(
+            config,
+            "hello",
+            engine_key="ollama",
+        )
+        is None
+    )
 
 
 def test_shadow_mode_injects_only_confirmed_direct_rules(tmp_path):

@@ -8,12 +8,33 @@ import pytest
 
 from openjarvis.agents.proactive_agent import (
     _PROACTIVE_CRON_PROMPT,
+    ProactiveAgent,
     _build_notification_channel,
     register_cron,
 )
 from openjarvis.core.registry import ChannelRegistry
 from openjarvis.scheduler.scheduler import TaskScheduler
 from openjarvis.scheduler.store import SchedulerStore
+
+
+def test_proactive_prompt_uses_shared_prompt_builder_not_global_profile(
+    tmp_path,
+):
+    class SoulOnlyBuilder:
+        def persona_sections(self):
+            return "SOUL MARKER"
+
+    (tmp_path / "USER.md").write_text("PRIVATE USER", encoding="utf-8")
+    (tmp_path / "MEMORY.md").write_text("PRIVATE MEMORY", encoding="utf-8")
+    agent = object.__new__(ProactiveAgent)
+    agent._timezone = "UTC"
+    agent._prompt_builder = SoulOnlyBuilder()
+
+    prompt = agent._build_system_prompt()
+
+    assert "SOUL MARKER" in prompt
+    assert "PRIVATE USER" not in prompt
+    assert "PRIVATE MEMORY" not in prompt
 
 
 @pytest.fixture()

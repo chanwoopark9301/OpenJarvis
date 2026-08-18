@@ -426,16 +426,25 @@ def stage_canonical_profile() -> None:
 def activate_canonical_profile_command(backup_paths: tuple[Path, ...]) -> None:
     """Stop static USER/MEMORY injection after explicit backup validation."""
     from openjarvis.memory.archive import PersonalMemoryArchive
-    from openjarvis.memory.profile_migration import activate_canonical_profile
+    from openjarvis.memory.profile_migration import (
+        activate_canonical_profile,
+        validate_local_personal_archive,
+    )
 
     config = load_config()
+    try:
+        validate_local_personal_archive(config.personal_memory.archive_path)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     archive = PersonalMemoryArchive(config.personal_memory.archive_path)
     selected_backups = backup_paths
     if not selected_backups:
         try:
-            stored = json.loads(
-                archive.get_metadata("canonical_profile_backup_paths", "[]")
+            manifest = json.loads(
+                archive.get_metadata("canonical_profile_staging_manifest", "{}")
             )
+            entries = manifest.get("entries", []) if isinstance(manifest, dict) else []
+            stored = [entry["backup_path"] for entry in entries]
         except (TypeError, ValueError, json.JSONDecodeError):
             stored = []
         if isinstance(stored, list):

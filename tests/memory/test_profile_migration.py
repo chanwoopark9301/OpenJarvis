@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -154,3 +155,181 @@ def test_staging_is_idempotent_for_the_same_profile_lines(tmp_path):
     assert first.imported == 3
     assert second.imported == 0
     assert len(archive.find_candidates(source=EvidenceSource.LEGACY_IMPORT)) == 3
+
+
+def _staging_manifest(archive: PersonalMemoryArchive) -> dict:
+    return json.loads(archive.get_metadata("canonical_profile_staging_manifest"))
+
+
+def test_activation_requires_backups_from_the_trusted_staging_manifest(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    staged = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    unrelated = tmp_path / "unrelated.backup"
+    unrelated.write_text("readable but untrusted", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="staged manifest"):
+        activate_canonical_profile(archive, backup_paths=(unrelated,))
+
+    assert archive.get_metadata("canonical_profile_active", "0") == "0"
+    activate_canonical_profile(archive, backup_paths=staged.backup_paths)
+
+
+def test_activation_rejects_a_staged_backup_snapshot_mismatch(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    staged = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    staged.backup_paths[0].write_text("changed after staging", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="snapshot"):
+        activate_canonical_profile(archive, backup_paths=staged.backup_paths)
+
+    assert archive.get_metadata("canonical_profile_active", "0") == "0"
+
+
+def test_staging_imports_exact_backup_snapshot_not_mutable_source(
+    tmp_path,
+    monkeypatch,
+):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    original_copy2 = __import__("shutil").copy2
+    copy_count = 0
+
+    def mutate_after_copy(source, target):
+        nonlocal copy_count
+        copied = original_copy2(source, target)
+        copy_count += 1
+        if copy_count == 1:
+            Path(source).write_text("- MUTATED LIVE SOURCE", encoding="utf-8")
+        return copied
+
+    monkeypatch.setattr(
+        "openjarvis.memory.profile_migration.shutil.copy2", mutate_after_copy
+    )
+
+    LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    contents = [candidate.content for candidate in archive.find_candidates()]
+    assert "Prefers concise replies" in contents
+    assert "MUTATED LIVE SOURCE" not in contents
+
+
+def test_staging_rejects_symlink_source_without_importing(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    real_user, memory_path = _legacy_files(tmp_path)
+    linked_user = tmp_path / "LINKED_USER.md"
+    linked_user.symlink_to(real_user)
+
+    with pytest.raises(ValueError, match="symlink"):
+        LegacyProfileMigrator(archive).stage(linked_user, memory_path)
+
+    assert archive.find_candidates() == []
+    assert archive.get_metadata("canonical_profile_staging_manifest", "") == ""
+
+
+def test_staging_rejects_backup_destination_collision_without_overwrite(
+    tmp_path,
+    monkeypatch,
+):
+    class FixedUuid:
+        hex = "fixed"
+
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    backup_dir = tmp_path / ".canonical-profile-backups"
+    backup_dir.mkdir()
+    collision = backup_dir / "USER.md.fixed.backup"
+    collision.write_text("must remain", encoding="utf-8")
+    monkeypatch.setattr(
+        "openjarvis.memory.profile_migration.uuid.uuid4", lambda: FixedUuid()
+    )
+
+    with pytest.raises(ValueError, match="collision"):
+        LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    assert collision.read_text(encoding="utf-8") == "must remain"
+    assert archive.find_candidates() == []
+
+
+def test_invalid_utf8_staging_is_atomic(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path = tmp_path / "USER.md"
+    memory_path = tmp_path / "MEMORY.md"
+    user_path.write_text("- valid candidate", encoding="utf-8")
+    memory_path.write_bytes(b"- invalid \xff")
+
+    with pytest.raises(UnicodeError):
+        LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    assert archive.find_candidates() == []
+    assert archive.get_metadata("canonical_profile_staging_manifest", "") == ""
+
+
+def test_repeated_zero_and_partial_staging_preserves_recovery_manifest(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    migrator = LegacyProfileMigrator(archive)
+    migrator.stage(user_path, memory_path)
+    original = _staging_manifest(archive)
+    user_path.unlink()
+    memory_path.unlink()
+
+    assert migrator.stage(user_path, memory_path).backup_paths == ()
+    assert _staging_manifest(archive) == original
+
+    user_path.write_text("- new user snapshot", encoding="utf-8")
+    partial = migrator.stage(user_path, memory_path)
+    merged = _staging_manifest(archive)
+    assert len(partial.backup_paths) == 1
+    assert {entry["source_path"] for entry in merged["entries"]} == {
+        str(user_path.resolve()),
+        str(memory_path.resolve()),
+    }
+
+
+def test_legacy_candidate_identity_is_case_sensitive(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path = tmp_path / "USER.md"
+    memory_path = tmp_path / "MEMORY.md"
+    user_path.write_text("- US", encoding="utf-8")
+    migrator = LegacyProfileMigrator(archive)
+    migrator.stage(user_path, memory_path)
+    user_path.write_text("- us", encoding="utf-8")
+
+    migrator.stage(user_path, memory_path)
+
+    assert [candidate.content for candidate in archive.find_candidates()] == [
+        "US",
+        "us",
+    ]
+
+
+def test_repeated_activation_is_audited(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    backups = LegacyProfileMigrator(archive).stage(user_path, memory_path).backup_paths
+
+    activate_canonical_profile(archive, backup_paths=backups)
+    activate_canonical_profile(archive, backup_paths=backups)
+
+    assert archive.decision_count(subject_id="canonical_profile") == 2
+
+
+def test_existing_corrupt_archive_fails_closed_for_static_profile(tmp_path):
+    archive_path = tmp_path / "corrupt.db"
+    archive_path.write_bytes(b"not sqlite")
+    user_path, memory_path = _legacy_files(tmp_path)
+    config = JarvisConfig()
+    config.personal_memory.archive_path = str(archive_path)
+    original = MemoryFilesConfig(
+        soul_path=str(tmp_path / "SOUL.md"),
+        user_path=str(user_path),
+        memory_path=str(memory_path),
+    )
+
+    effective = effective_chat_memory_files(config, original)
+
+    assert effective.soul_path == original.soul_path
+    assert effective.user_path == ""
+    assert effective.memory_path == ""

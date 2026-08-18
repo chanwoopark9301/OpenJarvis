@@ -1534,11 +1534,13 @@ def canonical_profile_is_active(config: object, archive: object | None = None) -
                 ).fetchone()
             return row is not None and str(row[0]) == "1"
         except (OSError, ValueError, sqlite3.Error):
-            return False
+            # An archive that has existed but can no longer be trusted must
+            # never restore legacy profile authority.
+            return True
     try:
         return selected_archive.get_metadata("canonical_profile_active", "0") == "1"
     except (AttributeError, OSError):
-        return False
+        return True
 
 
 def effective_chat_memory_files(

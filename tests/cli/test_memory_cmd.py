@@ -239,9 +239,11 @@ def test_activate_canonical_profile_cli_refuses_without_staging(
     monkeypatch,
 ):
     from openjarvis.core.config import JarvisConfig
+    from openjarvis.memory.archive import PersonalMemoryArchive
 
     config = JarvisConfig()
     config.personal_memory.archive_path = str(tmp_path / "personal.db")
+    PersonalMemoryArchive(config.personal_memory.archive_path)
     mod = importlib.import_module("openjarvis.cli.memory_cmd")
     monkeypatch.setattr(mod, "load_config", lambda: config)
 
@@ -249,3 +251,22 @@ def test_activate_canonical_profile_cli_refuses_without_staging(
 
     assert result.exit_code != 0
     assert "backup" in result.output.lower()
+
+
+def test_activate_canonical_profile_cli_missing_archive_does_not_create_it(
+    tmp_path,
+    monkeypatch,
+):
+    from openjarvis.core.config import JarvisConfig
+
+    config = JarvisConfig()
+    archive_path = tmp_path / "missing.db"
+    config.personal_memory.archive_path = str(archive_path)
+    mod = importlib.import_module("openjarvis.cli.memory_cmd")
+    monkeypatch.setattr(mod, "load_config", lambda: config)
+
+    result = CliRunner().invoke(cli, ["memory", "activate-canonical-profile"])
+
+    assert result.exit_code != 0
+    assert "archive" in result.output.lower()
+    assert not archive_path.exists()

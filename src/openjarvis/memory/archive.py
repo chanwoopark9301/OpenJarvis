@@ -551,6 +551,124 @@ class PersonalMemoryArchive:
                 (key, value),
             )
 
+    def stage_profile_candidates(
+        self,
+        records: Sequence[tuple[str, str, CandidateDraft]],
+        *,
+        metadata: dict[str, str],
+    ) -> tuple[int, int]:
+        """Atomically stage legacy candidates and publish recovery metadata."""
+        now = time.time()
+        imported = 0
+        skipped = 0
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for exchange_id, provenance, draft in records:
+                existing = connection.execute(
+                    "SELECT 1 FROM conversation_exchanges WHERE id = ?",
+                    (exchange_id,),
+                ).fetchone()
+                if existing is not None:
+                    skipped += 1
+                    continue
+                record_time = now + (imported * 0.000001)
+                connection.execute(
+                    """
+                    INSERT INTO conversation_exchanges (
+                      id, created_at, archived_at, source, agent_id, session_id,
+                      user_text, assistant_text, content_hash, candidate_state,
+                      candidate_attempts, candidate_extractor_version
+                    ) VALUES (?, ?, ?, ?, '', '', '', '', ?, 'complete', 1, ?)
+                    """,
+                    (
+                        exchange_id,
+                        record_time,
+                        record_time,
+                        provenance,
+                        self._content_hash("", "", provenance, "", ""),
+                        "legacy-profile-v1",
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO memory_candidates (
+                      id, exchange_id, kind, content, evidence_excerpt, importance,
+                      confidence, status, engine_id, extractor_version, source,
+                      temporal_scope, subject, target_claim_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        exchange_id,
+                        draft.kind,
+                        draft.content,
+                        draft.evidence_excerpt,
+                        draft.importance,
+                        draft.confidence,
+                        "legacy-profile-stage",
+                        "legacy-profile-v1",
+                        draft.source,
+                        draft.temporal_scope,
+                        draft.subject,
+                        draft.target_claim_id,
+                        record_time,
+                        record_time,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO candidate_extraction_runs (
+                      exchange_id, extractor_version, candidate_count, completed_at
+                    ) VALUES (?, 'legacy-profile-v1', 1, ?)
+                    """,
+                    (exchange_id, record_time),
+                )
+                imported += 1
+            for key, value in metadata.items():
+                connection.execute(
+                    """
+                    INSERT INTO archive_metadata(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, value),
+                )
+        return imported, skipped
+
+    def mark_canonical_profile_active(self, *, manifest_sha256: str) -> None:
+        """Activate canonical profile authority and append an audit decision."""
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for key, value in (
+                ("canonical_profile_active", "1"),
+                ("canonical_profile_activated_at", str(now)),
+                ("canonical_profile_active_manifest_sha256", manifest_sha256),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO archive_metadata(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, value),
+                )
+            connection.execute(
+                """
+                INSERT INTO memory_decisions (
+                  id, subject_id, subject_type, operation, reason_code,
+                  affected_ids_json, details_json, created_at
+                ) VALUES (?, 'canonical_profile', 'rollout', 'no_op',
+                          'canonical_profile_activated', '[]', ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    json.dumps(
+                        {"manifest_sha256": manifest_sha256},
+                        separators=(",", ":"),
+                    ),
+                    now,
+                ),
+            )
+
     def record_shadow_composition(
         self,
         *,
@@ -579,15 +697,15 @@ class PersonalMemoryArchive:
                 float(metrics.get("latency_ms_max", 0.0)),
                 max(0.0, float(latency_ms)),
             )
-            metrics["constraint_items"] = int(
-                metrics.get("constraint_items", 0)
-            ) + max(0, int(constraint_count))
+            metrics["constraint_items"] = int(metrics.get("constraint_items", 0)) + max(
+                0, int(constraint_count)
+            )
             metrics["schema_items"] = int(metrics.get("schema_items", 0)) + max(
                 0, int(schema_count)
             )
-            metrics["episode_items"] = int(
-                metrics.get("episode_items", 0)
-            ) + max(0, int(episode_count))
+            metrics["episode_items"] = int(metrics.get("episode_items", 0)) + max(
+                0, int(episode_count)
+            )
             metrics["raw_evidence_items"] = int(
                 metrics.get("raw_evidence_items", 0)
             ) + max(0, int(raw_evidence_count))
@@ -1506,12 +1624,8 @@ class PersonalMemoryArchive:
             scope=str(row["scope"]),
             operation=AdaptationOperation(str(row["operation"])),
             state=InsightState(str(row["state"])),
-            support_evidence_ids=tuple(
-                json.loads(str(row["support_evidence_json"]))
-            ),
-            counter_evidence_ids=tuple(
-                json.loads(str(row["counter_evidence_json"]))
-            ),
+            support_evidence_ids=tuple(json.loads(str(row["support_evidence_json"]))),
+            counter_evidence_ids=tuple(json.loads(str(row["counter_evidence_json"]))),
             created_at=float(row["created_at"]),
             requires_user_confirmation=bool(row["requires_user_confirmation"]),
             uncertainties=tuple(json.loads(str(row["uncertainties_json"]))),
@@ -1909,9 +2023,7 @@ class PersonalMemoryArchive:
                 schema_id = str(uuid.uuid4())
                 version_number = 1
                 maturity = (
-                    SchemaMaturity.STABLE
-                    if user_confirmed
-                    else SchemaMaturity.EMERGING
+                    SchemaMaturity.STABLE if user_confirmed else SchemaMaturity.EMERGING
                 )
                 connection.execute(
                     """
