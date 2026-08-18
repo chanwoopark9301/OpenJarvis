@@ -9,6 +9,49 @@ from openjarvis.core.registry import ToolRegistry
 from openjarvis.tools.web_search import WebSearchTool
 
 
+def mock_geocoder_and_forecast(monkeypatch, *, place: str, temperature: float):
+    geocoding_response = MagicMock()
+    geocoding_response.raise_for_status.return_value = None
+    geocoding_response.json.return_value = [
+        {
+            "name": place,
+            "display_name": f"{place}, 경기도, 대한민국",
+            "lat": "37.42889",
+            "lon": "126.98917",
+        }
+    ]
+    weather_response = MagicMock()
+    weather_response.raise_for_status.return_value = None
+    weather_response.json.return_value = {
+        "current_units": {
+            "temperature_2m": "°C",
+            "apparent_temperature": "°C",
+            "precipitation": "mm",
+            "wind_speed_10m": "km/h",
+        },
+        "current": {
+            "time": "2026-08-18T20:15",
+            "temperature_2m": temperature,
+            "apparent_temperature": 29.4,
+            "precipitation": 0.0,
+            "weather_code": 2,
+            "wind_speed_10m": 8.2,
+        },
+    }
+    monkeypatch.setattr(
+        "httpx.get", MagicMock(side_effect=[geocoding_response, weather_response])
+    )
+    monkeypatch.setattr(
+        WebSearchTool,
+        "_duckduckgo_search",
+        MagicMock(
+            return_value=(
+                "### fallback\nSource: https://example.com\nSummary: link snippet"
+            )
+        ),
+    )
+
+
 class TestWebSearchTool:
     def test_spec_name_and_category(self):
         tool = WebSearchTool(api_key="test-key")
@@ -29,12 +72,29 @@ class TestWebSearchTool:
         result = tool.execute(query="")
         assert result.success is False
         assert "No query" in result.content
+        assert result.metadata["mode"] == "search"
+        assert result.metadata["engine"] == "tavily"
+        assert result.metadata["content_available"] is True
+        assert result.metadata["retrieved_at"]
 
     def test_execute_no_query_param(self):
         tool = WebSearchTool(api_key="test-key")
         result = tool.execute()
         assert result.success is False
         assert "No query" in result.content
+
+    def test_korean_weather_without_administrative_suffix_uses_structured_data(
+        self, monkeypatch
+    ):
+        mock_geocoder_and_forecast(monkeypatch, place="과천시", temperature=24.7)
+        result = WebSearchTool().execute(query="과천 오늘 날씨")
+        assert result.metadata["engine"] == "open-meteo"
+        assert "기온 24.7°C" in result.content
+
+    def test_spec_tells_model_it_can_fetch_a_result_url(self):
+        description = WebSearchTool().spec.description
+        assert "public URL" in description
+        assert "fetch" in description
 
     def test_korean_current_weather_uses_structured_public_data(self, monkeypatch):
         geocoding_response = MagicMock()
@@ -74,6 +134,10 @@ class TestWebSearchTool:
 
         assert result.success is True
         assert result.metadata["engine"] == "open-meteo"
+        assert result.metadata["mode"] == "search"
+        assert result.metadata["content_available"] is True
+        assert result.metadata["retrieved_at"]
+        assert result.metadata["source"].startswith("https://api.open-meteo.com/")
         assert "경기도 과천시 현재 날씨" in result.content
         assert "기온 24.7°C" in result.content
         assert "체감 기온 29.4°C" in result.content
@@ -81,17 +145,13 @@ class TestWebSearchTool:
         assert "Source: https://api.open-meteo.com/" in result.content
         assert get.call_count == 2
 
-    def test_structured_weather_failure_falls_back_to_normal_search(
-        self, monkeypatch
-    ):
+    def test_structured_weather_failure_falls_back_to_normal_search(self, monkeypatch):
         monkeypatch.setattr("httpx.get", MagicMock(side_effect=OSError("offline")))
         monkeypatch.setattr(
             WebSearchTool,
             "_duckduckgo_search",
             MagicMock(
-                return_value=(
-                    "### fallback\nSource: https://example.com\nSummary: ok"
-                )
+                return_value=("### fallback\nSource: https://example.com\nSummary: ok")
             ),
         )
 
@@ -105,6 +165,13 @@ class TestWebSearchTool:
     def test_execute_no_api_key(self, monkeypatch):
         """When no API key, falls back to DuckDuckGo."""
         tool = WebSearchTool(api_key=None)
+        monkeypatch.setattr(
+            tool,
+            "_duckduckgo_search",
+            MagicMock(
+                return_value="### fallback\nSource: https://example.com\nSummary: ok"
+            ),
+        )
         with patch.dict("os.environ", {}, clear=True):
             tool._api_key = None
             monkeypatch.delitem(sys.modules, "tavily", raising=False)
@@ -145,6 +212,13 @@ class TestWebSearchTool:
             return original_import(name, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "__import__", _mock_import)
+        monkeypatch.setattr(
+            WebSearchTool,
+            "_duckduckgo_search",
+            MagicMock(
+                return_value="### fallback\nSource: https://example.com\nSummary: ok"
+            ),
+        )
 
         tool = WebSearchTool(api_key="test-key")
         result = tool.execute(query="test query")
@@ -152,6 +226,11 @@ class TestWebSearchTool:
         assert "Result 1" in result.content
         assert "Result 2" in result.content
         assert result.metadata["num_results"] == 2
+        assert result.metadata["mode"] == "search"
+        assert result.metadata["engine"] == "tavily"
+        assert result.metadata["content_available"] is True
+        assert result.metadata["retrieved_at"]
+        assert result.content.startswith("UNTRUSTED PUBLIC WEB DATA.")
 
     def test_execute_tavily_error(self, monkeypatch):
         """When Tavily errors (any error), falls back to DuckDuckGo."""
@@ -175,6 +254,13 @@ class TestWebSearchTool:
             return original_import(name, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "__import__", _mock_import)
+        monkeypatch.setattr(
+            WebSearchTool,
+            "_duckduckgo_search",
+            MagicMock(
+                return_value="### fallback\nSource: https://example.com\nSummary: ok"
+            ),
+        )
 
         tool = WebSearchTool(api_key="test-key")
         result = tool.execute(query="test query")
@@ -213,6 +299,10 @@ class TestWebSearchTool:
         assert "DDG Result 2" in result.content
         assert "https://example.com/1" in result.content
         assert result.metadata["engine"] == "duckduckgo"
+        assert result.metadata["mode"] == "search"
+        assert result.metadata["content_available"] is True
+        assert result.metadata["retrieved_at"]
+        assert result.content.startswith("UNTRUSTED PUBLIC WEB DATA.")
 
     def test_duckduckgo_uses_korean_region_for_korean_query(self, monkeypatch):
         mock_ddgs = MagicMock()
@@ -286,6 +376,13 @@ class TestWebSearchTool:
             return original_import(name, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "__import__", _mock_import)
+        monkeypatch.setattr(
+            WebSearchTool,
+            "_duckduckgo_search",
+            MagicMock(
+                return_value="### fallback\nSource: https://example.com\nSummary: ok"
+            ),
+        )
 
         tool = WebSearchTool(api_key="test-key")
         result = tool.execute(query="test query")
@@ -316,6 +413,10 @@ class TestWebSearchTool:
         result = tool.execute(query="obscure query")
         assert result.success is True
         assert result.content == "No results found."
+        assert result.metadata["mode"] == "search"
+        assert result.metadata["engine"] == "tavily"
+        assert result.metadata["content_available"] is False
+        assert result.metadata["retrieved_at"]
 
     def test_tool_id(self):
         tool = WebSearchTool(api_key="test-key")
@@ -548,6 +649,11 @@ class TestExecuteWithUrl:
         assert result.success is True
         assert "Page content here" in result.content
         assert result.metadata.get("mode") == "fetch"
+        assert result.metadata["engine"] == "http"
+        assert result.metadata["source"] == "https://example.com/article"
+        assert result.metadata["content_available"] is True
+        assert result.metadata["retrieved_at"]
+        assert result.content.startswith("UNTRUSTED PUBLIC WEB DATA.")
 
     def test_execute_with_embedded_url(self, monkeypatch):
         """When query contains a URL within text, detect and fetch it."""
@@ -579,6 +685,10 @@ class TestExecuteWithUrl:
         result = tool.execute(query="http://169.254.169.254/metadata")
         assert result.success is False
         assert "private IP blocked" in result.content
+        assert result.metadata["mode"] == "fetch"
+        assert result.metadata["engine"] == "http"
+        assert result.metadata["content_available"] is True
+        assert result.metadata["retrieved_at"]
 
     def test_execute_url_fetch_failure(self, monkeypatch):
         """URL fetch failure returns error result."""
@@ -595,3 +705,7 @@ class TestExecuteWithUrl:
         result = tool.execute(query="https://example.com/broken")
         assert result.success is False
         assert "Failed to fetch URL" in result.content
+        assert result.metadata["mode"] == "fetch"
+        assert result.metadata["engine"] == "http"
+        assert result.metadata["content_available"] is True
+        assert result.metadata["retrieved_at"]
