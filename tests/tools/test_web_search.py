@@ -94,6 +94,14 @@ class TestWebSearchTool:
         assert result.metadata["engine"] == "open-meteo"
         assert "기온 24.7°C" in result.content
 
+    def test_model_generated_korean_weather_connective_uses_structured_data(
+        self, monkeypatch
+    ):
+        mock_geocoder_and_forecast(monkeypatch, place="과천시", temperature=24.7)
+        result = WebSearchTool().execute(query="과천시 오늘의 날씨")
+        assert result.metadata["engine"] == "open-meteo"
+        assert "기온 24.7°C" in result.content
+
     def test_spec_tells_model_it_can_fetch_a_result_url(self):
         description = WebSearchTool().spec.description
         assert "public URL" in description

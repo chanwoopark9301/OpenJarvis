@@ -19,9 +19,9 @@ _NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 _OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 _KOREAN_WEATHER_QUERY = re.compile(
     r"(?P<place>(?:(?:[가-힣]{2,}(?:도|시|군|구))\s+){0,2}"
-    r"(?!(?:현재|오늘|내일|모레|이번(?:\s*주)?|주말|전국)(?:\s|날씨))"
+    r"(?!(?:현재|오늘(?:의)?|내일|모레|이번(?:\s*주)?|주말|전국)(?:\s|날씨))"
     r"[가-힣]{2,}(?:도|시|군|구)?)"
-    r"\s*(?:현재|오늘)?\s*날씨"
+    r"\s*(?:현재|오늘(?:의)?)?\s*날씨"
 )
 _REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 _MAX_REDIRECTS = 5
