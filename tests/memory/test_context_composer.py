@@ -45,6 +45,7 @@ def _accept_claim(
                 1.0,
                 temporal_scope=temporal_scope,
                 subject=subject,
+                evidence_excerpt=content,
             )
         ],
         engine_id="ollama",
@@ -72,6 +73,47 @@ def test_context_budget_and_direct_rule_order(tmp_path):
     assert len(context.constraints) == 5
     assert context.sections[0].name == "direct_constraints"
     assert context.sections[0].items == context.constraints
+
+
+def test_context_omits_superseded_name_and_includes_subject_correction(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    old_claim = _accept_claim(
+        archive,
+        index=1,
+        kind=CandidateKind.ROLE_PREFERENCE,
+        content="The assistant name is 조비서.",
+        subject="assistant.name",
+    )
+    archive.record_exchange(
+        exchange_id="name-correction",
+        user_text="아니, 공박사라고.",
+        assistant_text="알겠습니다.",
+        source="test",
+        session_id="session-2",
+    )
+    assert archive.claim_candidate_job("name-correction") is not None
+    correction = archive.complete_candidate_job(
+        "name-correction",
+        [
+            CandidateDraft(
+                CandidateKind.CORRECTION,
+                "The assistant name is 공박사.",
+                1.0,
+                1.0,
+                subject="assistant.name",
+                evidence_excerpt="공박사라고.",
+            )
+        ],
+        engine_id="ollama",
+        extractor_version="v2",
+    )[0]
+
+    result = MemoryEvaluator(archive).evaluate(correction.id)
+    context = ContextComposer(archive).compose("What is your name?")
+
+    assert result.superseded_claim_ids == (old_claim.id,)
+    assert context.constraints == ("The assistant name is 공박사.",)
+    assert "The assistant name is 조비서." not in context.render()
 
 
 def test_current_state_is_labeled_and_not_generalized(tmp_path):

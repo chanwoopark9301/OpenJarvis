@@ -33,6 +33,7 @@ def _accepted_claim(archive: PersonalMemoryArchive, content: str):
                 1.0,
                 temporal_scope="until_changed",
                 subject="topic:timer",
+                evidence_excerpt=content,
             )
         ],
         engine_id="ollama",
@@ -84,6 +85,7 @@ def test_correction_supersedes_instead_of_rewriting(tmp_path):
     assert corrected is not None
     assert archive.get_claim(claim.id).state.value == "superseded"
     assert archive.get_claim(claim.id).content == "Do not proactively mention timers."
+    assert archive.evidence_texts(corrected.evidence_ids) == (replacement,)
     assert ContextComposer(archive).compose("hello").constraints == (replacement,)
 
 

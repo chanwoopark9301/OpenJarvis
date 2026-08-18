@@ -79,6 +79,68 @@ def test_new_user_correction_supersedes_its_explicit_target():
     assert result.requires_user_confirmation is False
 
 
+def test_correction_without_target_supersedes_active_direct_claims_in_subject():
+    """Removing the kind gate could make any same-subject statement destructive."""
+    result = SchemaAdaptationEngine().decide(
+        candidate=CandidateDraft(
+            CandidateKind.CORRECTION,
+            "The assistant name is 공박사.",
+            1.0,
+            1.0,
+            subject="assistant.name",
+        ),
+        active_claims=[
+            _claim(
+                "old-name",
+                "The assistant name is 조비서.",
+                kind=CandidateKind.ROLE_PREFERENCE,
+                subject_scope="assistant.name",
+            ),
+            _claim(
+                "other-subject",
+                "Keep replies concise.",
+                kind=CandidateKind.ROLE_PREFERENCE,
+                subject_scope="response_style",
+            ),
+            _claim(
+                "same-subject-fact",
+                "The user coined an assistant nickname.",
+                kind=CandidateKind.FACT,
+                subject_scope="assistant.name",
+            ),
+        ],
+        related_schemas=[],
+    )
+
+    assert result.operation is AdaptationOperation.ACCOMMODATE_SUPERSEDE
+    assert result.superseded_claim_ids == ("old-name",)
+
+
+def test_non_correction_with_same_subject_does_not_implicitly_supersede():
+    """Correction-like wording cannot replace the model's typed correction label."""
+    result = SchemaAdaptationEngine().decide(
+        candidate=CandidateDraft(
+            CandidateKind.ROLE_PREFERENCE,
+            "Correction: the assistant name is 공박사.",
+            1.0,
+            1.0,
+            subject="assistant.name",
+        ),
+        active_claims=[
+            _claim(
+                "old-name",
+                "The assistant name is 조비서.",
+                kind=CandidateKind.ROLE_PREFERENCE,
+                subject_scope="assistant.name",
+            )
+        ],
+        related_schemas=[],
+    )
+
+    assert result.operation is AdaptationOperation.ACCOMMODATE_CREATE
+    assert result.superseded_claim_ids == ()
+
+
 def test_unrelated_generic_direct_rules_do_not_supersede_each_other():
     """A generic extractor subject must not erase a different direct rule."""
     result = SchemaAdaptationEngine().decide(

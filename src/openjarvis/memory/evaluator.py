@@ -2,27 +2,12 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any
 
 from openjarvis.memory.adaptation import SchemaAdaptationEngine
 from openjarvis.memory.archive import PersonalMemoryArchive
 from openjarvis.memory.personal_models import AdaptationOperation, MemoryCandidate
-
-_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
-_LOW_INFORMATION_WORDS = frozenset(
-    {"a", "an", "and", "i", "is", "me", "my", "the", "to", "user"}
-)
-_NEGATION_MARKERS = frozenset(
-    {"not", "no", "never", "dont", "cannot", "않", "안", "말", "못"}
-)
-_ENGLISH_NEGATION_RE = re.compile(
-    r"\b(?:not|no|never|cannot|can't|cant|don't|dont|doesn't|doesnt|"
-    r"didn't|didnt|won't|wont)\b",
-    re.IGNORECASE,
-)
-_KOREAN_NEGATION_RE = re.compile(r"(?:안\s|못\s|않|말(?:아|라|고|자)|없)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,45 +136,13 @@ class MemoryEvaluator:
             target_claim_id=candidate.target_claim_id,
         )
 
-    @classmethod
+    @staticmethod
     def _supported_by_user_text(
-        cls,
         candidate: MemoryCandidate,
         user_text: str,
     ) -> bool:
-        candidate_normalized = " ".join(cls._tokens(candidate.content))
-        user_normalized = " ".join(cls._tokens(user_text))
-        if not candidate_normalized or not user_normalized:
-            return False
-        candidate_negated = cls._has_negation(candidate.content)
-        user_negated = cls._has_negation(user_text)
-        if candidate_negated != user_negated:
-            return False
-        if candidate_normalized in user_normalized:
-            return True
-        candidate_tokens = set(candidate_normalized.split())
-        user_tokens = set(user_normalized.split())
-        meaningful_candidate = candidate_tokens - _LOW_INFORMATION_WORDS
-        meaningful_user = user_tokens - _LOW_INFORMATION_WORDS
-        if not meaningful_candidate:
-            return False
-        overlap = meaningful_candidate & meaningful_user
-        return len(overlap) / len(meaningful_candidate) >= 0.5
-
-    @staticmethod
-    def _has_negation(text: str) -> bool:
-        return bool(
-            _ENGLISH_NEGATION_RE.search(text)
-            or _KOREAN_NEGATION_RE.search(text)
-            or any(
-                token in _NEGATION_MARKERS
-                for token in MemoryEvaluator._tokens(text)
-            )
-        )
-
-    @staticmethod
-    def _tokens(text: str) -> list[str]:
-        return [match.group(0).casefold() for match in _WORD_RE.finditer(text)]
+        excerpt = candidate.evidence_excerpt
+        return bool(excerpt) and excerpt in user_text
 
 
 __all__ = ["EvaluationResult", "MemoryEvaluator"]

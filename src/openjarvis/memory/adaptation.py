@@ -157,13 +157,22 @@ class SchemaAdaptationEngine:
         active_claims: Sequence[PersonalClaim],
     ) -> AdaptationDecision:
         explicit_target = candidate.target_claim_id
-        superseded = tuple(
-            claim.id
-            for claim in active_claims
-            if claim.state.value == "active"
-            and bool(explicit_target)
-            and claim.id == explicit_target
-        )
+        if explicit_target:
+            superseded = tuple(
+                claim.id
+                for claim in active_claims
+                if claim.state.value == "active" and claim.id == explicit_target
+            )
+        elif candidate.kind is CandidateKind.CORRECTION:
+            superseded = tuple(
+                claim.id
+                for claim in active_claims
+                if claim.state.value == "active"
+                and claim.kind in DIRECT_RULE_KINDS
+                and claim.subject_scope == candidate.subject
+            )
+        else:
+            superseded = ()
         if superseded:
             return AdaptationDecision(
                 AdaptationOperation.ACCOMMODATE_SUPERSEDE,

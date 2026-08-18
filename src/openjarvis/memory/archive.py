@@ -2112,7 +2112,7 @@ class PersonalMemoryArchive:
                     candidate.exchange_id,
                     candidate.id,
                     candidate.source.value,
-                    candidate.content,
+                    candidate.evidence_excerpt,
                     candidate.temporal_scope,
                     candidate.subject,
                     str(exchange["session_id"]),

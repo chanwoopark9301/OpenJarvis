@@ -105,7 +105,15 @@ def _evidence_ids(archive: PersonalMemoryArchive) -> set[str]:
         assert archive.claim_candidate_job(exchange_id) is not None
         candidate = archive.complete_candidate_job(
             exchange_id,
-            [CandidateDraft(CandidateKind.FACT, text, 0.8, 0.9)],
+            [
+                CandidateDraft(
+                    CandidateKind.FACT,
+                    text,
+                    0.8,
+                    0.9,
+                    evidence_excerpt=text,
+                )
+            ],
             engine_id="ollama",
             extractor_version="test",
         )[0]

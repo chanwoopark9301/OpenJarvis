@@ -37,6 +37,7 @@ def _apply(archive: PersonalMemoryArchive, item: dict[str, str]) -> None:
                 1.0,
                 temporal_scope=item["scope"],
                 subject=item["subject"],
+                evidence_excerpt=item["text"],
             )
         ],
         engine_id="ollama",
@@ -75,7 +76,15 @@ def test_assistant_text_never_becomes_personal_evidence(tmp_path):
     assert archive.claim_candidate_job("assistant-only") is not None
     candidate = archive.complete_candidate_job(
         "assistant-only",
-        [CandidateDraft(CandidateKind.FACT, "You are definitely a runner.", 1, 1)],
+        [
+            CandidateDraft(
+                CandidateKind.FACT,
+                "You are definitely a runner.",
+                1,
+                1,
+                evidence_excerpt="You are definitely a runner.",
+            )
+        ],
         engine_id="ollama",
         extractor_version="acceptance",
     )[0]
@@ -118,6 +127,7 @@ def test_conflicting_old_direct_rule_is_absent_immediately_after_restart(tmp_pat
                 temporal_scope="until_changed",
                 subject="topic:alpha",
                 target_claim_id=old_claim.id,
+                evidence_excerpt="Do not mention topic alpha unless I ask.",
             )
         ],
         engine_id="ollama",

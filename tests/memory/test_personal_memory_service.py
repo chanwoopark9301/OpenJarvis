@@ -359,6 +359,7 @@ def test_extraction_is_followed_by_durable_candidate_evaluation(tmp_path):
                     1.0,
                     temporal_scope="until_changed",
                     subject="topic:timers",
+                    evidence_excerpt="Do not mention timers unless I ask.",
                 )
             ]
         ),
@@ -456,7 +457,15 @@ def test_evaluation_schedules_separate_consolidation_job(tmp_path):
         tmp_path,
         EventBus(),
         _FakeExtractor(
-            [CandidateDraft("fact", "Running improved my mood today.", 0.8, 0.9)]
+            [
+                CandidateDraft(
+                    "fact",
+                    "Running improved my mood today.",
+                    0.8,
+                    0.9,
+                    evidence_excerpt="Running improved my mood today.",
+                )
+            ]
         ),
         job_handlers={"check_consolidation": handle_consolidation},
     )

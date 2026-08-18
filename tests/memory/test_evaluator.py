@@ -72,6 +72,7 @@ def test_evaluator_applies_direct_rule_and_audits_once(tmp_path):
             1.0,
             temporal_scope="until_changed",
             subject="topic:timers",
+            evidence_excerpt="Do not mention timers unless I ask.",
         ),
     )
     evaluator = MemoryEvaluator(archive, relation_classifier=_NeverCalledClassifier())
@@ -85,6 +86,9 @@ def test_evaluator_applies_direct_rule_and_audits_once(tmp_path):
     assert replay.reason_code == "candidate_already_evaluated"
     assert len(claims) == 1
     assert claims[0].content == "Do not mention timers unless I ask."
+    assert archive.evidence_texts(claims[0].evidence_ids) == (
+        "Do not mention timers unless I ask.",
+    )
     assert archive.decision_count(subject_id=candidate.id) == 1
     assert archive.evidence_count(candidate_id=candidate.id) == 1
 
@@ -102,6 +106,7 @@ def test_evaluator_rejects_assistant_only_claim(tmp_path):
             "The user enjoys ten-minute focus sessions.",
             0.8,
             0.9,
+            evidence_excerpt="You enjoy ten-minute focus sessions.",
         ),
     )
 
@@ -114,31 +119,24 @@ def test_evaluator_rejects_assistant_only_claim(tmp_path):
     assert archive.get_candidate(candidate.id).status == "rejected"
 
 
-@pytest.mark.parametrize(
-    ("user_text", "candidate_text"),
-    [
-        ("I do not like timers.", "I like timers."),
-        ("I don't like timers.", "I like timers."),
-        ("나는 달리기를 좋아하지 않아.", "나는 달리기를 좋아해."),
-    ],
-)
-def test_evaluator_rejects_negation_inversion(
+@pytest.mark.parametrize("evidence_excerpt", ["", "I like timers."])
+def test_evaluator_rejects_empty_or_unlinked_evidence_excerpt(
     tmp_path,
-    user_text,
-    candidate_text,
+    evidence_excerpt,
 ):
-    """Lexical overlap must not turn a negative statement into its opposite."""
+    """Only an exact excerpt from the linked user message is admissible evidence."""
     archive = PersonalMemoryArchive(tmp_path / "personal.db")
     candidate = _candidate(
         archive,
         exchange_id="negative",
-        user_text=user_text,
+        user_text="I do not like timers.",
         assistant_text="",
         draft=CandidateDraft(
             CandidateKind.PREFERENCE,
-            candidate_text,
+            "The user dislikes timers.",
             0.8,
             0.9,
+            evidence_excerpt=evidence_excerpt,
         ),
     )
 
@@ -146,6 +144,31 @@ def test_evaluator_rejects_negation_inversion(
 
     assert result.applied is False
     assert result.reason_code == "unsupported_by_user_evidence"
+
+
+def test_evaluator_uses_exact_user_excerpt_not_normalized_claim_text(tmp_path):
+    """Evidence must preserve what the user said, not the model's normalized claim."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    candidate = _candidate(
+        archive,
+        exchange_id="exact-excerpt",
+        user_text="공박사라고.",
+        assistant_text="알겠습니다.",
+        draft=CandidateDraft(
+            CandidateKind.ROLE_PREFERENCE,
+            "The assistant name is 공박사.",
+            1.0,
+            1.0,
+            subject="assistant.name",
+            evidence_excerpt="공박사라고.",
+        ),
+    )
+
+    result = MemoryEvaluator(archive).evaluate(candidate.id)
+    claim = archive.get_active_claims()[0]
+
+    assert result.applied is True
+    assert archive.evidence_texts(claim.evidence_ids) == ("공박사라고.",)
 
 
 def test_new_direct_rule_supersedes_explicit_target_atomically(tmp_path):
@@ -162,6 +185,7 @@ def test_new_direct_rule_supersedes_explicit_target_atomically(tmp_path):
             0.8,
             1.0,
             subject="topic:timers",
+            evidence_excerpt="Offer timers when I study.",
         ),
     )
     evaluator = MemoryEvaluator(archive)
@@ -180,6 +204,7 @@ def test_new_direct_rule_supersedes_explicit_target_atomically(tmp_path):
             1.0,
             subject="topic:timers",
             target_claim_id=old_claim.id,
+            evidence_excerpt="do not offer timers unless I ask.",
         ),
     )
 
@@ -191,6 +216,53 @@ def test_new_direct_rule_supersedes_explicit_target_atomically(tmp_path):
     assert [claim.kind for claim in archive.get_active_claims()] == [
         CandidateKind.CORRECTION
     ]
+
+
+def test_correction_supersedes_active_direct_claim_with_same_subject(tmp_path):
+    """A typed correction can replace an active direct rule without a target ID."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    first = _candidate(
+        archive,
+        exchange_id="old-name",
+        user_text="Call yourself 조비서.",
+        assistant_text="Okay.",
+        draft=CandidateDraft(
+            CandidateKind.ROLE_PREFERENCE,
+            "The assistant name is 조비서.",
+            1.0,
+            1.0,
+            subject="assistant.name",
+            evidence_excerpt="Call yourself 조비서.",
+        ),
+    )
+    evaluator = MemoryEvaluator(archive)
+    assert evaluator.evaluate(first.id).applied is True
+    old_claim = archive.get_active_claims()[0]
+    correction = _candidate(
+        archive,
+        exchange_id="new-name",
+        user_text="아니, 공박사라고.",
+        assistant_text="알겠습니다.",
+        draft=CandidateDraft(
+            CandidateKind.CORRECTION,
+            "The assistant name is 공박사.",
+            1.0,
+            1.0,
+            subject="assistant.name",
+            evidence_excerpt="공박사라고.",
+        ),
+    )
+
+    result = evaluator.evaluate(correction.id)
+    active_claim = archive.get_active_claims()[0]
+
+    assert result.applied is True
+    assert result.superseded_claim_ids == (old_claim.id,)
+    assert archive.get_claim(old_claim.id).state.value == "superseded"
+    assert active_claim.kind is CandidateKind.CORRECTION
+    assert active_claim.subject_scope == "assistant.name"
+    assert active_claim.supersedes_id == old_claim.id
+    assert archive.evidence_texts(active_claim.evidence_ids) == ("공박사라고.",)
 
 
 def test_audit_insert_failure_rolls_back_evidence_and_claim(tmp_path):
@@ -207,6 +279,7 @@ def test_audit_insert_failure_rolls_back_evidence_and_claim(tmp_path):
             0.8,
             1.0,
             subject="response_style",
+            evidence_excerpt="Keep answers short.",
         ),
     )
     with sqlite3.connect(archive.path) as connection:
@@ -242,6 +315,7 @@ def test_contradiction_challenges_schema_and_leaves_auditable_conflict(tmp_path)
                 0.8,
                 0.9,
                 subject="running_and_mood",
+                evidence_excerpt=f"Running improved my mood on day {index}.",
             ),
         )
         assert MemoryEvaluator(archive).evaluate(candidate.id).applied
@@ -269,6 +343,7 @@ def test_contradiction_challenges_schema_and_leaves_auditable_conflict(tmp_path)
             1.0,
             1.0,
             subject="running_and_mood",
+            evidence_excerpt="Running made my mood worse today.",
         ),
     )
 

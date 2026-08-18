@@ -131,6 +131,7 @@ class PersonalMemoryInspector:
                     temporal_scope=original.temporal_scope,
                     subject=original.subject_scope,
                     target_claim_id=original.id,
+                    evidence_excerpt=user_text,
                 )
             ],
             engine_id="deterministic-user-control",

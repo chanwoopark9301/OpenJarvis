@@ -100,7 +100,15 @@ def test_confirming_answer_links_user_evidence_and_resumes_subject(tmp_path):
     assert archive.claim_candidate_job("answer-exchange") is not None
     candidate = archive.complete_candidate_job(
         "answer-exchange",
-        [CandidateDraft("fact", "Yes, when I am rested.", 0.8, 1.0)],
+        [
+            CandidateDraft(
+                "fact",
+                "Yes, when I am rested.",
+                0.8,
+                1.0,
+                evidence_excerpt="Yes, when I am rested.",
+            )
+        ],
         engine_id="ollama",
         extractor_version="v2",
     )[0]

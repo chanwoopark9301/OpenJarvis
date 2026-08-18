@@ -29,6 +29,7 @@ class _Extractor:
                 0.8,
                 0.9,
                 subject="running_and_mood",
+                evidence_excerpt=exchange.user_text,
             )
         ]
 

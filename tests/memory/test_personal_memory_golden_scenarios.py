@@ -38,6 +38,7 @@ def test_direct_topic_bans_survive_related_study_conversation(tmp_path):
             0.7,
             1.0,
             subject="study_coaching",
+            evidence_excerpt="I used to ask for study plans.",
         ),
     )
     for index, (topic, content) in enumerate(
@@ -58,6 +59,7 @@ def test_direct_topic_bans_survive_related_study_conversation(tmp_path):
                 1.0,
                 temporal_scope="until_changed",
                 subject=f"topic:{topic}",
+                evidence_excerpt=content,
             ),
         )
 
@@ -83,6 +85,7 @@ def test_capability_boundary_blocks_claiming_unavailable_actions(tmp_path):
             1.0,
             temporal_scope="until_changed",
             subject="assistant_capabilities",
+            evidence_excerpt=content,
         ),
     )
 
