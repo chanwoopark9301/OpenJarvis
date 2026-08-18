@@ -113,10 +113,11 @@ class MemoryEvaluator:
                 False,
                 "candidate_already_evaluated",
             )
+        applied = bool(persisted.get("applied", True))
         return EvaluationResult(
             candidate_id,
-            True,
-            decision.reason_code,
+            applied,
+            str(persisted.get("reason_code", decision.reason_code)),
             decision_id=str(persisted["decision_id"]),
             superseded_claim_ids=tuple(persisted["superseded_claim_ids"]),
         )

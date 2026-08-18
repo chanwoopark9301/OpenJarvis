@@ -6,6 +6,7 @@ import sqlite3
 
 import pytest
 
+import openjarvis.memory.archive as archive_module
 from openjarvis.memory.adaptation import RelationProposal
 from openjarvis.memory.archive import PersonalMemoryArchive
 from openjarvis.memory.evaluator import MemoryEvaluator
@@ -263,6 +264,109 @@ def test_correction_supersedes_active_direct_claim_with_same_subject(tmp_path):
     assert active_claim.subject_scope == "assistant.name"
     assert active_claim.supersedes_id == old_claim.id
     assert archive.evidence_texts(active_claim.evidence_ids) == ("공박사라고.",)
+
+
+def test_delayed_older_direct_claim_cannot_replace_newer_active_correction(
+    tmp_path,
+    monkeypatch,
+):
+    """Retry order must not let older source evidence reverse the latest name."""
+    clock = [10.0]
+    monkeypatch.setattr(archive_module.time, "time", lambda: clock[0])
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    older = _candidate(
+        archive,
+        exchange_id="older-name",
+        user_text="Call yourself 조비서.",
+        assistant_text="Okay.",
+        draft=CandidateDraft(
+            CandidateKind.ROLE_PREFERENCE,
+            "The assistant name is 조비서.",
+            1.0,
+            1.0,
+            subject="assistant.name",
+            evidence_excerpt="Call yourself 조비서.",
+        ),
+    )
+    clock[0] = 20.0
+    newer = _candidate(
+        archive,
+        exchange_id="newer-name",
+        user_text="아니, 공박사라고.",
+        assistant_text="알겠습니다.",
+        draft=CandidateDraft(
+            CandidateKind.CORRECTION,
+            "The assistant name is 공박사.",
+            1.0,
+            1.0,
+            subject="assistant.name",
+            evidence_excerpt="공박사라고.",
+        ),
+    )
+    evaluator = MemoryEvaluator(archive)
+    clock[0] = 30.0
+    assert evaluator.evaluate(newer.id).applied is True
+
+    clock[0] = 40.0
+    delayed = evaluator.evaluate(older.id)
+
+    assert delayed.applied is False
+    assert delayed.reason_code == "stale_direct_evidence"
+    assert archive.get_candidate(older.id).status.value == "rejected"
+    active = archive.get_active_claims()
+    assert [(claim.content, claim.state.value) for claim in active] == [
+        ("The assistant name is 공박사.", "active")
+    ]
+    assert archive.evidence_count(candidate_id=older.id) == 0
+    assert archive.decision_count(subject_id=older.id) == 1
+
+
+def test_direct_claim_chronology_breaks_exchange_timestamp_ties_by_id(
+    tmp_path,
+    monkeypatch,
+):
+    """Equal source timestamps still have one stable newest exchange."""
+    clock = [10.0]
+    monkeypatch.setattr(archive_module.time, "time", lambda: clock[0])
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    earlier = _candidate(
+        archive,
+        exchange_id="a-name",
+        user_text="Call yourself 조비서.",
+        assistant_text="Okay.",
+        draft=CandidateDraft(
+            CandidateKind.CORRECTION,
+            "The assistant name is 조비서.",
+            1.0,
+            1.0,
+            subject="assistant.name",
+            evidence_excerpt="Call yourself 조비서.",
+        ),
+    )
+    later = _candidate(
+        archive,
+        exchange_id="z-name",
+        user_text="Call yourself 공박사.",
+        assistant_text="Okay.",
+        draft=CandidateDraft(
+            CandidateKind.CORRECTION,
+            "The assistant name is 공박사.",
+            1.0,
+            1.0,
+            subject="assistant.name",
+            evidence_excerpt="Call yourself 공박사.",
+        ),
+    )
+    evaluator = MemoryEvaluator(archive)
+    assert evaluator.evaluate(later.id).applied is True
+
+    delayed = evaluator.evaluate(earlier.id)
+
+    assert delayed.applied is False
+    assert delayed.reason_code == "stale_direct_evidence"
+    assert [claim.content for claim in archive.get_active_claims()] == [
+        "The assistant name is 공박사."
+    ]
 
 
 def test_audit_failure_rolls_back_selected_supersession_evidence_and_claim(tmp_path):

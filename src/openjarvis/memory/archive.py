@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from openjarvis.memory.personal_models import (
+    DIRECT_RULE_KINDS,
     AdaptationOperation,
     CandidateDraft,
     CandidateKind,
@@ -2226,11 +2227,129 @@ class PersonalMemoryArchive:
                 return None
             candidate = self._candidate_from_row(row)
             exchange = connection.execute(
-                "SELECT session_id FROM conversation_exchanges WHERE id = ?",
+                "SELECT id, created_at, session_id "
+                "FROM conversation_exchanges WHERE id = ?",
                 (candidate.exchange_id,),
             ).fetchone()
             if exchange is None:
                 raise RuntimeError("candidate evidence exchange is missing")
+
+            requested_superseded = tuple(
+                dict.fromkeys(str(value) for value in superseded_claim_ids)
+            )
+            superseded = requested_superseded
+            if (
+                candidate.kind in DIRECT_RULE_KINDS
+                and candidate.subject != "user"
+            ):
+                atomic_values = tuple(sorted(kind.value for kind in atomic_claim_kinds))
+                placeholders = ",".join("?" for _ in atomic_values)
+                active_rows = connection.execute(
+                    f"""
+                    SELECT c.id AS claim_id, c.kind AS claim_kind,
+                           COALESCE(x.created_at, c.created_at) AS exchange_created_at,
+                           COALESCE(x.id, '') AS exchange_id,
+                           COALESCE(mc.created_at, e.created_at, c.created_at)
+                               AS source_created_at,
+                           COALESCE(mc.id, e.id, c.id) AS source_id
+                    FROM personal_claims AS c
+                    LEFT JOIN claim_evidence_links AS l ON l.claim_id = c.id
+                    LEFT JOIN evidence_items AS e ON e.id = l.evidence_id
+                    LEFT JOIN conversation_exchanges AS x ON x.id = e.exchange_id
+                    LEFT JOIN memory_candidates AS mc ON mc.id = e.candidate_id
+                    WHERE c.state = 'active'
+                      AND c.subject_scope = ?
+                      AND c.kind IN ({placeholders})
+                    """,
+                    (candidate.subject, *atomic_values),
+                ).fetchall()
+                active_source_keys: dict[str, tuple[float, str, float, str]] = {}
+                active_kinds: dict[str, CandidateKind] = {}
+                for active_row in active_rows:
+                    claim_id = str(active_row["claim_id"])
+                    active_kinds[claim_id] = CandidateKind(active_row["claim_kind"])
+                    source_key = (
+                        float(active_row["exchange_created_at"]),
+                        str(active_row["exchange_id"]),
+                        float(active_row["source_created_at"]),
+                        str(active_row["source_id"]),
+                    )
+                    active_source_keys[claim_id] = max(
+                        source_key,
+                        active_source_keys.get(claim_id, source_key),
+                    )
+                candidate_source_key = (
+                    float(exchange["created_at"]),
+                    str(exchange["id"]),
+                    candidate.created_at,
+                    candidate.id,
+                )
+                chronology_keys = (
+                    active_source_keys
+                    if candidate.kind is CandidateKind.CORRECTION
+                    else {
+                        claim_id: source_key
+                        for claim_id, source_key in active_source_keys.items()
+                        if active_kinds[claim_id] in DIRECT_RULE_KINDS
+                    }
+                )
+                newer_claim_ids = tuple(
+                    sorted(
+                        claim_id
+                        for claim_id, source_key in chronology_keys.items()
+                        if source_key >= candidate_source_key
+                    )
+                )
+                if newer_claim_ids:
+                    decision_id = str(uuid.uuid4())
+                    connection.execute(
+                        """
+                        UPDATE memory_candidates
+                        SET status = 'rejected', updated_at = ?
+                        WHERE id = ? AND status = 'pending'
+                        """,
+                        (now, candidate_id),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO memory_decisions (
+                          id, subject_id, subject_type, operation, reason_code,
+                          affected_ids_json, details_json, created_at
+                        ) VALUES (?, ?, 'candidate', 'no_op',
+                                  'stale_direct_evidence', ?, '{}', ?)
+                        """,
+                        (
+                            decision_id,
+                            candidate_id,
+                            json.dumps(newer_claim_ids, separators=(",", ":")),
+                            now,
+                        ),
+                    )
+                    return {
+                        "decision_id": decision_id,
+                        "evidence_id": "",
+                        "claim_id": "",
+                        "superseded_claim_ids": (),
+                        "applied": False,
+                        "reason_code": "stale_direct_evidence",
+                    }
+                if (
+                    candidate.kind is CandidateKind.CORRECTION
+                    and not candidate.target_claim_id
+                ):
+                    superseded = tuple(
+                        sorted(
+                            claim_id
+                            for claim_id in active_source_keys
+                            if active_kinds[claim_id] in DIRECT_RULE_KINDS
+                        )
+                    )
+                else:
+                    superseded = tuple(
+                        claim_id
+                        for claim_id in requested_superseded
+                        if claim_id in active_source_keys
+                    )
 
             evidence_id = str(uuid.uuid4())
             connection.execute(
@@ -2253,9 +2372,6 @@ class PersonalMemoryArchive:
                 ),
             )
 
-            superseded = tuple(
-                dict.fromkeys(str(value) for value in superseded_claim_ids)
-            )
             for claim_id in superseded:
                 connection.execute(
                     """
@@ -2394,6 +2510,8 @@ class PersonalMemoryArchive:
             "evidence_id": evidence_id,
             "claim_id": claim_id,
             "superseded_claim_ids": superseded,
+            "applied": True,
+            "reason_code": reason_code,
         }
 
     def claim_candidate_job(self, exchange_id: str) -> ConversationExchange | None:
