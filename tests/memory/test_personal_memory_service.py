@@ -287,7 +287,58 @@ def test_startup_reprocesses_an_old_zero_candidate_completion(tmp_path):
                 """,
                 (exchange.id,),
             ).fetchone()
-        assert row == (2, "personal-memory-v5")
+        assert row == (2, "personal-memory-v6")
+    finally:
+        service.stop()
+
+
+def test_startup_reprocesses_v5_zero_candidate_with_v6_lifecycle(tmp_path):
+    """The changed proposer contract must not inherit a v5 empty completion."""
+    extractor = _FakeExtractor()
+    service = _service(tmp_path, EventBus(), extractor)
+    exchange = service.archive.record_exchange(
+        exchange_id="v5-empty-name",
+        user_text="공박사라고.",
+        assistant_text="알겠습니다.",
+        source="test",
+    )
+    assert service.archive.claim_candidate_job(exchange.id) is not None
+    service.archive.complete_candidate_job(
+        exchange.id,
+        [],
+        engine_id="ollama",
+        extractor_version="personal-memory-v5",
+    )
+
+    service.start()
+    try:
+        assert extractor.started.wait(timeout=1.0)
+        deadline = time.time() + 1.0
+        while (
+            time.time() < deadline
+            and _candidate_job_state(service.archive, exchange.id) != "complete"
+        ):
+            time.sleep(0.01)
+        with sqlite3.connect(service.archive.path) as connection:
+            exchange_row = connection.execute(
+                """
+                SELECT candidate_attempts, candidate_extractor_version
+                FROM conversation_exchanges WHERE id = ?
+                """,
+                (exchange.id,),
+            ).fetchone()
+            run_rows = connection.execute(
+                """
+                SELECT extractor_version FROM candidate_extraction_runs
+                WHERE exchange_id = ? ORDER BY extractor_version
+                """,
+                (exchange.id,),
+            ).fetchall()
+        assert exchange_row == (2, "personal-memory-v6")
+        assert run_rows == [
+            ("personal-memory-v5",),
+            ("personal-memory-v6",),
+        ]
     finally:
         service.stop()
 
