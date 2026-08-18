@@ -9,7 +9,8 @@ import re
 import sqlite3
 import stat
 import uuid
-from contextlib import ExitStack
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -390,12 +391,141 @@ def _hash_open_file(fd: int) -> str:
     return digest.hexdigest()
 
 
+def _require_same_private_identity(
+    path: Path,
+    fd: int,
+    expected: dict[str, int | str],
+    *,
+    expected_mode: int,
+    directory: bool,
+) -> None:
+    """Recheck every security-relevant field on one open descriptor."""
+    observed = _private_identity(
+        path,
+        os.fstat(fd),
+        expected_mode=expected_mode,
+        directory=directory,
+    )
+    if observed != expected:
+        raise ValueError("profile backup identity changed")
+
+
+@dataclass(frozen=True, slots=True)
+class _PinnedBackup:
+    backup: Path
+    snapshot_fd: int
+    backup_fd: int
+    snapshot_identity: dict[str, int | str]
+    backup_identity: dict[str, int | str]
+    expected_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _BackupValidation:
+    backup_root: Path
+    root_fd: int
+    root_identity: dict[str, int | str]
+    entries: tuple[_PinnedBackup, ...]
+    identities_json: str
+
+    def _check_identities(
+        self,
+        reopened_root_fd: int,
+        reopened_entries: list[tuple[int, int]],
+    ) -> None:
+        _require_same_private_identity(
+            self.backup_root,
+            self.root_fd,
+            self.root_identity,
+            expected_mode=0o700,
+            directory=True,
+        )
+        _require_same_private_identity(
+            self.backup_root,
+            reopened_root_fd,
+            self.root_identity,
+            expected_mode=0o700,
+            directory=True,
+        )
+        for pinned, (snapshot_fd, backup_fd) in zip(
+            self.entries,
+            reopened_entries,
+            strict=True,
+        ):
+            _require_same_private_identity(
+                pinned.backup.parent,
+                pinned.snapshot_fd,
+                pinned.snapshot_identity,
+                expected_mode=0o700,
+                directory=True,
+            )
+            _require_same_private_identity(
+                pinned.backup.parent,
+                snapshot_fd,
+                pinned.snapshot_identity,
+                expected_mode=0o700,
+                directory=True,
+            )
+            _require_same_private_identity(
+                pinned.backup,
+                pinned.backup_fd,
+                pinned.backup_identity,
+                expected_mode=0o600,
+                directory=False,
+            )
+            _require_same_private_identity(
+                pinned.backup,
+                backup_fd,
+                pinned.backup_identity,
+                expected_mode=0o600,
+                directory=False,
+            )
+
+    def revalidate(self) -> None:
+        """Freshly resolve and fully check every pinned recovery object."""
+        try:
+            with ExitStack() as stack:
+                reopened_root_fd = _open_directory_chain(self.backup_root, stack)
+                reopened_entries: list[tuple[int, int]] = []
+                for pinned in self.entries:
+                    snapshot_fd = _stack_fd(
+                        stack,
+                        os.open(
+                            pinned.backup.parent.name,
+                            _directory_open_flags(),
+                            dir_fd=reopened_root_fd,
+                        ),
+                    )
+                    backup_fd = _stack_fd(
+                        stack,
+                        os.open(
+                            pinned.backup.name,
+                            os.O_RDONLY | os.O_NOFOLLOW,
+                            dir_fd=snapshot_fd,
+                        ),
+                    )
+                    reopened_entries.append((snapshot_fd, backup_fd))
+
+                self._check_identities(reopened_root_fd, reopened_entries)
+                for pinned in self.entries:
+                    if _hash_open_file(pinned.backup_fd) != pinned.expected_sha256:
+                        raise ValueError(
+                            "profile backup snapshot does not match staged manifest"
+                        )
+                self._check_identities(reopened_root_fd, reopened_entries)
+        except ValueError:
+            raise
+        except OSError as exc:
+            raise ValueError("profile backup path is missing or unsafe") from exc
+
+
+@contextmanager
 def _validate_staged_backups(
     archive: PersonalMemoryArchive,
     manifest: dict,
     backup_paths: tuple[Path, ...],
-) -> tuple[tuple[Path, ...], str]:
-    """Validate exact private snapshots without following a pathname twice."""
+) -> Iterator[_BackupValidation]:
+    """Pin exact private snapshots through their transaction precommit check."""
     if not _secure_snapshot_primitives_available():
         raise ValueError("secure profile backup validation is not supported")
     entries = manifest["entries"]
@@ -411,21 +541,16 @@ def _validate_staged_backups(
     backup_root = (
         archive.path.parent.expanduser().absolute() / ".canonical-profile-backups"
     )
-    identities: dict[str, object]
     try:
         with ExitStack() as stack:
             root_fd = _open_directory_chain(backup_root, stack)
-            root_identity = os.fstat(root_fd)
-            identities = {
-                "version": 1,
-                "root": _private_identity(
-                    backup_root,
-                    root_identity,
-                    expected_mode=0o700,
-                    directory=True,
-                ),
-                "entries": [],
-            }
+            root_identity = _private_identity(
+                backup_root,
+                os.fstat(root_fd),
+                expected_mode=0o700,
+                directory=True,
+            )
+            pinned_entries: list[_PinnedBackup] = []
             identity_entries: list[dict[str, object]] = []
             for backup, entry in zip(resolved_backups, entries, strict=True):
                 if backup.parent.parent != backup_root:
@@ -440,10 +565,9 @@ def _validate_staged_backups(
                         dir_fd=root_fd,
                     ),
                 )
-                snapshot_identity = os.fstat(snapshot_fd)
-                snapshot_record = _private_identity(
+                snapshot_identity = _private_identity(
                     backup.parent,
-                    snapshot_identity,
+                    os.fstat(snapshot_fd),
                     expected_mode=0o700,
                     directory=True,
                 )
@@ -455,10 +579,9 @@ def _validate_staged_backups(
                         dir_fd=snapshot_fd,
                     ),
                 )
-                backup_identity = os.fstat(backup_fd)
-                backup_record = _private_identity(
+                backup_identity = _private_identity(
                     backup,
-                    backup_identity,
+                    os.fstat(backup_fd),
                     expected_mode=0o600,
                     directory=False,
                 )
@@ -466,63 +589,45 @@ def _validate_staged_backups(
                     raise ValueError(
                         "profile backup snapshot does not match staged manifest"
                     )
-                after_hash = os.fstat(backup_fd)
-                if (after_hash.st_dev, after_hash.st_ino) != (
-                    backup_identity.st_dev,
-                    backup_identity.st_ino,
-                ):
-                    raise ValueError("profile backup identity changed")
-                verify_snapshot_fd = _stack_fd(
-                    stack,
-                    os.open(
-                        backup.parent.name,
-                        _directory_open_flags(),
-                        dir_fd=root_fd,
-                    ),
+                pinned_entries.append(
+                    _PinnedBackup(
+                        backup=backup,
+                        snapshot_fd=snapshot_fd,
+                        backup_fd=backup_fd,
+                        snapshot_identity=snapshot_identity,
+                        backup_identity=backup_identity,
+                        expected_sha256=str(entry["sha256"]),
+                    )
                 )
-                verified_snapshot = os.fstat(verify_snapshot_fd)
-                if (verified_snapshot.st_dev, verified_snapshot.st_ino) != (
-                    snapshot_identity.st_dev,
-                    snapshot_identity.st_ino,
-                ):
-                    raise ValueError("profile backup directory identity changed")
-                verify_backup_fd = _stack_fd(
-                    stack,
-                    os.open(
-                        backup.name,
-                        os.O_RDONLY | os.O_NOFOLLOW,
-                        dir_fd=verify_snapshot_fd,
-                    ),
-                )
-                verified_backup = os.fstat(verify_backup_fd)
-                if (verified_backup.st_dev, verified_backup.st_ino) != (
-                    backup_identity.st_dev,
-                    backup_identity.st_ino,
-                ):
-                    raise ValueError("profile backup identity changed")
                 identity_entries.append(
                     {
                         "backup_path": str(backup),
-                        "directory": snapshot_record,
-                        "file": backup_record,
+                        "directory": snapshot_identity,
+                        "file": backup_identity,
                     }
                 )
-            root_observed = os.fstat(root_fd)
-            if (root_observed.st_dev, root_observed.st_ino) != (
-                root_identity.st_dev,
-                root_identity.st_ino,
-            ):
-                raise ValueError("profile backup root identity changed")
-            identities["entries"] = identity_entries
+            identities = {
+                "version": 1,
+                "root": root_identity,
+                "entries": identity_entries,
+            }
+            validation = _BackupValidation(
+                backup_root=backup_root,
+                root_fd=root_fd,
+                root_identity=root_identity,
+                entries=tuple(pinned_entries),
+                identities_json=json.dumps(
+                    identities,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+            validation.revalidate()
+            yield validation
     except ValueError:
         raise
     except OSError as exc:
         raise ValueError("profile backup path is missing or unsafe") from exc
-    return resolved_backups, json.dumps(
-        identities,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
 
 
 def validate_local_personal_archive(path: str | Path) -> None:
@@ -557,17 +662,14 @@ def activate_canonical_profile(
     validate_local_personal_archive(archive.path)
 
     manifest = _read_manifest(archive)
-    _, backup_identities_json = _validate_staged_backups(
-        archive,
-        manifest,
-        backup_paths,
-    )
     manifest_json = _manifest_json(manifest)
-    archive.mark_canonical_profile_active(
-        manifest_json=manifest_json,
-        manifest_sha256=_manifest_digest(manifest_json),
-        backup_identities_json=backup_identities_json,
-    )
+    with _validate_staged_backups(archive, manifest, backup_paths) as validation:
+        archive.mark_canonical_profile_active(
+            manifest_json=manifest_json,
+            manifest_sha256=_manifest_digest(manifest_json),
+            backup_identities_json=validation.identities_json,
+            precommit_check=validation.revalidate,
+        )
 
 
 def deactivate_canonical_profile(
@@ -580,20 +682,19 @@ def deactivate_canonical_profile(
         raise ValueError("a local personal-memory archive is required")
     validate_local_personal_archive(archive.path)
     manifest = _read_manifest(archive)
-    _, backup_identities_json = _validate_staged_backups(
-        archive,
-        manifest,
-        backup_paths,
-    )
-    active_identities = archive.get_metadata(_ACTIVE_IDENTITIES_KEY, "")
-    if not active_identities or active_identities != backup_identities_json:
-        raise ValueError("profile backup identity differs from activation attestation")
     manifest_json = _manifest_json(manifest)
-    archive.mark_canonical_profile_inactive(
-        manifest_json=manifest_json,
-        manifest_sha256=_manifest_digest(manifest_json),
-        backup_identities_json=backup_identities_json,
-    )
+    with _validate_staged_backups(archive, manifest, backup_paths) as validation:
+        active_identities = archive.get_metadata(_ACTIVE_IDENTITIES_KEY, "")
+        if not active_identities or active_identities != validation.identities_json:
+            raise ValueError(
+                "profile backup identity differs from activation attestation"
+            )
+        archive.mark_canonical_profile_inactive(
+            manifest_json=manifest_json,
+            manifest_sha256=_manifest_digest(manifest_json),
+            backup_identities_json=validation.identities_json,
+            precommit_check=validation.revalidate,
+        )
 
 
 __all__ = [

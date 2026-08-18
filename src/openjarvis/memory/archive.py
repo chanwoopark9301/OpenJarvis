@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from openjarvis.memory.personal_models import (
     DIRECT_RULE_KINDS,
@@ -642,6 +642,7 @@ class PersonalMemoryArchive:
         manifest_json: str,
         manifest_sha256: str,
         backup_identities_json: str,
+        precommit_check: Callable[[], None] | None = None,
     ) -> None:
         """Activate canonical profile authority and append an audit decision."""
         now = time.time()
@@ -653,6 +654,8 @@ class PersonalMemoryArchive:
             ).fetchone()
             if staged is None or str(staged["value"]) != manifest_json:
                 raise ValueError("canonical profile staging manifest changed")
+            if precommit_check is not None:
+                precommit_check()
             for key, value in (
                 ("canonical_profile_active", "1"),
                 ("canonical_profile_activated_at", str(now)),
@@ -693,6 +696,7 @@ class PersonalMemoryArchive:
         manifest_json: str,
         manifest_sha256: str,
         backup_identities_json: str,
+        precommit_check: Callable[[], None] | None = None,
     ) -> None:
         """Clear canonical cutover only when its exact attestation still matches."""
         now = time.time()
@@ -724,6 +728,8 @@ class PersonalMemoryArchive:
                 != backup_identities_json
             ):
                 raise ValueError("canonical profile backup identity changed")
+            if precommit_check is not None:
+                precommit_check()
             for key, value in (
                 ("canonical_profile_active", "0"),
                 ("canonical_profile_deactivated_at", str(now)),
