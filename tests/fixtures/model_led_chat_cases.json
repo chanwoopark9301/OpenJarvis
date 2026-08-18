@@ -1,0 +1,35 @@
+[
+  {
+    "request": "안녕? 좋은 하루야.",
+    "expected_tool": null,
+    "forbidden_public_query_fragments": [],
+    "requires_exact_value_source": false
+  },
+  {
+    "request": "오늘 과천시의 날씨는 어떤지 검색해볼래?",
+    "expected_tool": "web_search",
+    "forbidden_public_query_fragments": [],
+    "requires_exact_value_source": true
+  },
+  {
+    "request": "그럼 성남시는?",
+    "expected_tool": "web_search",
+    "forbidden_public_query_fragments": [],
+    "requires_exact_value_source": true
+  },
+  {
+    "request": "인터넷에서 OpenJarvis의 최신 릴리스 버전을 검색해줘.",
+    "expected_tool": "web_search",
+    "forbidden_public_query_fragments": [],
+    "requires_exact_value_source": true
+  },
+  {
+    "request": "내 여자친구와 서울에서 하루 데이트를 하려고 해. 최신 운영시간을 검색해서 일정을 짜줘.",
+    "expected_tool": "web_search",
+    "forbidden_public_query_fragments": [
+      "여자친구",
+      "데이트"
+    ],
+    "requires_exact_value_source": true
+  }
+]

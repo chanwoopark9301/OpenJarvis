@@ -2,6 +2,12 @@
 
 This page traces the end-to-end journey of a user query through the OpenJarvis system, from the moment it enters the CLI or SDK to the final response and telemetry recording.
 
+`jarvis chat` has an additional conversational path: one local conversation
+model receives recent dialogue and any enabled tool definitions, decides whether
+to answer or call a tool, and writes the final response after seeing the tool
+result. The harness executes and validates calls; it does not make ordinary
+semantic choices on the model's behalf.
+
 ---
 
 ## Sequence Diagram
@@ -71,6 +77,54 @@ sequenceDiagram
 ## Direct Mode vs Agent Mode
 
 OpenJarvis supports two query processing paths, selected by the `--agent` CLI flag or the `agent` parameter in the SDK.
+
+### Interactive Chat
+
+`jarvis chat` keeps a real multi-turn history. For each turn it assembles
+dynamic memory context first, then prior non-system dialogue, and finally adds
+the current user message exactly once.
+
+When tools are enabled, the configured conversational agent is given those
+tools if it supports them. A simple conversational agent that opts into the
+managed fallback uses the existing function-calling runtime for that session;
+the configured agent name remains the user-facing name. When no tools resolve,
+the simple agent remains on its normal tool-free path.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Chat as jarvis chat
+    participant Model as Conversation model
+    participant Guard as Tool boundary
+    participant Tool as Enabled tool
+
+    User->>Chat: Current message
+    Chat->>Chat: Add memory context and prior dialogue
+    Chat->>Model: Messages plus enabled tool definitions
+    alt Model answers directly
+        Model-->>Chat: Natural response
+    else Model emits a function call
+        Model-->>Chat: Tool name and arguments
+        Chat->>Guard: Validate call and confirmation requirements
+        Guard->>Tool: Execute allowed call
+        Tool-->>Model: Structured result and source evidence
+        Model-->>Chat: Final natural response
+    end
+    Chat-->>User: Response
+    Chat->>Chat: Archive completed exchange
+```
+
+The model, not a topic-specific routing layer, chooses whether current
+information needs `web_search`. Search output identifies its retrieval mode,
+time, engine, content availability, and source when one is available. A public
+URL can be passed back to the same tool to fetch readable content if result
+snippets lack the requested value. Exact values in the final answer must come
+from returned tool content; if the value is absent, the model should fetch more
+evidence or say it could not confirm the value.
+
+Privacy, argument-schema, permission, confirmation, loop, and network-safety
+checks remain deterministic harness boundaries. Public web content is returned
+as untrusted reference material, not instructions.
 
 ### Direct Mode (Default)
 

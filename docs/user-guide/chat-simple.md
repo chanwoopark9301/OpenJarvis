@@ -1,6 +1,9 @@
 # Simple Chat
 
-A lightweight conversational AI with no tools and no agent overhead. This is the simplest possible OpenJarvis setup: just Ollama and a local model. Ideal for general-purpose chat, Q&A, brainstorming, and getting started quickly.
+A lightweight conversational AI built around one local conversation model.
+The `chat-simple` preset starts without tools, so it needs only Ollama and a
+local model. You can optionally enable `web_search`; the same model then decides
+when to search, sees the retrieved evidence, and writes the final answer.
 
 ## Quickstart (3 minutes)
 
@@ -26,7 +29,8 @@ jarvis init --preset chat-simple
 jarvis ask "What is quantum computing?"
 ```
 
-That's it. No API keys, no tools, no cloud -- just a local model answering your questions.
+That's it. With the preset unchanged, there are no API keys, tools, or cloud
+services -- just a local model answering your questions.
 
 ## CLI Commands
 
@@ -70,6 +74,42 @@ default_agent = "simple"            # Single-turn, no tools
 host = "0.0.0.0"
 port = 8000
 ```
+
+## Optional model-led web search
+
+To let interactive chat retrieve current public information, add the general
+web tool to the same configuration:
+
+```toml
+[tools]
+enabled = ["web_search"]
+```
+
+Then start `jarvis chat` normally. You do not need to select a separate search
+agent. The conversation model receives the `web_search` function definition
+and decides turn by turn whether to use it:
+
+```text
+You> 안녕? 좋은 하루야.
+Jarvis> 안녕! 좋은 하루 보내.
+
+You> 오늘 과천시의 날씨는 어떤지 검색해볼래?
+# The model calls web_search, reads its returned value and source,
+# and then answers using that evidence.
+```
+
+An ordinary greeting remains a single model response with no tool call. A
+current-information request can produce a `web_search` call. The result is
+returned to the same model with retrieval metadata and source information;
+only then does the model compose the final response. If a search snippet lacks
+an exact requested value, the model can ask `web_search` to fetch a promising
+public URL or report that the value could not be confirmed.
+
+The chat session also carries prior user and assistant messages into later
+turns, so follow-ups such as `그럼 성남시는?` can be understood in the context
+of an earlier weather question. Safety checks still validate tool arguments,
+protect private-network addresses, and request confirmation for tools that
+require it.
 
 ### Model options
 
@@ -149,6 +189,8 @@ OPENJARVIS_MODEL=qwen3.5:9b jarvis ask "Hello"
 
 **Slow responses** -- Use a smaller model (`qwen3.5:4b`). Check available memory; models need RAM roughly equal to their parameter count in GB (e.g., 9B model needs ~9 GB).
 
-**Want to add tools later?** -- Switch to the [Code Assistant](code-assistant.md) or [Deep Research](deep-research.md) config. Simple chat is intentionally minimal.
+**Want broader tools?** -- Keep simple chat focused with only `web_search`, or
+switch to the [Code Assistant](code-assistant.md) or [Deep Research](deep-research.md)
+configuration for a larger tool set and specialized workflows.
 
 **Browser app not loading** -- Make sure both the backend (`jarvis serve`) and frontend are running. The `./scripts/quickstart.sh` script starts both automatically.
