@@ -68,6 +68,18 @@ class StagedProfileManifest:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _CreatedPrivateSnapshot:
+    backup_path: Path
+    content: bytes
+    snapshot_name: str
+    snapshot_device: int
+    snapshot_inode: int
+    backup_name: str
+    backup_device: int
+    backup_inode: int
+
+
 class LegacyProfileMigrator:
     """Back up legacy files and stage bullets as untrusted candidates."""
 
@@ -83,94 +95,122 @@ class LegacyProfileMigrator:
         if not _secure_snapshot_primitives_available():
             raise ValueError("secure profile snapshots are not supported")
         sources = tuple(
-            Path(path).expanduser().absolute() for path in (user_path, memory_path)
+            _canonical_absolute_path(path) for path in (user_path, memory_path)
         )
+        if len(set(sources)) != len(sources):
+            raise ValueError("legacy profile paths are not unique")
         # Fail before creating private snapshots when existing trusted metadata is
-        # corrupt. Re-read after copying so a concurrent valid staging operation
-        # is merged instead of being overwritten by this preflight snapshot.
+        # corrupt. The transaction builder reads it again under BEGIN IMMEDIATE.
         resolve_staged_profile_manifest(self.archive)
-        backup_dir = self.archive.path.parent / ".canonical-profile-backups"
-        snapshots: list[tuple[Path, Path, bytes]] = []
+        backup_dir = _canonical_absolute_path(
+            self.archive.path.parent / ".canonical-profile-backups"
+        )
+        snapshots: list[tuple[Path, _CreatedPrivateSnapshot]] = []
         with ExitStack() as backup_stack:
             backup_root_fd: int | None = None
             backup_root_identity: os.stat_result | None = None
-            for source in sources:
-                with ExitStack() as source_stack:
-                    opened_source = _open_regular_source(source, source_stack)
-                    if opened_source is None:
-                        continue
-                    source_fd, source_identity = opened_source
-                    if backup_root_fd is None:
-                        backup_root_fd, backup_root_identity = (
-                            _open_private_backup_root(backup_dir, backup_stack)
+            try:
+                for source in sources:
+                    with ExitStack() as source_stack:
+                        opened_source = _open_regular_source(source, source_stack)
+                        if opened_source is None:
+                            continue
+                        source_fd, source_identity = opened_source
+                        if backup_root_fd is None:
+                            backup_root_fd, backup_root_identity = (
+                                _open_private_backup_root(backup_dir, backup_stack)
+                            )
+                        assert backup_root_identity is not None
+                        created = _copy_private_snapshot(
+                            source,
+                            source_fd,
+                            source_identity,
+                            backup_dir,
+                            backup_root_fd,
+                            backup_root_identity,
                         )
-                    assert backup_root_identity is not None
-                    backup, snapshot = _copy_private_snapshot(
-                        source,
-                        source_fd,
-                        source_identity,
-                        backup_dir,
-                        backup_root_fd,
-                        backup_root_identity,
-                    )
-                    snapshot.decode("utf-8")
-                    snapshots.append((source, backup, snapshot))
+                        snapshots.append((source, created))
+                        created.content.decode("utf-8")
 
-        old_manifest = resolve_staged_profile_manifest(self.archive)
-        merged = {entry.source_path: entry.as_dict() for entry in old_manifest.entries}
-        records: list[tuple[str, str, CandidateDraft]] = []
-        for source, backup, snapshot in snapshots:
-            snapshot_hash = hashlib.sha256(snapshot).hexdigest()
-            merged[str(source)] = {
-                "source_path": str(source),
-                "backup_path": str(backup),
-                "sha256": snapshot_hash,
-            }
-            for line_number, raw_line in enumerate(
-                snapshot.decode("utf-8").splitlines(), start=1
-            ):
-                match = _BULLET.match(raw_line)
-                content = match.group(1).strip() if match is not None else ""
-                if not content:
-                    continue
-                digest_input = f"{source}:{line_number}:{content}"
-                digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
-                exchange_id = f"legacy-profile-{digest}"
-                records.append(
-                    (
-                        exchange_id,
-                        f"legacy-profile:{source}:{line_number}",
-                        CandidateDraft(
-                            CandidateKind.FACT,
-                            content,
-                            0.1,
-                            0.1,
-                            source=EvidenceSource.LEGACY_IMPORT,
-                            temporal_scope="unspecified",
-                            subject="legacy_profile",
+                if not snapshots:
+                    return ProfileMigrationResult(
+                        backup_paths=(), imported=0, skipped=0
+                    )
+
+                records: list[tuple[str, str, CandidateDraft]] = []
+                new_entries: list[StagedProfileManifestEntry] = []
+                for source, created in snapshots:
+                    snapshot_hash = hashlib.sha256(created.content).hexdigest()
+                    new_entries.append(
+                        StagedProfileManifestEntry(
+                            source_path=str(_canonical_absolute_path(source)),
+                            backup_path=str(
+                                _canonical_absolute_path(created.backup_path)
+                            ),
+                            sha256=snapshot_hash,
+                        )
+                    )
+                    for line_number, raw_line in enumerate(
+                        created.content.decode("utf-8").splitlines(), start=1
+                    ):
+                        match = _BULLET.match(raw_line)
+                        content = match.group(1).strip() if match is not None else ""
+                        if not content:
+                            continue
+                        digest_input = f"{source}:{line_number}:{content}"
+                        digest = hashlib.sha256(
+                            digest_input.encode("utf-8")
+                        ).hexdigest()
+                        exchange_id = f"legacy-profile-{digest}"
+                        records.append(
+                            (
+                                exchange_id,
+                                f"legacy-profile:{source}:{line_number}",
+                                CandidateDraft(
+                                    CandidateKind.FACT,
+                                    content,
+                                    0.1,
+                                    0.1,
+                                    source=EvidenceSource.LEGACY_IMPORT,
+                                    temporal_scope="unspecified",
+                                    subject="legacy_profile",
+                                ),
+                            )
+                        )
+
+                def build_metadata(current_manifest_raw: str) -> dict[str, str]:
+                    old_manifest = _parse_staged_profile_manifest(current_manifest_raw)
+                    merged = {
+                        entry.source_path: entry for entry in old_manifest.entries
+                    }
+                    for entry in new_entries:
+                        merged[entry.source_path] = entry
+                    proposed = StagedProfileManifest(entries=tuple(merged.values()))
+                    manifest_json = _manifest_json(proposed.as_dict())
+                    validated = _parse_staged_profile_manifest(manifest_json)
+                    canonical_manifest_json = _manifest_json(validated.as_dict())
+                    return {
+                        _STAGING_MANIFEST_KEY: canonical_manifest_json,
+                        _BACKUP_METADATA_KEY: json.dumps(
+                            [str(path) for path in validated.backup_paths],
+                            separators=(",", ":"),
                         ),
-                    )
-                )
+                    }
 
-        if not snapshots:
-            return ProfileMigrationResult(backup_paths=(), imported=0, skipped=0)
-        manifest = {"version": 1, "entries": list(merged.values())}
-        manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
-        all_backup_paths = [entry["backup_path"] for entry in manifest["entries"]]
-        imported, skipped = self.archive.stage_profile_candidates(
-            records,
-            metadata={
-                _STAGING_MANIFEST_KEY: manifest_json,
-                _BACKUP_METADATA_KEY: json.dumps(
-                    all_backup_paths, separators=(",", ":")
-                ),
-            },
-        )
-        return ProfileMigrationResult(
-            backup_paths=tuple(backup for _, backup, _ in snapshots),
-            imported=imported,
-            skipped=skipped,
-        )
+                imported, skipped = self.archive.stage_profile_candidates(
+                    records,
+                    metadata_builder=build_metadata,
+                )
+            except BaseException:
+                if backup_root_fd is not None:
+                    _cleanup_created_snapshots(backup_root_fd, snapshots)
+                raise
+
+            return ProfileMigrationResult(
+                backup_paths=tuple(created.backup_path for _, created in snapshots),
+                imported=imported,
+                skipped=skipped,
+            )
 
 
 def _secure_snapshot_primitives_available() -> bool:
@@ -182,8 +222,16 @@ def _secure_snapshot_primitives_available() -> bool:
         and hasattr(os, "fchmod")
         and os.open in os.supports_dir_fd
         and os.mkdir in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+        and os.rmdir in os.supports_dir_fd
         and os.utime in os.supports_fd
     )
+
+
+def _canonical_absolute_path(path: str | Path) -> Path:
+    """Return an absolute path with only lexical dot segments collapsed."""
+    absolute = Path(path).expanduser().absolute()
+    return Path(os.path.normpath(str(absolute)))
 
 
 def _directory_open_flags() -> int:
@@ -316,7 +364,7 @@ def _copy_private_snapshot(
     backup_dir: Path,
     backup_root_fd: int,
     backup_root_identity: os.stat_result,
-) -> tuple[Path, bytes]:
+) -> _CreatedPrivateSnapshot:
     """Copy an opened source into an exclusive destination descriptor."""
     snapshot_name = uuid.uuid4().hex
     try:
@@ -325,42 +373,191 @@ def _copy_private_snapshot(
         raise ValueError("profile backup destination collision") from exc
     backup = (backup_dir / snapshot_name / source.name).absolute()
     with ExitStack() as stack:
-        snapshot_fd = _stack_fd(
-            stack,
-            os.open(snapshot_name, _directory_open_flags(), dir_fd=backup_root_fd),
-        )
-        _force_mode(snapshot_fd, 0o700)
-        file_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-        backup_fd = _stack_fd(
-            stack,
-            os.open(source.name, file_flags, 0o600, dir_fd=snapshot_fd),
-        )
-        _force_mode(backup_fd, 0o600)
-        backup_identity = os.fstat(backup_fd)
-        if not stat.S_ISREG(backup_identity.st_mode):
-            raise ValueError("profile backup destination is unsafe")
+        snapshot_fd: int | None = None
+        backup_fd: int | None = None
         try:
-            _copy_fd_bytes(source_fd, backup_fd)
-            os.utime(
-                backup_fd,
-                ns=(source_identity.st_atime_ns, source_identity.st_mtime_ns),
+            snapshot_fd = _stack_fd(
+                stack,
+                os.open(
+                    snapshot_name,
+                    _directory_open_flags(),
+                    dir_fd=backup_root_fd,
+                ),
             )
-            os.fsync(backup_fd)
-            _verify_backup_path_identity(backup, backup_identity)
-            root_observed = os.fstat(backup_root_fd)
-            if (root_observed.st_dev, root_observed.st_ino) != (
-                backup_root_identity.st_dev,
-                backup_root_identity.st_ino,
-            ):
-                raise ValueError("profile backup root identity changed")
-            os.lseek(backup_fd, 0, os.SEEK_SET)
-            snapshot = bytearray()
-            while chunk := os.read(backup_fd, 1024 * 1024):
-                snapshot.extend(chunk)
-        finally:
-            # The file starts at 0600 and descriptor copying never broadens it.
+            _force_mode(snapshot_fd, 0o700)
+            snapshot_identity = os.fstat(snapshot_fd)
+            file_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            backup_fd = _stack_fd(
+                stack,
+                os.open(source.name, file_flags, 0o600, dir_fd=snapshot_fd),
+            )
             _force_mode(backup_fd, 0o600)
-    return backup, bytes(snapshot)
+            backup_identity = os.fstat(backup_fd)
+            if not stat.S_ISREG(backup_identity.st_mode):
+                raise ValueError("profile backup destination is unsafe")
+            try:
+                _copy_fd_bytes(source_fd, backup_fd)
+                os.utime(
+                    backup_fd,
+                    ns=(source_identity.st_atime_ns, source_identity.st_mtime_ns),
+                )
+                os.fsync(backup_fd)
+                _verify_backup_path_identity(backup, backup_identity)
+                root_observed = os.fstat(backup_root_fd)
+                if (root_observed.st_dev, root_observed.st_ino) != (
+                    backup_root_identity.st_dev,
+                    backup_root_identity.st_ino,
+                ):
+                    raise ValueError("profile backup root identity changed")
+                os.lseek(backup_fd, 0, os.SEEK_SET)
+                snapshot = bytearray()
+                while chunk := os.read(backup_fd, 1024 * 1024):
+                    snapshot.extend(chunk)
+            finally:
+                # The file starts at 0600 and descriptor copying never broadens it.
+                _force_mode(backup_fd, 0o600)
+        except BaseException:
+            _cleanup_partial_snapshot(
+                backup_root_fd,
+                snapshot_name=snapshot_name,
+                snapshot_fd=snapshot_fd,
+                backup_name=source.name,
+                backup_fd=backup_fd,
+            )
+            raise
+    return _CreatedPrivateSnapshot(
+        backup_path=_canonical_absolute_path(backup),
+        content=bytes(snapshot),
+        snapshot_name=snapshot_name,
+        snapshot_device=int(snapshot_identity.st_dev),
+        snapshot_inode=int(snapshot_identity.st_ino),
+        backup_name=source.name,
+        backup_device=int(backup_identity.st_dev),
+        backup_inode=int(backup_identity.st_ino),
+    )
+
+
+def _cleanup_partial_snapshot(
+    backup_root_fd: int,
+    *,
+    snapshot_name: str,
+    snapshot_fd: int | None,
+    backup_name: str,
+    backup_fd: int | None,
+) -> None:
+    """Remove an exclusively created partial snapshot only while identity matches."""
+    if snapshot_fd is None:
+        return
+    reopened_snapshot_fd: int | None = None
+    reopened_backup_fd: int | None = None
+    try:
+        snapshot_identity = os.fstat(snapshot_fd)
+        reopened_snapshot_fd = os.open(
+            snapshot_name,
+            _directory_open_flags(),
+            dir_fd=backup_root_fd,
+        )
+        reopened_snapshot = os.fstat(reopened_snapshot_fd)
+        if (
+            not stat.S_ISDIR(snapshot_identity.st_mode)
+            or snapshot_identity.st_uid != os.geteuid()
+            or stat.S_IMODE(snapshot_identity.st_mode) & 0o077
+            or (snapshot_identity.st_dev, snapshot_identity.st_ino)
+            != (reopened_snapshot.st_dev, reopened_snapshot.st_ino)
+        ):
+            return
+        if backup_fd is not None:
+            backup_identity = os.fstat(backup_fd)
+            reopened_backup_fd = os.open(
+                backup_name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=reopened_snapshot_fd,
+            )
+            reopened_backup = os.fstat(reopened_backup_fd)
+            if (
+                not stat.S_ISREG(backup_identity.st_mode)
+                or backup_identity.st_uid != os.geteuid()
+                or stat.S_IMODE(backup_identity.st_mode) & 0o077
+                or (backup_identity.st_dev, backup_identity.st_ino)
+                != (reopened_backup.st_dev, reopened_backup.st_ino)
+            ):
+                return
+            closing_backup_fd = reopened_backup_fd
+            reopened_backup_fd = None
+            os.close(closing_backup_fd)
+            os.unlink(backup_name, dir_fd=reopened_snapshot_fd)
+        closing_snapshot_fd = reopened_snapshot_fd
+        reopened_snapshot_fd = None
+        os.close(closing_snapshot_fd)
+        os.rmdir(snapshot_name, dir_fd=backup_root_fd)
+    except OSError:
+        pass
+    finally:
+        for fd in (reopened_backup_fd, reopened_snapshot_fd):
+            if fd is not None:
+                closing_fd = fd
+                try:
+                    os.close(closing_fd)
+                except OSError:
+                    pass
+
+
+def _cleanup_created_snapshots(
+    backup_root_fd: int,
+    snapshots: list[tuple[Path, _CreatedPrivateSnapshot]],
+) -> None:
+    """Best-effort removal of only exact snapshot objects owned by this stage."""
+    for _, created in reversed(snapshots):
+        snapshot_fd: int | None = None
+        backup_fd: int | None = None
+        try:
+            snapshot_fd = os.open(
+                created.snapshot_name,
+                _directory_open_flags(),
+                dir_fd=backup_root_fd,
+            )
+            snapshot_stat = os.fstat(snapshot_fd)
+            if (
+                not stat.S_ISDIR(snapshot_stat.st_mode)
+                or stat.S_IMODE(snapshot_stat.st_mode) != 0o700
+                or snapshot_stat.st_uid != os.geteuid()
+                or (snapshot_stat.st_dev, snapshot_stat.st_ino)
+                != (created.snapshot_device, created.snapshot_inode)
+            ):
+                continue
+            backup_fd = os.open(
+                created.backup_name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=snapshot_fd,
+            )
+            backup_stat = os.fstat(backup_fd)
+            if (
+                not stat.S_ISREG(backup_stat.st_mode)
+                or stat.S_IMODE(backup_stat.st_mode) != 0o600
+                or backup_stat.st_uid != os.geteuid()
+                or (backup_stat.st_dev, backup_stat.st_ino)
+                != (created.backup_device, created.backup_inode)
+            ):
+                continue
+            closing_backup_fd = backup_fd
+            backup_fd = None
+            os.close(closing_backup_fd)
+            os.unlink(created.backup_name, dir_fd=snapshot_fd)
+            closing_snapshot_fd = snapshot_fd
+            snapshot_fd = None
+            os.close(closing_snapshot_fd)
+            os.rmdir(created.snapshot_name, dir_fd=backup_root_fd)
+        except OSError:
+            # A changed identity is left in place rather than risking deletion of
+            # an object this stage no longer demonstrably owns.
+            pass
+        finally:
+            for fd in (backup_fd, snapshot_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
 
 def resolve_staged_profile_manifest(
@@ -368,6 +565,11 @@ def resolve_staged_profile_manifest(
 ) -> StagedProfileManifest:
     """Parse trusted staging metadata once into validated ordered entries."""
     raw = archive.get_metadata(_STAGING_MANIFEST_KEY, "")
+    return _parse_staged_profile_manifest(raw)
+
+
+def _parse_staged_profile_manifest(raw: str) -> StagedProfileManifest:
+    """Parse one manifest value without opening a second archive transaction."""
     if not raw:
         return StagedProfileManifest(entries=())
     try:
@@ -419,8 +621,8 @@ def resolve_staged_profile_manifest(
         backup_paths.add(backup)
         resolved_entries.append(
             StagedProfileManifestEntry(
-                source_path=source_path,
-                backup_path=backup_path,
+                source_path=str(source),
+                backup_path=str(backup),
                 sha256=sha256,
             )
         )
@@ -612,16 +814,14 @@ def _validate_staged_backups(
         raise ValueError("secure profile backup validation is not supported")
     entries = manifest.entries
     expected_backups = manifest.backup_paths
-    resolved_backups = tuple(
-        Path(path).expanduser().absolute() for path in backup_paths
-    )
+    resolved_backups = tuple(_canonical_absolute_path(path) for path in backup_paths)
     if not resolved_backups:
         raise ValueError("at least one backup from the staged manifest is required")
     if resolved_backups != expected_backups:
         raise ValueError("profile backups must match the trusted staged manifest")
 
-    backup_root = (
-        archive.path.parent.expanduser().absolute() / ".canonical-profile-backups"
+    backup_root = _canonical_absolute_path(
+        archive.path.parent / ".canonical-profile-backups"
     )
     try:
         with ExitStack() as stack:

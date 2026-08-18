@@ -7,6 +7,8 @@ import json
 import os
 import sqlite3
 import stat
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -25,6 +27,7 @@ from openjarvis.memory.profile_migration import (
     LegacyProfileMigrator,
     activate_canonical_profile,
     deactivate_canonical_profile,
+    resolve_staged_profile_manifest,
 )
 
 
@@ -718,6 +721,242 @@ def test_staging_is_idempotent_for_the_same_profile_lines(tmp_path):
     assert len(archive.find_candidates(source=EvidenceSource.LEGACY_IMPORT)) == 3
 
 
+def test_concurrent_stagers_publish_every_owned_snapshot_without_orphans(
+    tmp_path,
+    monkeypatch,
+):
+    """Two publish-ready stages must merge under the same write transaction."""
+    archive_path = tmp_path / "personal.db"
+    archives = (
+        PersonalMemoryArchive(archive_path),
+        PersonalMemoryArchive(archive_path),
+    )
+    source_pairs = []
+    for owner in ("alpha", "beta"):
+        source_dir = tmp_path / owner
+        source_dir.mkdir()
+        user_path = source_dir / "USER.md"
+        memory_path = source_dir / "MEMORY.md"
+        user_path.write_text(f"- {owner} user", encoding="utf-8")
+        memory_path.write_text(f"- {owner} memory", encoding="utf-8")
+        source_pairs.append((user_path, memory_path))
+    publish_barrier = threading.Barrier(2)
+    original_stage = PersonalMemoryArchive.stage_profile_candidates
+
+    def publish_together(self, *args, **kwargs):
+        publish_barrier.wait(timeout=10)
+        return original_stage(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        PersonalMemoryArchive,
+        "stage_profile_candidates",
+        publish_together,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(LegacyProfileMigrator(archive).stage, *sources)
+            for archive, sources in zip(archives, source_pairs)
+        ]
+        results = [future.result(timeout=10) for future in futures]
+
+    manifest = resolve_staged_profile_manifest(archives[0])
+    expected_sources = {
+        str(path) for source_pair in source_pairs for path in source_pair
+    }
+    created_backups = {path for result in results for path in result.backup_paths}
+    backup_root = tmp_path / ".canonical-profile-backups"
+    disk_backups = {
+        path
+        for snapshot_dir in backup_root.iterdir()
+        for path in snapshot_dir.iterdir()
+    }
+
+    assert {entry.source_path for entry in manifest.entries} == expected_sources
+    assert set(manifest.backup_paths) == created_backups
+    assert (
+        tuple(
+            Path(path)
+            for path in json.loads(
+                archives[0].get_metadata("canonical_profile_backup_paths")
+            )
+        )
+        == manifest.backup_paths
+    )
+    assert disk_backups == created_backups
+
+
+def test_staging_transaction_failure_cleans_only_new_snapshots(tmp_path):
+    """A rolled-back publish must not orphan or delete another owner's snapshot."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    backup_root = tmp_path / ".canonical-profile-backups"
+    foreign_snapshot = backup_root / "foreign-snapshot"
+    foreign_snapshot.mkdir(parents=True, mode=0o700)
+    foreign_marker = foreign_snapshot / "foreign-marker"
+    foreign_marker.write_text("foreign", encoding="utf-8")
+    foreign_marker.chmod(0o600)
+    with sqlite3.connect(archive.path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_profile_stage
+            BEFORE INSERT ON memory_candidates
+            BEGIN
+              SELECT RAISE(ABORT, 'profile stage unavailable');
+            END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="stage unavailable"):
+        LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    assert list(backup_root.iterdir()) == [foreign_snapshot]
+    assert foreign_marker.read_text(encoding="utf-8") == "foreign"
+    assert archive.get_metadata("canonical_profile_staging_manifest", "") == ""
+    assert archive.find_candidates() == []
+
+
+def test_snapshot_copy_failure_removes_owned_partial_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    """A copy error after exclusive creation must not leave an owned orphan."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+
+    def fail_copy(*_args):
+        raise OSError("injected copy failure")
+
+    monkeypatch.setattr(migration_module, "_copy_fd_bytes", fail_copy)
+
+    with pytest.raises(OSError, match="copy failure"):
+        LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    backup_root = tmp_path / ".canonical-profile-backups"
+    assert list(backup_root.iterdir()) == []
+    assert archive.get_metadata("canonical_profile_staging_manifest", "") == ""
+
+
+def test_snapshot_identity_failure_removes_owned_empty_directory(
+    tmp_path,
+    monkeypatch,
+):
+    """Ownership starts at exclusive mkdir, before snapshot identity completes."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    original_fstat = migration_module.os.fstat
+    fstat_calls = 0
+
+    def fail_first_snapshot_identity(fd):
+        nonlocal fstat_calls
+        fstat_calls += 1
+        if fstat_calls == 3:
+            raise OSError("injected snapshot identity failure")
+        return original_fstat(fd)
+
+    monkeypatch.setattr(migration_module.os, "fstat", fail_first_snapshot_identity)
+
+    with pytest.raises(OSError, match="snapshot identity failure"):
+        LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    backup_root = tmp_path / ".canonical-profile-backups"
+    assert list(backup_root.iterdir()) == []
+    assert archive.get_metadata("canonical_profile_staging_manifest", "") == ""
+
+
+def test_staging_revalidates_manifest_inside_publish_transaction_and_cleans(
+    tmp_path,
+    monkeypatch,
+):
+    """A manifest changed after preflight must fail before publish without orphans."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    original_stage = archive.stage_profile_candidates
+
+    def corrupt_before_transaction(*args, **kwargs):
+        archive.set_metadata("canonical_profile_staging_manifest", '{"invalid":true}')
+        return original_stage(*args, **kwargs)
+
+    monkeypatch.setattr(
+        archive,
+        "stage_profile_candidates",
+        corrupt_before_transaction,
+    )
+
+    with pytest.raises(ValueError, match="trusted staged manifest is invalid"):
+        LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    backup_root = tmp_path / ".canonical-profile-backups"
+    assert list(backup_root.iterdir()) == []
+    assert archive.find_candidates() == []
+
+
+def test_staging_canonicalizes_legacy_alias_before_normal_restage(tmp_path):
+    """A legacy alias and its normal spelling must remain one parseable entry."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    alias_segment = tmp_path / "alias-segment"
+    alias_segment.mkdir()
+    aliased_user_path = alias_segment / ".." / user_path.name
+    migrator = LegacyProfileMigrator(archive)
+    migrator.stage(aliased_user_path, memory_path)
+    legacy_manifest = _staging_manifest(archive)
+    legacy_manifest["entries"][0]["source_path"] = str(aliased_user_path)
+    archive.set_metadata(
+        "canonical_profile_staging_manifest",
+        json.dumps(legacy_manifest, separators=(",", ":")),
+    )
+
+    migrator.stage(user_path, tmp_path / "missing-memory.md")
+
+    manifest = resolve_staged_profile_manifest(archive)
+    assert [entry.source_path for entry in manifest.entries] == [
+        str(user_path),
+        str(memory_path),
+    ]
+    assert len(set(manifest.backup_paths)) == 2
+    assert all(".." not in Path(entry.source_path).parts for entry in manifest.entries)
+    assert all(".." not in path.parts for path in manifest.backup_paths)
+
+
+def test_staging_rejects_duplicate_logical_source_alias_without_artifacts(tmp_path):
+    """One stage cannot create two snapshots for the same lexical source."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, _ = _legacy_files(tmp_path)
+    alias_segment = tmp_path / "private-alias-segment"
+    alias_segment.mkdir()
+    aliased_user_path = alias_segment / ".." / user_path.name
+
+    with pytest.raises(ValueError) as caught:
+        LegacyProfileMigrator(archive).stage(aliased_user_path, user_path)
+
+    assert str(caught.value) == "legacy profile paths are not unique"
+    assert str(user_path) not in str(caught.value)
+    assert "Prefers concise replies" not in str(caught.value)
+    assert not (tmp_path / ".canonical-profile-backups").exists()
+    assert archive.get_metadata("canonical_profile_staging_manifest", "") == ""
+
+
+def test_archive_path_alias_stages_and_activates_canonical_backups(tmp_path):
+    """Archive dot segments cannot split staging and activation root identity."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    alias_segment = tmp_path / "archive-alias-segment"
+    alias_segment.mkdir()
+    archive = PersonalMemoryArchive(
+        alias_segment / ".." / state_dir.name / "personal.db"
+    )
+    user_path, memory_path = _legacy_files(tmp_path)
+
+    staged = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    activate_canonical_profile(archive, backup_paths=staged.backup_paths)
+
+    manifest = resolve_staged_profile_manifest(archive)
+    assert manifest.backup_paths == staged.backup_paths
+    assert all(".." not in path.parts for path in manifest.backup_paths)
+    assert archive.get_metadata("canonical_profile_active", "0") == "1"
+
+
 def _staging_manifest(archive: PersonalMemoryArchive) -> dict:
     return json.loads(archive.get_metadata("canonical_profile_staging_manifest"))
 
@@ -887,13 +1126,20 @@ def test_canonical_profile_api_rejects_corrupt_staging_manifest(
     assert memory_path.read_text(encoding="utf-8") == "CURRENT PRIVATE MEMORY"
 
 
-def test_staging_rejects_corrupt_manifest_before_creating_snapshots(tmp_path):
+@pytest.mark.parametrize(
+    "corruption",
+    ("missing_backup_path", "duplicate_source_parent_alias"),
+)
+def test_staging_rejects_corrupt_manifest_before_creating_snapshots(
+    tmp_path,
+    corruption,
+):
     """Trusted metadata must be parsed before staging writes recovery files."""
     archive = PersonalMemoryArchive(tmp_path / "personal.db")
     user_path, memory_path = _legacy_files(tmp_path)
     migrator = LegacyProfileMigrator(archive)
     migrator.stage(user_path, memory_path)
-    _corrupt_staging_manifest(archive, "missing_backup_path")
+    _corrupt_staging_manifest(archive, corruption)
     manifest_before = archive.get_metadata("canonical_profile_staging_manifest")
     candidates_before = len(archive.find_candidates())
     backup_root = tmp_path / ".canonical-profile-backups"
@@ -901,9 +1147,12 @@ def test_staging_rejects_corrupt_manifest_before_creating_snapshots(tmp_path):
     user_before = user_path.read_bytes()
     memory_before = memory_path.read_bytes()
 
-    with pytest.raises(ValueError, match="trusted staged manifest is invalid"):
+    with pytest.raises(
+        ValueError, match="trusted staged manifest is invalid"
+    ) as caught:
         migrator.stage(user_path, memory_path)
 
+    assert _PRIVATE_MANIFEST_MARKER not in str(caught.value)
     assert {path.name for path in backup_root.iterdir()} == snapshots_before
     assert archive.get_metadata("canonical_profile_staging_manifest") == manifest_before
     assert len(archive.find_candidates()) == candidates_before

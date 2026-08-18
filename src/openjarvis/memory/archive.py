@@ -557,14 +557,21 @@ class PersonalMemoryArchive:
         self,
         records: Sequence[tuple[str, str, CandidateDraft]],
         *,
-        metadata: dict[str, str],
+        metadata_builder: Callable[[str], dict[str, str]],
     ) -> tuple[int, int]:
-        """Atomically stage legacy candidates and publish recovery metadata."""
+        """Build recovery metadata and stage candidates under one write lock."""
         now = time.time()
         imported = 0
         skipped = 0
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            manifest_row = connection.execute(
+                "SELECT value FROM archive_metadata WHERE key = ?",
+                ("canonical_profile_staging_manifest",),
+            ).fetchone()
+            metadata = metadata_builder(
+                str(manifest_row["value"]) if manifest_row is not None else ""
+            )
             for exchange_id, provenance, draft in records:
                 existing = connection.execute(
                     "SELECT 1 FROM conversation_exchanges WHERE id = ?",
