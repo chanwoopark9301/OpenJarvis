@@ -372,69 +372,80 @@ def _copy_private_snapshot(
     except FileExistsError as exc:
         raise ValueError("profile backup destination collision") from exc
     backup = (backup_dir / snapshot_name / source.name).absolute()
-    with ExitStack() as stack:
-        snapshot_fd: int | None = None
-        backup_fd: int | None = None
-        try:
-            snapshot_fd = _stack_fd(
-                stack,
-                os.open(
-                    snapshot_name,
-                    _directory_open_flags(),
-                    dir_fd=backup_root_fd,
-                ),
-            )
-            _force_mode(snapshot_fd, 0o700)
-            snapshot_identity = os.fstat(snapshot_fd)
-            file_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-            backup_fd = _stack_fd(
-                stack,
-                os.open(source.name, file_flags, 0o600, dir_fd=snapshot_fd),
-            )
-            _force_mode(backup_fd, 0o600)
-            backup_identity = os.fstat(backup_fd)
-            if not stat.S_ISREG(backup_identity.st_mode):
-                raise ValueError("profile backup destination is unsafe")
+    created: _CreatedPrivateSnapshot | None = None
+    try:
+        with ExitStack() as stack:
+            snapshot_fd: int | None = None
+            backup_fd: int | None = None
             try:
-                _copy_fd_bytes(source_fd, backup_fd)
-                os.utime(
-                    backup_fd,
-                    ns=(source_identity.st_atime_ns, source_identity.st_mtime_ns),
+                snapshot_fd = _stack_fd(
+                    stack,
+                    os.open(
+                        snapshot_name,
+                        _directory_open_flags(),
+                        dir_fd=backup_root_fd,
+                    ),
                 )
-                os.fsync(backup_fd)
-                _verify_backup_path_identity(backup, backup_identity)
-                root_observed = os.fstat(backup_root_fd)
-                if (root_observed.st_dev, root_observed.st_ino) != (
-                    backup_root_identity.st_dev,
-                    backup_root_identity.st_ino,
-                ):
-                    raise ValueError("profile backup root identity changed")
-                os.lseek(backup_fd, 0, os.SEEK_SET)
-                snapshot = bytearray()
-                while chunk := os.read(backup_fd, 1024 * 1024):
-                    snapshot.extend(chunk)
-            finally:
-                # The file starts at 0600 and descriptor copying never broadens it.
+                _force_mode(snapshot_fd, 0o700)
+                snapshot_identity = os.fstat(snapshot_fd)
+                file_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                backup_fd = _stack_fd(
+                    stack,
+                    os.open(source.name, file_flags, 0o600, dir_fd=snapshot_fd),
+                )
                 _force_mode(backup_fd, 0o600)
-        except BaseException:
-            _cleanup_partial_snapshot(
+                backup_identity = os.fstat(backup_fd)
+                if not stat.S_ISREG(backup_identity.st_mode):
+                    raise ValueError("profile backup destination is unsafe")
+                try:
+                    _copy_fd_bytes(source_fd, backup_fd)
+                    os.utime(
+                        backup_fd,
+                        ns=(source_identity.st_atime_ns, source_identity.st_mtime_ns),
+                    )
+                    os.fsync(backup_fd)
+                    _verify_backup_path_identity(backup, backup_identity)
+                    root_observed = os.fstat(backup_root_fd)
+                    if (root_observed.st_dev, root_observed.st_ino) != (
+                        backup_root_identity.st_dev,
+                        backup_root_identity.st_ino,
+                    ):
+                        raise ValueError("profile backup root identity changed")
+                    os.lseek(backup_fd, 0, os.SEEK_SET)
+                    snapshot = bytearray()
+                    while chunk := os.read(backup_fd, 1024 * 1024):
+                        snapshot.extend(chunk)
+                finally:
+                    # Descriptor copying never broadens the initial private mode.
+                    _force_mode(backup_fd, 0o600)
+                created = _CreatedPrivateSnapshot(
+                    backup_path=_canonical_absolute_path(backup),
+                    content=bytes(snapshot),
+                    snapshot_name=snapshot_name,
+                    snapshot_device=int(snapshot_identity.st_dev),
+                    snapshot_inode=int(snapshot_identity.st_ino),
+                    backup_name=source.name,
+                    backup_device=int(backup_identity.st_dev),
+                    backup_inode=int(backup_identity.st_ino),
+                )
+            except BaseException:
+                _cleanup_partial_snapshot(
+                    backup_root_fd,
+                    snapshot_name=snapshot_name,
+                    snapshot_fd=snapshot_fd,
+                    backup_name=source.name,
+                    backup_fd=backup_fd,
+                )
+                raise
+    except BaseException:
+        if created is not None:
+            _cleanup_created_snapshots(
                 backup_root_fd,
-                snapshot_name=snapshot_name,
-                snapshot_fd=snapshot_fd,
-                backup_name=source.name,
-                backup_fd=backup_fd,
+                [(source, created)],
             )
-            raise
-    return _CreatedPrivateSnapshot(
-        backup_path=_canonical_absolute_path(backup),
-        content=bytes(snapshot),
-        snapshot_name=snapshot_name,
-        snapshot_device=int(snapshot_identity.st_dev),
-        snapshot_inode=int(snapshot_identity.st_ino),
-        backup_name=source.name,
-        backup_device=int(backup_identity.st_dev),
-        backup_inode=int(backup_identity.st_ino),
-    )
+        raise
+    assert created is not None
+    return created
 
 
 def _cleanup_partial_snapshot(

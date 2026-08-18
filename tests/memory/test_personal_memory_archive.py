@@ -37,6 +37,51 @@ def _seed_three_ordered_exchanges(tmp_path):
     return archive
 
 
+def test_stage_profile_candidates_preserves_legacy_metadata_keyword(tmp_path):
+    """The pre-builder public keyword must retain import and replay behavior."""
+    PersonalMemoryArchive, CandidateDraft = _archive_api()
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    records = [
+        (
+            "legacy-stage-exchange",
+            "legacy-profile:/profile/USER.md:1",
+            CandidateDraft("fact", "Legacy staged fact", 0.1, 0.1),
+        )
+    ]
+
+    first = archive.stage_profile_candidates(
+        records,
+        metadata={"legacy_stage_marker": "first"},
+    )
+    replay = archive.stage_profile_candidates(
+        records,
+        metadata={"legacy_stage_marker": "second"},
+    )
+
+    assert first == (1, 0)
+    assert replay == (0, 1)
+    assert archive.get_metadata("legacy_stage_marker") == "second"
+    assert len(archive.find_candidates()) == 1
+
+
+@pytest.mark.parametrize("provided", ("neither", "both"))
+def test_stage_profile_candidates_requires_one_metadata_source(tmp_path, provided):
+    """Static metadata and an atomic builder are mutually exclusive contracts."""
+    PersonalMemoryArchive, _ = _archive_api()
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    kwargs = {}
+    if provided == "both":
+        kwargs = {
+            "metadata": {"legacy_stage_marker": "static"},
+            "metadata_builder": lambda _raw: {"legacy_stage_marker": "builder"},
+        }
+
+    with pytest.raises(ValueError, match="exactly one metadata source"):
+        archive.stage_profile_candidates([], **kwargs)
+
+    assert archive.get_metadata("legacy_stage_marker", "") == ""
+
+
 def test_recent_exchanges_are_bounded_and_end_before_current(tmp_path):
     """Dialogue context must not include its current or future exchange."""
     archive = _seed_three_ordered_exchanges(tmp_path)
@@ -309,9 +354,7 @@ def test_recovery_reopens_a_completed_job_for_a_pending_exchange(tmp_path):
     job = archive.enqueue_job(
         job_type="extract_candidates",
         subject_id="exchange-stranded",
-        idempotency_key=(
-            "extract_candidates:personal-memory-v3:exchange-stranded"
-        ),
+        idempotency_key=("extract_candidates:personal-memory-v3:exchange-stranded"),
         priority=100,
     )
     assert archive.claim_job(job.id) is not None

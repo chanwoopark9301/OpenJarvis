@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, overload
 
 from openjarvis.memory.personal_models import (
     DIRECT_RULE_KINDS,
@@ -553,25 +553,49 @@ class PersonalMemoryArchive:
                 (key, value),
             )
 
+    @overload
     def stage_profile_candidates(
         self,
         records: Sequence[tuple[str, str, CandidateDraft]],
         *,
+        metadata: dict[str, str],
+        metadata_builder: None = None,
+    ) -> tuple[int, int]: ...
+
+    @overload
+    def stage_profile_candidates(
+        self,
+        records: Sequence[tuple[str, str, CandidateDraft]],
+        *,
+        metadata: None = None,
         metadata_builder: Callable[[str], dict[str, str]],
+    ) -> tuple[int, int]: ...
+
+    def stage_profile_candidates(
+        self,
+        records: Sequence[tuple[str, str, CandidateDraft]],
+        *,
+        metadata: dict[str, str] | None = None,
+        metadata_builder: Callable[[str], dict[str, str]] | None = None,
     ) -> tuple[int, int]:
-        """Build recovery metadata and stage candidates under one write lock."""
+        """Stage candidates with static metadata or an in-transaction builder."""
+        if (metadata is None) == (metadata_builder is None):
+            raise ValueError("exactly one metadata source is required")
         now = time.time()
         imported = 0
         skipped = 0
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            manifest_row = connection.execute(
-                "SELECT value FROM archive_metadata WHERE key = ?",
-                ("canonical_profile_staging_manifest",),
-            ).fetchone()
-            metadata = metadata_builder(
-                str(manifest_row["value"]) if manifest_row is not None else ""
-            )
+            published_metadata = metadata
+            if metadata_builder is not None:
+                manifest_row = connection.execute(
+                    "SELECT value FROM archive_metadata WHERE key = ?",
+                    ("canonical_profile_staging_manifest",),
+                ).fetchone()
+                published_metadata = metadata_builder(
+                    str(manifest_row["value"]) if manifest_row is not None else ""
+                )
+            assert published_metadata is not None
             for exchange_id, provenance, draft in records:
                 existing = connection.execute(
                     "SELECT 1 FROM conversation_exchanges WHERE id = ?",
@@ -633,7 +657,7 @@ class PersonalMemoryArchive:
                     (exchange_id, record_time),
                 )
                 imported += 1
-            for key, value in metadata.items():
+            for key, value in published_metadata.items():
                 connection.execute(
                     """
                     INSERT INTO archive_metadata(key, value) VALUES (?, ?)

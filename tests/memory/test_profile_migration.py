@@ -1501,6 +1501,85 @@ def test_failed_close_does_not_retry_a_reused_descriptor(monkeypatch):
                 pass
 
 
+@pytest.mark.parametrize("replace_owned_path", (False, True))
+def test_snapshot_close_after_release_cleans_only_matching_owned_path(
+    tmp_path,
+    monkeypatch,
+    replace_owned_path,
+):
+    """ExitStack teardown errors retain ownership without retrying a closed fd."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    backup_root = tmp_path / ".canonical-profile-backups"
+    foreign_snapshot = backup_root / "foreign-snapshot"
+    foreign_snapshot.mkdir(parents=True, mode=0o700)
+    foreign_marker = foreign_snapshot / "foreign-marker"
+    foreign_marker.write_text("foreign", encoding="utf-8")
+    foreign_marker.chmod(0o600)
+    original_open = migration_module.os.open
+    original_close = migration_module._close_fd
+    destination_fd: int | None = None
+    reused_fd: int | None = None
+    close_calls: dict[int, int] = {}
+    replacement: Path | None = None
+
+    def capture_destination(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal destination_fd
+        fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        if mode == 0o600 and destination_fd is None:
+            destination_fd = fd
+        return fd
+
+    def release_then_raise(fd):
+        nonlocal reused_fd, replacement
+        close_calls[fd] = close_calls.get(fd, 0) + 1
+        original_close(fd)
+        if fd != destination_fd or reused_fd is not None:
+            return
+        reused_fd = original_open(os.devnull, os.O_RDONLY)
+        assert reused_fd == fd
+        if replace_owned_path:
+            owned_snapshot = next(
+                path for path in backup_root.iterdir() if path != foreign_snapshot
+            )
+            owned_backup = next(owned_snapshot.iterdir())
+            owned_backup.rename(owned_snapshot / "owned-original")
+            replacement = owned_snapshot / owned_backup.name
+            replacement.write_text("replacement", encoding="utf-8")
+            replacement.chmod(0o600)
+        raise OSError("released destination close")
+
+    monkeypatch.setattr(migration_module.os, "open", capture_destination)
+    monkeypatch.setattr(migration_module, "_close_fd", release_then_raise)
+    monkeypatch.setattr(
+        migration_module,
+        "_secure_snapshot_primitives_available",
+        lambda: True,
+    )
+    before = _fd_count()
+    try:
+        with pytest.raises(OSError, match="released destination close"):
+            LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+        assert destination_fd is not None
+        assert reused_fd == destination_fd
+        assert close_calls[destination_fd] == 1
+        os.fstat(reused_fd)
+        assert foreign_marker.read_text(encoding="utf-8") == "foreign"
+        if replace_owned_path:
+            assert replacement is not None
+            assert replacement.read_text(encoding="utf-8") == "replacement"
+            assert len(list(backup_root.iterdir())) == 2
+        else:
+            assert list(backup_root.iterdir()) == [foreign_snapshot]
+        assert archive.get_metadata("canonical_profile_staging_manifest", "") == ""
+        assert archive.find_candidates() == []
+    finally:
+        if reused_fd is not None:
+            os.close(reused_fd)
+    assert _fd_count() == before
+
+
 @pytest.mark.parametrize(
     "failure_hook",
     ("copy", "identity", "fsync", "fstat", "chmod", "cleanup"),
