@@ -23,6 +23,7 @@ from openjarvis.memory.personal_models import (
 _BULLET = re.compile(r"^\s*[-*+]\s+(.+?)\s*$")
 _BACKUP_METADATA_KEY = "canonical_profile_backup_paths"
 _STAGING_MANIFEST_KEY = "canonical_profile_staging_manifest"
+_ACTIVE_IDENTITIES_KEY = "canonical_profile_active_backup_identities"
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +350,181 @@ def _read_manifest(archive: PersonalMemoryArchive) -> dict:
     return manifest
 
 
+def _manifest_json(manifest: dict) -> str:
+    return json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+
+
+def _manifest_digest(manifest_json: str) -> str:
+    return hashlib.sha256(manifest_json.encode("utf-8")).hexdigest()
+
+
+def _private_identity(
+    path: Path,
+    observed: os.stat_result,
+    *,
+    expected_mode: int,
+    directory: bool,
+) -> dict[str, int | str]:
+    expected_kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_kind(observed.st_mode):
+        raise ValueError("profile backup identity is not the expected file type")
+    if stat.S_IMODE(observed.st_mode) != expected_mode:
+        raise ValueError("profile backup permissions are not private")
+    if observed.st_uid != os.geteuid():
+        raise ValueError("profile backup ownership changed")
+    return {
+        "path": str(path),
+        "device": int(observed.st_dev),
+        "inode": int(observed.st_ino),
+        "uid": int(observed.st_uid),
+        "mode": int(stat.S_IMODE(observed.st_mode)),
+    }
+
+
+def _hash_open_file(fd: int) -> str:
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while chunk := os.read(fd, 1024 * 1024):
+        digest.update(chunk)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def _validate_staged_backups(
+    archive: PersonalMemoryArchive,
+    manifest: dict,
+    backup_paths: tuple[Path, ...],
+) -> tuple[tuple[Path, ...], str]:
+    """Validate exact private snapshots without following a pathname twice."""
+    if not _secure_snapshot_primitives_available():
+        raise ValueError("secure profile backup validation is not supported")
+    entries = manifest["entries"]
+    expected_backups = tuple(Path(entry["backup_path"]) for entry in entries)
+    resolved_backups = tuple(
+        Path(path).expanduser().absolute() for path in backup_paths
+    )
+    if not resolved_backups:
+        raise ValueError("at least one backup from the staged manifest is required")
+    if resolved_backups != expected_backups:
+        raise ValueError("profile backups must match the trusted staged manifest")
+
+    backup_root = (
+        archive.path.parent.expanduser().absolute() / ".canonical-profile-backups"
+    )
+    identities: dict[str, object]
+    try:
+        with ExitStack() as stack:
+            root_fd = _open_directory_chain(backup_root, stack)
+            root_identity = os.fstat(root_fd)
+            identities = {
+                "version": 1,
+                "root": _private_identity(
+                    backup_root,
+                    root_identity,
+                    expected_mode=0o700,
+                    directory=True,
+                ),
+                "entries": [],
+            }
+            identity_entries: list[dict[str, object]] = []
+            for backup, entry in zip(resolved_backups, entries, strict=True):
+                if backup.parent.parent != backup_root:
+                    raise ValueError(
+                        "profile backup path is outside the private backup root"
+                    )
+                snapshot_fd = _stack_fd(
+                    stack,
+                    os.open(
+                        backup.parent.name,
+                        _directory_open_flags(),
+                        dir_fd=root_fd,
+                    ),
+                )
+                snapshot_identity = os.fstat(snapshot_fd)
+                snapshot_record = _private_identity(
+                    backup.parent,
+                    snapshot_identity,
+                    expected_mode=0o700,
+                    directory=True,
+                )
+                backup_fd = _stack_fd(
+                    stack,
+                    os.open(
+                        backup.name,
+                        os.O_RDONLY | os.O_NOFOLLOW,
+                        dir_fd=snapshot_fd,
+                    ),
+                )
+                backup_identity = os.fstat(backup_fd)
+                backup_record = _private_identity(
+                    backup,
+                    backup_identity,
+                    expected_mode=0o600,
+                    directory=False,
+                )
+                if _hash_open_file(backup_fd) != entry["sha256"]:
+                    raise ValueError(
+                        "profile backup snapshot does not match staged manifest"
+                    )
+                after_hash = os.fstat(backup_fd)
+                if (after_hash.st_dev, after_hash.st_ino) != (
+                    backup_identity.st_dev,
+                    backup_identity.st_ino,
+                ):
+                    raise ValueError("profile backup identity changed")
+                verify_snapshot_fd = _stack_fd(
+                    stack,
+                    os.open(
+                        backup.parent.name,
+                        _directory_open_flags(),
+                        dir_fd=root_fd,
+                    ),
+                )
+                verified_snapshot = os.fstat(verify_snapshot_fd)
+                if (verified_snapshot.st_dev, verified_snapshot.st_ino) != (
+                    snapshot_identity.st_dev,
+                    snapshot_identity.st_ino,
+                ):
+                    raise ValueError("profile backup directory identity changed")
+                verify_backup_fd = _stack_fd(
+                    stack,
+                    os.open(
+                        backup.name,
+                        os.O_RDONLY | os.O_NOFOLLOW,
+                        dir_fd=verify_snapshot_fd,
+                    ),
+                )
+                verified_backup = os.fstat(verify_backup_fd)
+                if (verified_backup.st_dev, verified_backup.st_ino) != (
+                    backup_identity.st_dev,
+                    backup_identity.st_ino,
+                ):
+                    raise ValueError("profile backup identity changed")
+                identity_entries.append(
+                    {
+                        "backup_path": str(backup),
+                        "directory": snapshot_record,
+                        "file": backup_record,
+                    }
+                )
+            root_observed = os.fstat(root_fd)
+            if (root_observed.st_dev, root_observed.st_ino) != (
+                root_identity.st_dev,
+                root_identity.st_ino,
+            ):
+                raise ValueError("profile backup root identity changed")
+            identities["entries"] = identity_entries
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError("profile backup path is missing or unsafe") from exc
+    return resolved_backups, json.dumps(
+        identities,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def validate_local_personal_archive(path: str | Path) -> None:
     """Validate an existing archive without creating or mutating it."""
     archive_path = Path(path).expanduser()
@@ -381,28 +557,42 @@ def activate_canonical_profile(
     validate_local_personal_archive(archive.path)
 
     manifest = _read_manifest(archive)
-    entries = manifest["entries"]
-    expected_backups = tuple(Path(entry["backup_path"]) for entry in entries)
-    resolved_backups = tuple(
-        Path(path).expanduser().absolute() for path in backup_paths
+    _, backup_identities_json = _validate_staged_backups(
+        archive,
+        manifest,
+        backup_paths,
     )
-    if not resolved_backups:
-        raise ValueError("at least one backup from the staged manifest is required")
-    if resolved_backups != expected_backups:
-        raise ValueError("profile backups must match the trusted staged manifest")
-    for backup, entry in zip(resolved_backups, entries, strict=True):
-        if backup.is_symlink() or not backup.is_file():
-            raise ValueError("all profile backups must be readable files")
-        try:
-            snapshot_hash = hashlib.sha256(backup.read_bytes()).hexdigest()
-        except OSError as exc:
-            raise ValueError("all profile backups must be readable files") from exc
-        if snapshot_hash != entry["sha256"]:
-            raise ValueError("profile backup snapshot does not match staged manifest")
-
-    manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    manifest_json = _manifest_json(manifest)
     archive.mark_canonical_profile_active(
-        manifest_sha256=hashlib.sha256(manifest_json.encode("utf-8")).hexdigest()
+        manifest_json=manifest_json,
+        manifest_sha256=_manifest_digest(manifest_json),
+        backup_identities_json=backup_identities_json,
+    )
+
+
+def deactivate_canonical_profile(
+    archive: PersonalMemoryArchive,
+    *,
+    backup_paths: tuple[Path, ...],
+) -> None:
+    """Re-enable current static profile sources without restoring backup bytes."""
+    if not isinstance(archive, PersonalMemoryArchive):
+        raise ValueError("a local personal-memory archive is required")
+    validate_local_personal_archive(archive.path)
+    manifest = _read_manifest(archive)
+    _, backup_identities_json = _validate_staged_backups(
+        archive,
+        manifest,
+        backup_paths,
+    )
+    active_identities = archive.get_metadata(_ACTIVE_IDENTITIES_KEY, "")
+    if not active_identities or active_identities != backup_identities_json:
+        raise ValueError("profile backup identity differs from activation attestation")
+    manifest_json = _manifest_json(manifest)
+    archive.mark_canonical_profile_inactive(
+        manifest_json=manifest_json,
+        manifest_sha256=_manifest_digest(manifest_json),
+        backup_identities_json=backup_identities_json,
     )
 
 
@@ -410,5 +600,6 @@ __all__ = [
     "LegacyProfileMigrator",
     "ProfileMigrationResult",
     "activate_canonical_profile",
+    "deactivate_canonical_profile",
     "validate_local_personal_archive",
 ]

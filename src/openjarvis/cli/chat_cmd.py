@@ -64,10 +64,17 @@ def _read_input(prompt: str = "You> ") -> Optional[str]:
         return None
 
 
-def _personal_memory_status(config, personal_mode: str) -> str:
+def _personal_memory_status(
+    config,
+    personal_mode: str,
+    *,
+    canonical_profile_active: bool = False,
+) -> str:
     """Describe whether stored personal memory can influence responses."""
     if not config.agent.context_from_memory:
         return "collecting; response injection disabled"
+    if canonical_profile_active:
+        return "canonical profile active"
     if personal_mode == "shadow":
         return "collecting; direct rule injection enabled"
     return "active"
@@ -349,7 +356,11 @@ def chat(
         if personal_memory_service is not None:
             personal_memory_service.start()
             personal_mode = getattr(config.personal_memory, "mode", "active")
-            personal_status = _personal_memory_status(config, personal_mode)
+            personal_status = _personal_memory_status(
+                config,
+                personal_mode,
+                canonical_profile_active=canonical_profile_active,
+            )
             console.print(f"[dim]  Personal memory: {personal_status}[/dim]")
     except Exception as exc:
         console.print(f"[yellow]Personal memory unavailable: {exc}[/yellow]")

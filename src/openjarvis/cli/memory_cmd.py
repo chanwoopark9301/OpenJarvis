@@ -456,6 +456,50 @@ def activate_canonical_profile_command(backup_paths: tuple[Path, ...]) -> None:
     Console().print("[green]Canonical profile activated.[/green]")
 
 
+@memory.command(name="deactivate-canonical-profile")
+@click.option(
+    "--backup-path",
+    "backup_paths",
+    multiple=True,
+    type=click.Path(path_type=Path),
+    help="Attested recovery backup; may be repeated.",
+)
+def deactivate_canonical_profile_command(backup_paths: tuple[Path, ...]) -> None:
+    """Re-enable current USER/MEMORY files after backup revalidation."""
+    from openjarvis.memory.archive import PersonalMemoryArchive
+    from openjarvis.memory.profile_migration import (
+        deactivate_canonical_profile,
+        validate_local_personal_archive,
+    )
+
+    config = load_config()
+    try:
+        validate_local_personal_archive(config.personal_memory.archive_path)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    archive = PersonalMemoryArchive(config.personal_memory.archive_path)
+    selected_backups = backup_paths
+    if not selected_backups:
+        try:
+            manifest = json.loads(
+                archive.get_metadata("canonical_profile_staging_manifest", "{}")
+            )
+            entries = manifest.get("entries", []) if isinstance(manifest, dict) else []
+            stored = [entry["backup_path"] for entry in entries]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            stored = []
+        if isinstance(stored, list):
+            selected_backups = tuple(Path(str(path)) for path in stored)
+    try:
+        deactivate_canonical_profile(archive, backup_paths=selected_backups)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    Console().print(
+        "[green]Canonical profile deactivated; current static profile files "
+        "were not changed.[/green]"
+    )
+
+
 @memory.command()
 @click.option(
     "--backend",

@@ -635,15 +635,31 @@ class PersonalMemoryArchive:
                 )
         return imported, skipped
 
-    def mark_canonical_profile_active(self, *, manifest_sha256: str) -> None:
+    def mark_canonical_profile_active(
+        self,
+        *,
+        manifest_json: str,
+        manifest_sha256: str,
+        backup_identities_json: str,
+    ) -> None:
         """Activate canonical profile authority and append an audit decision."""
         now = time.time()
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            staged = connection.execute(
+                "SELECT value FROM archive_metadata "
+                "WHERE key = 'canonical_profile_staging_manifest'"
+            ).fetchone()
+            if staged is None or str(staged["value"]) != manifest_json:
+                raise ValueError("canonical profile staging manifest changed")
             for key, value in (
                 ("canonical_profile_active", "1"),
                 ("canonical_profile_activated_at", str(now)),
                 ("canonical_profile_active_manifest_sha256", manifest_sha256),
+                (
+                    "canonical_profile_active_backup_identities",
+                    backup_identities_json,
+                ),
             ):
                 connection.execute(
                     """
@@ -659,6 +675,73 @@ class PersonalMemoryArchive:
                   affected_ids_json, details_json, created_at
                 ) VALUES (?, 'canonical_profile', 'rollout', 'no_op',
                           'canonical_profile_activated', '[]', ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    json.dumps(
+                        {"manifest_sha256": manifest_sha256},
+                        separators=(",", ":"),
+                    ),
+                    now,
+                ),
+            )
+
+    def mark_canonical_profile_inactive(
+        self,
+        *,
+        manifest_json: str,
+        manifest_sha256: str,
+        backup_identities_json: str,
+    ) -> None:
+        """Clear canonical cutover only when its exact attestation still matches."""
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT key, value FROM archive_metadata
+                WHERE key IN (
+                  'canonical_profile_active',
+                  'canonical_profile_staging_manifest',
+                  'canonical_profile_active_manifest_sha256',
+                  'canonical_profile_active_backup_identities'
+                )
+                """
+            ).fetchall()
+            metadata = {str(row["key"]): str(row["value"]) for row in rows}
+            if metadata.get("canonical_profile_active") != "1":
+                raise ValueError("canonical profile is not active")
+            if metadata.get("canonical_profile_staging_manifest") != manifest_json:
+                raise ValueError("canonical profile staging manifest changed")
+            if (
+                metadata.get("canonical_profile_active_manifest_sha256")
+                != manifest_sha256
+            ):
+                raise ValueError("canonical profile active manifest changed")
+            if (
+                metadata.get("canonical_profile_active_backup_identities")
+                != backup_identities_json
+            ):
+                raise ValueError("canonical profile backup identity changed")
+            for key, value in (
+                ("canonical_profile_active", "0"),
+                ("canonical_profile_deactivated_at", str(now)),
+                ("canonical_profile_inactive_manifest_sha256", manifest_sha256),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO archive_metadata(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, value),
+                )
+            connection.execute(
+                """
+                INSERT INTO memory_decisions (
+                  id, subject_id, subject_type, operation, reason_code,
+                  affected_ids_json, details_json, created_at
+                ) VALUES (?, 'canonical_profile', 'rollout', 'no_op',
+                          'canonical_profile_deactivated', '[]', ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -2238,10 +2321,7 @@ class PersonalMemoryArchive:
                 dict.fromkeys(str(value) for value in superseded_claim_ids)
             )
             superseded = requested_superseded
-            if (
-                candidate.kind in DIRECT_RULE_KINDS
-                and candidate.subject != "user"
-            ):
+            if candidate.kind in DIRECT_RULE_KINDS and candidate.subject != "user":
                 atomic_values = tuple(sorted(kind.value for kind in atomic_claim_kinds))
                 placeholders = ",".join("?" for _ in atomic_values)
                 active_rows = connection.execute(

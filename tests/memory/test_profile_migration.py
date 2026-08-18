@@ -23,6 +23,7 @@ from openjarvis.memory.personal_models import EvidenceSource
 from openjarvis.memory.profile_migration import (
     LegacyProfileMigrator,
     activate_canonical_profile,
+    deactivate_canonical_profile,
 )
 
 
@@ -120,6 +121,100 @@ def test_activation_stops_static_dynamic_profile_injection(tmp_path):
     assert effective.soul_path == original_files.soul_path
     assert effective.user_path == ""
     assert effective.memory_path == ""
+
+
+def test_deactivation_preserves_current_static_files_and_audits_cutover(tmp_path):
+    """Rollback changes prompt authority without restoring stale snapshot bytes."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    staged = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    activate_canonical_profile(archive, backup_paths=staged.backup_paths)
+    user_path.write_text("CURRENT USER PROFILE", encoding="utf-8")
+    memory_path.write_text("CURRENT MEMORY PROFILE", encoding="utf-8")
+
+    deactivate_canonical_profile(archive, backup_paths=staged.backup_paths)
+
+    assert archive.get_metadata("canonical_profile_active", "1") == "0"
+    assert archive.get_metadata("canonical_profile_deactivated_at", "")
+    assert user_path.read_text(encoding="utf-8") == "CURRENT USER PROFILE"
+    assert memory_path.read_text(encoding="utf-8") == "CURRENT MEMORY PROFILE"
+    assert archive.decision_count(subject_id="canonical_profile") == 2
+
+
+@pytest.mark.parametrize("failure", ("missing", "tampered", "replaced", "mode"))
+def test_deactivation_fails_closed_when_attested_backup_changes(tmp_path, failure):
+    """Rollback requires the same private snapshots attested at activation."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    staged = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    activate_canonical_profile(archive, backup_paths=staged.backup_paths)
+    target = staged.backup_paths[0]
+    if failure == "missing":
+        target.unlink()
+    elif failure == "tampered":
+        target.write_text("tampered", encoding="utf-8")
+        target.chmod(0o600)
+    elif failure == "replaced":
+        original = target.read_bytes()
+        target.unlink()
+        target.write_bytes(original)
+        target.chmod(0o600)
+    else:
+        target.chmod(0o644)
+
+    with pytest.raises(ValueError, match="backup"):
+        deactivate_canonical_profile(archive, backup_paths=staged.backup_paths)
+
+    assert archive.get_metadata("canonical_profile_active", "0") == "1"
+    assert archive.get_metadata("canonical_profile_deactivated_at", "") == ""
+    assert archive.decision_count(subject_id="canonical_profile") == 1
+
+
+def test_deactivation_requires_exact_active_manifest_and_backup_order(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    staged = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    activate_canonical_profile(archive, backup_paths=staged.backup_paths)
+
+    with pytest.raises(ValueError, match="manifest"):
+        deactivate_canonical_profile(
+            archive,
+            backup_paths=tuple(reversed(staged.backup_paths)),
+        )
+
+    manifest = archive.get_metadata("canonical_profile_staging_manifest")
+    archive.set_metadata(
+        "canonical_profile_staging_manifest",
+        manifest.replace('"version":1', '"version":2'),
+    )
+    with pytest.raises(ValueError, match="manifest"):
+        deactivate_canonical_profile(archive, backup_paths=staged.backup_paths)
+    assert archive.get_metadata("canonical_profile_active", "0") == "1"
+
+
+def test_deactivation_metadata_and_audit_are_atomic(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    staged = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    activate_canonical_profile(archive, backup_paths=staged.backup_paths)
+    with sqlite3.connect(archive.path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_deactivation_audit
+            BEFORE INSERT ON memory_decisions
+            WHEN NEW.reason_code = 'canonical_profile_deactivated'
+            BEGIN
+              SELECT RAISE(ABORT, 'deactivation audit unavailable');
+            END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="audit unavailable"):
+        deactivate_canonical_profile(archive, backup_paths=staged.backup_paths)
+
+    assert archive.get_metadata("canonical_profile_active", "0") == "1"
+    assert archive.get_metadata("canonical_profile_deactivated_at", "") == ""
+    assert archive.decision_count(subject_id="canonical_profile") == 1
 
 
 def test_activation_cannot_rehydrate_named_persona_user_or_memory(

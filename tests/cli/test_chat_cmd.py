@@ -38,6 +38,19 @@ def test_personal_memory_status_reports_disabled_response_injection():
     )
 
 
+def test_personal_memory_status_reports_canonical_projection_after_cutover():
+    config = JarvisConfig()
+
+    assert (
+        _personal_memory_status(
+            config,
+            "shadow",
+            canonical_profile_active=True,
+        )
+        == "canonical profile active"
+    )
+
+
 def test_prompt_builder_injection_requires_capability_and_explicit_parameter():
     class KeywordOnlyReceiver:
         accepts_prompt_builder = True
@@ -508,6 +521,7 @@ class TestChatAgents:
         config.memory.enabled = True
         config.memory.facts_path = str(facts_path)
         config.agent.context_from_memory = True
+        config.personal_memory.archive_path = str(tmp_path / "personal-memory.db")
 
         with (
             patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
@@ -659,7 +673,10 @@ class TestChatAgents:
         assert spy.stopped is True
         assert spy.submissions == [("hello", "simple ok")]
 
-    def test_chat_archives_completed_turn_with_personal_memory_service(self) -> None:
+    def test_chat_archives_completed_turn_with_personal_memory_service(
+        self,
+        tmp_path,
+    ) -> None:
         """The REPL must archive a finished turn before it announces completion."""
 
         class _SpyPersonalMemoryService:
@@ -692,6 +709,7 @@ class TestChatAgents:
         config.intelligence.default_model = "test-model"
         config.personal_memory.enabled = True
         config.personal_memory.mode = "shadow"
+        config.personal_memory.archive_path = str(tmp_path / "personal-memory.db")
 
         with (
             patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
