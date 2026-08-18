@@ -115,10 +115,11 @@ Delayed background evaluation cannot reverse a newer direct statement for the
 same subject. The archive orders direct evidence by source-exchange time and
 exchange ID, then by candidate/evidence time and ID for a deterministic tie.
 Inside the same write transaction, an older direct rule is rejected when a
-newer direct rule is active; an older direct-source fact or preference is also
-rejected when a newer correction is active. A genuinely newer explicit
-correction still applies normally. Stale attempts and the active claim remain
-auditable without rewriting evidence.
+newer same-subject atomic claim is active. The same chronology rule applies to
+direct-source facts and preferences, so delayed model classification cannot
+make an older observation coexist with a newer role preference or correction.
+A genuinely newer explicit correction still applies normally. Stale attempts
+and the active claim remain auditable without rewriting evidence.
 
 Accepted non-direct facts and preferences first remain atomic claims. Schema
 consolidation and reflection run only after recurrent cross-session evidence or
@@ -243,6 +244,10 @@ non-content audit decision. Current `USER.md` and `MEMORY.md` bytes are never
 restored or overwritten; those current sources simply become eligible for
 static injection again. Missing, modified, replaced, or permission-weakened
 backups fail closed and leave both canonical metadata and audit state unchanged.
+All root, snapshot-directory, and file descriptors remain pinned across the
+cutover. After every manifest hash finishes, the whole set is freshly reopened
+and fully revalidated; the hashes and identities are checked again inside the
+SQLite transaction immediately before metadata and audit writes.
 
 Preserve the archive, manifest, and snapshots after deactivation. This command
 is a safe authority rollback, not an automatic file restore. Do not use
