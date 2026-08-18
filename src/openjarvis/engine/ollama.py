@@ -169,8 +169,13 @@ class OllamaEngine(AsyncHTTPEngineMixin, InferenceEngine):
                 payload["format"] = "json"
             elif isinstance(response_format, dict):
                 if response_format.get("type") == "json_schema":
-                    wrapped = response_format.get("json_schema") or {}
-                    payload["format"] = wrapped.get("schema") or "json"
+                    wrapped = response_format.get("json_schema")
+                    schema = (
+                        wrapped.get("schema") if isinstance(wrapped, dict) else None
+                    )
+                    payload["format"] = (
+                        schema if isinstance(schema, dict) and schema else "json"
+                    )
                 else:
                     payload["format"] = "json"
         try:

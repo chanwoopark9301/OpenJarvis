@@ -70,6 +70,46 @@ def test_generate_passes_json_schema_to_ollama() -> None:
     assert sent_payloads[0]["format"] == schema
 
 
+@pytest.mark.parametrize(
+    "json_schema",
+    [
+        "memory_candidates",
+        {"name": "memory_candidates", "schema": "not-a-schema"},
+        {"name": "memory_candidates", "schema": ["not-a-schema"]},
+        {"name": "memory_candidates", "schema": {}},
+    ],
+    ids=["non_dict_wrapper", "string_schema", "list_schema", "empty_schema"],
+)
+def test_generate_falls_back_to_json_for_invalid_json_schema(
+    json_schema: object,
+) -> None:
+    """Only a non-empty schema dictionary is valid for Ollama's format field."""
+    sent_payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent_payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": "{}"}},
+        )
+
+    engine = OllamaEngine(host="http://testhost:11434")
+    engine._client.close()
+    engine._client = httpx.Client(
+        base_url="http://testhost:11434", transport=httpx.MockTransport(handler)
+    )
+    try:
+        engine.generate(
+            [Message(role=Role.USER, content="Find memory candidates")],
+            model="qwen3.5:9b",
+            response_format={"type": "json_schema", "json_schema": json_schema},
+        )
+    finally:
+        engine._client.close()
+
+    assert sent_payloads[0]["format"] == "json"
+
+
 @requires_respx
 class TestOllamaGenerate:
     def test_generate_returns_content(self, engine: OllamaEngine) -> None:
