@@ -26,8 +26,14 @@ def test_builtin_agent_import_registers_proactive_in_fresh_process():
             "-c",
             (
                 "import openjarvis.agents; "
-                "from openjarvis.core.registry import AgentRegistry; "
-                "print(AgentRegistry.contains('proactive'))"
+                "from openjarvis.cli.chat_cmd import "
+                "_ensure_requested_agent_registered; "
+                "from openjarvis.core.registry import AgentRegistry, ToolRegistry; "
+                "print(AgentRegistry.contains('proactive'), "
+                "ToolRegistry.contains('check_permission')); "
+                "_ensure_requested_agent_registered('proactive'); "
+                "print(AgentRegistry.contains('proactive'), "
+                "ToolRegistry.contains('check_permission'))"
             ),
         ],
         check=True,
@@ -35,7 +41,7 @@ def test_builtin_agent_import_registers_proactive_in_fresh_process():
         text=True,
     )
 
-    assert result.stdout.strip() == "True"
+    assert result.stdout.splitlines() == ["False False", "True True"]
 
 
 def test_proactive_prompt_uses_shared_prompt_builder_not_global_profile(

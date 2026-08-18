@@ -6,10 +6,10 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sqlite3
 import stat
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,31 +46,37 @@ class LegacyProfileMigrator:
         memory_path: Path,
     ) -> ProfileMigrationResult:
         """Copy, preflight, then atomically import exact profile snapshots."""
+        if not _secure_snapshot_primitives_available():
+            raise ValueError("secure profile snapshots are not supported")
         sources = tuple(
             Path(path).expanduser().absolute() for path in (user_path, memory_path)
         )
         backup_dir = self.archive.path.parent / ".canonical-profile-backups"
-        backup_root_fd = _open_private_backup_root(backup_dir)
         snapshots: list[tuple[Path, Path, bytes]] = []
-        try:
+        with ExitStack() as backup_stack:
+            backup_root_fd: int | None = None
+            backup_root_identity: os.stat_result | None = None
             for source in sources:
-                if not source.exists():
-                    continue
-                if source.is_symlink():
-                    raise ValueError(
-                        f"legacy profile path must not be a symlink: {source}"
+                with ExitStack() as source_stack:
+                    opened_source = _open_regular_source(source, source_stack)
+                    if opened_source is None:
+                        continue
+                    source_fd, source_identity = opened_source
+                    if backup_root_fd is None:
+                        backup_root_fd, backup_root_identity = (
+                            _open_private_backup_root(backup_dir, backup_stack)
+                        )
+                    assert backup_root_identity is not None
+                    backup, snapshot = _copy_private_snapshot(
+                        source,
+                        source_fd,
+                        source_identity,
+                        backup_dir,
+                        backup_root_fd,
+                        backup_root_identity,
                     )
-                if not source.is_file():
-                    raise ValueError(f"legacy profile path is not a file: {source}")
-                backup, snapshot = _copy2_private_snapshot(
-                    source,
-                    backup_dir,
-                    backup_root_fd,
-                )
-                snapshot.decode("utf-8")
-                snapshots.append((source, backup, snapshot))
-        finally:
-            os.close(backup_root_fd)
+                    snapshot.decode("utf-8")
+                    snapshots.append((source, backup, snapshot))
 
         old_manifest = _read_manifest(self.archive)
         merged = {
@@ -132,90 +138,200 @@ class LegacyProfileMigrator:
         )
 
 
+def _secure_snapshot_primitives_available() -> bool:
+    """Return whether descriptor-only, no-follow snapshot operations exist."""
+    return bool(
+        os.name == "posix"
+        and getattr(os, "O_DIRECTORY", 0)
+        and getattr(os, "O_NOFOLLOW", 0)
+        and hasattr(os, "fchmod")
+        and os.open in os.supports_dir_fd
+        and os.mkdir in os.supports_dir_fd
+        and os.utime in os.supports_fd
+    )
+
+
 def _directory_open_flags() -> int:
-    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
-def _open_private_backup_root(backup_dir: Path) -> int:
-    """Open or atomically create the non-symlink private backup root."""
+def _close_fd(fd: int) -> None:
+    """Close one descriptor, retrying once while preserving cleanup failure."""
     try:
-        os.mkdir(backup_dir, mode=0o700)
+        os.close(fd)
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def _stack_fd(stack: ExitStack, fd: int) -> int:
+    stack.callback(_close_fd, fd)
+    return fd
+
+
+def _force_mode(fd: int, mode: int) -> None:
+    """Apply a private mode, retrying once before preserving the failure."""
+    try:
+        os.fchmod(fd, mode)
+    except OSError:
+        try:
+            os.fchmod(fd, mode)
+        except OSError:
+            pass
+        raise
+
+
+def _open_directory_chain(path: Path, stack: ExitStack) -> int:
+    """Open every absolute directory component without following symlinks."""
+    absolute = path.absolute()
+    current_fd = _stack_fd(stack, os.open(absolute.anchor, _directory_open_flags()))
+    for component in absolute.parts[1:]:
+        current_fd = _stack_fd(
+            stack,
+            os.open(component, _directory_open_flags(), dir_fd=current_fd),
+        )
+    return current_fd
+
+
+def _open_regular_source(
+    source: Path,
+    stack: ExitStack,
+) -> tuple[int, os.stat_result] | None:
+    """Open one optional source once, rejecting symlinks and non-files."""
+    try:
+        parent_fd = _open_directory_chain(source.parent, stack)
+        source_fd = _stack_fd(
+            stack,
+            os.open(source.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd),
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("legacy profile path is unsafe or contains a symlink") from exc
+    source_identity = os.fstat(source_fd)
+    if not stat.S_ISREG(source_identity.st_mode):
+        raise ValueError("legacy profile path is not a regular file")
+    return source_fd, source_identity
+
+
+def _open_private_backup_root(
+    backup_dir: Path,
+    stack: ExitStack,
+) -> tuple[int, os.stat_result]:
+    """Open or atomically create the non-symlink private backup root."""
+    parent_fd = _open_directory_chain(backup_dir.parent, stack)
+    try:
+        os.mkdir(backup_dir.name, mode=0o700, dir_fd=parent_fd)
     except FileExistsError:
         pass
     try:
-        root_fd = os.open(backup_dir, _directory_open_flags())
+        root_fd = _stack_fd(
+            stack,
+            os.open(backup_dir.name, _directory_open_flags(), dir_fd=parent_fd),
+        )
     except OSError as exc:
         raise ValueError("profile backup directory is unsafe") from exc
     root_stat = os.fstat(root_fd)
     if not stat.S_ISDIR(root_stat.st_mode):
-        os.close(root_fd)
         raise ValueError("profile backup directory is unsafe")
-    os.fchmod(root_fd, 0o700)
-    return root_fd
+    _force_mode(root_fd, 0o700)
+    return root_fd, root_stat
 
 
-def _copy2_private_snapshot(
+def _copy_fd_bytes(source_fd: int, backup_fd: int) -> None:
+    """Copy bytes between already-open descriptors without resolving paths."""
+    while True:
+        chunk = os.read(source_fd, 1024 * 1024)
+        if not chunk:
+            return
+        remaining = memoryview(chunk)
+        while remaining:
+            written = os.write(backup_fd, remaining)
+            if written <= 0:
+                raise OSError("profile snapshot write made no progress")
+            remaining = remaining[written:]
+
+
+def _verify_backup_path_identity(
+    backup: Path,
+    expected: os.stat_result,
+) -> None:
+    """Ensure the recovery path still resolves to the reserved inode."""
+    try:
+        with ExitStack() as stack:
+            parent_fd = _open_directory_chain(backup.parent, stack)
+            verification_fd = _stack_fd(
+                stack,
+                os.open(
+                    backup.name,
+                    os.O_RDONLY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                ),
+            )
+            observed = os.fstat(verification_fd)
+    except OSError as exc:
+        raise ValueError("profile backup path identity changed") from exc
+    if (observed.st_dev, observed.st_ino) != (
+        expected.st_dev,
+        expected.st_ino,
+    ) or not stat.S_ISREG(observed.st_mode):
+        raise ValueError("profile backup path identity changed")
+
+
+def _copy_private_snapshot(
     source: Path,
+    source_fd: int,
+    source_identity: os.stat_result,
     backup_dir: Path,
     backup_root_fd: int,
+    backup_root_identity: os.stat_result,
 ) -> tuple[Path, bytes]:
-    """Reserve an unreplaceable destination, then copy metadata and bytes."""
+    """Copy an opened source into an exclusive destination descriptor."""
     snapshot_name = uuid.uuid4().hex
     try:
         os.mkdir(snapshot_name, mode=0o700, dir_fd=backup_root_fd)
     except FileExistsError as exc:
         raise ValueError("profile backup destination collision") from exc
-    snapshot_fd = os.open(
-        snapshot_name,
-        _directory_open_flags(),
-        dir_fd=backup_root_fd,
-    )
     backup = (backup_dir / snapshot_name / source.name).absolute()
-    file_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        backup_fd = os.open(source.name, file_flags, 0o600, dir_fd=snapshot_fd)
-    except Exception:
-        os.close(snapshot_fd)
-        raise
-    root_identity = os.fstat(backup_root_fd)
-    snapshot_identity = os.fstat(snapshot_fd)
-    backup_identity = os.fstat(backup_fd)
-    try:
-        # Removing directory write permission makes the reserved inode impossible
-        # to replace between the validation and copy2's destination open.
-        os.fchmod(snapshot_fd, 0o500)
-        os.fchmod(backup_root_fd, 0o500)
-        path_root = os.lstat(backup_dir)
-        path_snapshot = os.lstat(backup.parent)
-        path_backup = os.lstat(backup)
-        if (
-            (path_root.st_dev, path_root.st_ino)
-            != (root_identity.st_dev, root_identity.st_ino)
-            or (path_snapshot.st_dev, path_snapshot.st_ino)
-            != (snapshot_identity.st_dev, snapshot_identity.st_ino)
-            or (path_backup.st_dev, path_backup.st_ino)
-            != (backup_identity.st_dev, backup_identity.st_ino)
-            or not stat.S_ISREG(path_backup.st_mode)
-        ):
+    with ExitStack() as stack:
+        snapshot_fd = _stack_fd(
+            stack,
+            os.open(snapshot_name, _directory_open_flags(), dir_fd=backup_root_fd),
+        )
+        _force_mode(snapshot_fd, 0o700)
+        file_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        backup_fd = _stack_fd(
+            stack,
+            os.open(source.name, file_flags, 0o600, dir_fd=snapshot_fd),
+        )
+        backup_identity = os.fstat(backup_fd)
+        if not stat.S_ISREG(backup_identity.st_mode):
             raise ValueError("profile backup destination is unsafe")
-        shutil.copy2(source, backup, follow_symlinks=False)
-        copied = os.lstat(backup)
-        if (copied.st_dev, copied.st_ino) != (
-            backup_identity.st_dev,
-            backup_identity.st_ino,
-        ) or not stat.S_ISREG(copied.st_mode):
-            raise ValueError("profile backup destination is unsafe")
-        os.fchmod(backup_fd, 0o600)
-        os.fsync(backup_fd)
-        os.lseek(backup_fd, 0, os.SEEK_SET)
-        with os.fdopen(os.dup(backup_fd), "rb") as snapshot_handle:
-            snapshot = snapshot_handle.read()
-    finally:
-        os.fchmod(snapshot_fd, 0o700)
-        os.fchmod(backup_root_fd, 0o700)
-        os.close(backup_fd)
-        os.close(snapshot_fd)
-    return backup, snapshot
+        try:
+            _copy_fd_bytes(source_fd, backup_fd)
+            os.utime(
+                backup_fd,
+                ns=(source_identity.st_atime_ns, source_identity.st_mtime_ns),
+            )
+            os.fsync(backup_fd)
+            _verify_backup_path_identity(backup, backup_identity)
+            root_observed = os.fstat(backup_root_fd)
+            if (root_observed.st_dev, root_observed.st_ino) != (
+                backup_root_identity.st_dev,
+                backup_root_identity.st_ino,
+            ):
+                raise ValueError("profile backup root identity changed")
+            os.lseek(backup_fd, 0, os.SEEK_SET)
+            snapshot = bytearray()
+            while chunk := os.read(backup_fd, 1024 * 1024):
+                snapshot.extend(chunk)
+        finally:
+            # The file starts at 0600 and descriptor copying never broadens it.
+            _force_mode(backup_fd, 0o600)
+    return backup, bytes(snapshot)
 
 
 def _read_manifest(archive: PersonalMemoryArchive) -> dict:

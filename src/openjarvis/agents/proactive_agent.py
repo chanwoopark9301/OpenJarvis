@@ -291,7 +291,13 @@ class ProactiveAgent(ToolUsingAgent):
 
     agent_id = "proactive"
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        prompt_builder: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> None:
+        kwargs["prompt_builder"] = prompt_builder
         self._notification_channel_id: str = kwargs.pop("notification_channel_id", "")
         self._hours_back: int = kwargs.pop("hours_back", 24)
         self._approval_store: Optional[ApprovalStore] = kwargs.pop(

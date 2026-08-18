@@ -244,3 +244,90 @@ Remediated all nine review findings without operating the user's installed profi
 
 - The secure destination implementation uses directory-relative file operations and POSIX permission/inode guarantees available on the supported local Unix execution path. No real installation paths were touched.
 - The unrelated server-route fixture mismatch recorded in fix round 1 remains outside Task 5; the required and broader covering suites are green.
+
+## Fix round 3: descriptor-only snapshots and explicit prompt capability
+
+### Controller ruling and status
+
+Replaced the literal `shutil.copy2` implementation with a descriptor-only equivalent. No source or destination content path is re-resolved during copying or import, and unsupported platforms refuse before a backup root or snapshot artifact is created.
+
+### RED evidence
+
+- New descriptor-boundary and failure-invariant selection initially produced `9 failed, 2 passed, 19 deselected`:
+  - descriptor-copy/source-swap helpers did not exist;
+  - unsupported-platform gating did not exist;
+  - injected `fstat` leaked descriptors in the prior helper;
+  - injected post-copy chmod left a copied file at source mode `0644`;
+  - cleanup and identity failure hooks did not exist.
+- The symlink-source regression also exposed an error-contract mismatch after no-follow open correctly refused the link; the safe error was normalized without exposing the configured path.
+- The explicit prompt-capability selection initially failed test collection because the capability and lazy-registration APIs did not exist.
+- The fresh-process proactive check established the expected side-effect boundary: before an explicit proactive request both proactive agent and proactive tool registration were absent; after the request both were present.
+- An injected one-shot directory chmod failure initially left an existing `0777` backup root unchanged, producing a focused RED failure. The mode application now retries once, repairs `0700`, and still preserves the original failure for refusal/audit.
+
+### Descriptor-only source and destination boundary
+
+- `_secure_snapshot_primitives_available` requires POSIX, `O_DIRECTORY`, `O_NOFOLLOW`, `fchmod`, directory-relative `open`/`mkdir`, and fd-capable `utime`. Failure is checked at the beginning of staging, before any backup artifact is created.
+- Every source ancestor is opened component-by-component with `O_DIRECTORY | O_NOFOLLOW`. The source itself is opened exactly once with `O_RDONLY | O_NOFOLLOW`, then `fstat` must identify a regular file.
+- The backup root and each snapshot directory are created/opened relative to already pinned parent/root descriptors. The destination is reserved with `O_EXCL | O_NOFOLLOW` at mode `0600`.
+- `_copy_fd_bytes` uses only `os.read(source_fd)` and `os.write(backup_fd)`. It never receives a filesystem path.
+- Source atime/mtime are copied through fd-capable `os.utime`; the destination is fsynced and forced to `0600`. Directories are forced to `0700`.
+- Import bytes are read back from the same still-open destination descriptor. A path is opened no-follow only for recovery-path device/inode verification; it is never used as a content source.
+- There are no `shutil`, `copy2`, or `_copy2_private_snapshot` references in the migration source or tests.
+
+### Swap and unsupported-platform probes
+
+- Replacing USER.md with an attacker symlink at the copy boundary still backs up/imports the originally opened USER descriptor; attacker content is absent.
+- Replacing the entire source ancestor with an attacker directory at the copy boundary likewise preserves the original content.
+- Replacing the backup-root ancestor during copying does not write into the attacker tree. Recovery-path verification detects the changed identity and refuses before database publication.
+- A simulated unsupported platform raises `secure profile snapshots are not supported` and leaves `.canonical-profile-backups` nonexistent.
+- A fixed source mtime regression confirms recovery timestamp preservation.
+
+### Exception and cleanup invariants
+
+- Nested `ExitStack` ownership covers every root, ancestor, source, snapshot, destination, and verification descriptor.
+- Cleanup callbacks continue closing remaining descriptors if one cleanup callback raises. `_close_fd` itself retries a failed close once while preserving the failure.
+- Injected failures cover copy, recovery-path identity verification, fsync, fstat, chmod, and cleanup. Every case returns `/dev/fd` count to its baseline.
+- Surviving backup roots and snapshot directories are always `0700`; destination files are always `0600`, including post-copy failure cases.
+- `_force_mode` retries one transient chmod failure before re-raising. This repairs an existing overly broad backup-root mode and preserves the refusal signal.
+
+### Explicit prompt-builder capability and proactive side effects
+
+- Removed all inference that `**kwargs` implies prompt-builder delivery.
+- Chat injection now requires both `accepts_prompt_builder=True` and a concrete `prompt_builder` parameter in the selected execution class's effective constructor signature.
+- `BaseAgent` declares the capability. ProactiveAgent, OperativeAgent, and MonitorOperativeAgent now expose and forward explicit `prompt_builder` parameters. A swallowing `**kwargs` wrapper is rejected by regression test even when it inherits the capability.
+- Proactive is no longer imported by the global built-in-agent import, avoiding its five proactive-tool registrations during ordinary agent loading.
+- `_ensure_requested_agent_registered('proactive')` lazily imports and, after registry-reset scenarios, explicitly re-registers only the ProactiveAgent class. A fresh-process test verifies proactive agent/tools are absent before the request and compatible afterward.
+- The registered external-provider proactive payload test remains green and excludes USER/MEMORY markers.
+
+### GREEN evidence
+
+- Focused profile migration suite: `31 passed in 0.24s`.
+- Focused prompt capability, lazy registration, and proactive privacy selection: `5 passed, 24 deselected in 0.61s`.
+- Required Task 5 plus affected MonitorOperative suite:
+  - `uv run pytest -q tests/memory/test_profile_migration.py tests/memory/test_context_composer.py tests/cli/test_memory_cmd.py tests/cli/test_chat_cmd.py tests/memory/test_developmental_memory_privacy.py tests/agents/test_proactive_agent.py tests/agents/test_monitor_operative.py`
+  - `97 passed in 1.15s`.
+- Broader memory and CLI suite:
+  - `uv run pytest -q tests/memory tests/cli`
+  - `844 passed, 16 skipped, 8 warnings in 12.76s`.
+- Full agent suite:
+  - `uv run pytest -q tests/agents`
+  - `559 passed in 4.33s`.
+- Ruff check, Ruff format check, and `git diff --check` pass on all round-three source/test files.
+
+### Files changed in fix round 3
+
+- `src/openjarvis/memory/profile_migration.py`
+- `src/openjarvis/cli/chat_cmd.py`
+- `src/openjarvis/agents/_stubs.py`
+- `src/openjarvis/agents/proactive_agent.py`
+- `src/openjarvis/agents/operative.py`
+- `src/openjarvis/agents/monitor_operative.py`
+- `src/openjarvis/agents/__init__.py`
+- `tests/memory/test_profile_migration.py`
+- `tests/cli/test_chat_cmd.py`
+- `tests/agents/test_proactive_agent.py`
+
+### Concerns
+
+- Secure staging intentionally refuses platforms without the complete no-follow/dir-fd/fd-timestamp primitive set; it does not fall back to a path-based copy.
+- The unrelated server-route fixture mismatch recorded in fix round 1 remains outside Task 5.

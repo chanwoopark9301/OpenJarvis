@@ -14,9 +14,10 @@ from openjarvis.agents._stubs import (
     ToolUsingAgent,
 )
 from openjarvis.cli.chat_cmd import (
-    _constructor_forwards_keyword,
+    _ensure_requested_agent_registered,
     _personal_memory_status,
     _read_input,
+    _supports_prompt_builder_injection,
     chat,
 )
 from openjarvis.core.config import JarvisConfig
@@ -36,25 +37,29 @@ def test_personal_memory_status_reports_disabled_response_injection():
     )
 
 
-def test_constructor_keyword_audit_follows_kwargs_chain_safely():
-    class AcceptingBase:
+def test_prompt_builder_injection_requires_capability_and_explicit_parameter():
+    class ExplicitReceiver:
+        accepts_prompt_builder = True
+
         def __init__(self, *, prompt_builder=None):
             pass
 
-    class SafeForwarder(AcceptingBase):
+    class SwallowingWrapper(ExplicitReceiver):
         def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
+            self.kwargs = kwargs
 
-    class RejectingBase:
-        def __init__(self, *, bus=None):
+    class NoCapability:
+        def __init__(self, *, prompt_builder=None):
             pass
 
-    class UnsafeForwarder(RejectingBase):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
+    assert _supports_prompt_builder_injection(ExplicitReceiver)
+    assert not _supports_prompt_builder_injection(SwallowingWrapper)
+    assert not _supports_prompt_builder_injection(NoCapability)
 
-    assert _constructor_forwards_keyword(SafeForwarder, "prompt_builder")
-    assert not _constructor_forwards_keyword(UnsafeForwarder, "prompt_builder")
+
+def test_requested_proactive_registration_is_lazy_and_compatible():
+    _ensure_requested_agent_registered("proactive")
+    assert AgentRegistry.contains("proactive")
 
 
 class _SimpleChatAgent(BaseAgent):

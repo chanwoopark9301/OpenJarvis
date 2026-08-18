@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import logging
 import sys
@@ -25,27 +26,29 @@ from openjarvis.memory import record_and_publish_completed_exchange
 logger = logging.getLogger(__name__)
 
 
-def _constructor_forwards_keyword(agent_cls: object, keyword: str) -> bool:
-    """Verify that each ``**kwargs`` hop reaches an explicit keyword receiver."""
+def _supports_prompt_builder_injection(agent_cls: object) -> bool:
+    """Require an explicit capability and an explicit constructor parameter."""
     if not isinstance(agent_cls, type):
         return False
-    for current in agent_cls.__mro__:
-        constructor = current.__dict__.get("__init__")
-        if constructor is None:
-            continue
-        try:
-            parameters = inspect.signature(constructor).parameters
-        except (TypeError, ValueError):
-            return False
-        if keyword in parameters:
-            return True
-        if any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
-        ):
-            continue
+    if not getattr(agent_cls, "accepts_prompt_builder", False):
         return False
-    return False
+    try:
+        parameter = inspect.signature(agent_cls.__init__).parameters.get(
+            "prompt_builder"
+        )
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind != inspect.Parameter.VAR_KEYWORD
+
+
+def _ensure_requested_agent_registered(agent_key: str) -> None:
+    """Load opt-in agents without imposing their tool side effects globally."""
+    if agent_key == "proactive":
+        module = importlib.import_module("openjarvis.agents.proactive_agent")
+        from openjarvis.core.registry import AgentRegistry
+
+        if not AgentRegistry.contains("proactive"):
+            AgentRegistry.register_value("proactive", module.ProactiveAgent)
 
 
 def _read_input(prompt: str = "You> ") -> Optional[str]:
@@ -223,6 +226,7 @@ def chat(
             import openjarvis.agents  # noqa: F401 — trigger registration
             from openjarvis.core.registry import AgentRegistry
 
+            _ensure_requested_agent_registered(agent_key)
             if AgentRegistry.contains(agent_key):
                 configured_cls = AgentRegistry.get(agent_key)
                 kwargs: dict = {"bus": bus}
@@ -279,7 +283,7 @@ def chat(
                     kwargs["interactive"] = True
                     kwargs["confirm_callback"] = _confirm
 
-                if _constructor_forwards_keyword(execution_cls, "prompt_builder"):
+                if _supports_prompt_builder_injection(execution_cls):
                     from openjarvis.prompt.builder import SystemPromptBuilder
 
                     kwargs["prompt_builder"] = SystemPromptBuilder(

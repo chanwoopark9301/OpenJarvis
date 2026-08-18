@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import gc
 import json
+import os
 import sqlite3
 import stat
 from pathlib import Path
 
 import pytest
 
+import openjarvis.memory.profile_migration as migration_module
 from openjarvis.core.config import (
     JarvisConfig,
     MemoryFilesConfig,
@@ -195,19 +198,18 @@ def test_staging_imports_exact_backup_snapshot_not_mutable_source(
 ):
     archive = PersonalMemoryArchive(tmp_path / "personal.db")
     user_path, memory_path = _legacy_files(tmp_path)
-    original_copy2 = __import__("shutil").copy2
+    original_copy = migration_module._copy_fd_bytes
     copy_count = 0
 
-    def mutate_after_copy(source, target, *args, **kwargs):
+    def mutate_after_copy(source_fd, target_fd):
         nonlocal copy_count
-        copied = original_copy2(source, target, *args, **kwargs)
+        original_copy(source_fd, target_fd)
         copy_count += 1
         if copy_count == 1:
-            Path(source).write_text("- MUTATED LIVE SOURCE", encoding="utf-8")
-        return copied
+            user_path.write_text("- MUTATED LIVE SOURCE", encoding="utf-8")
 
     monkeypatch.setattr(
-        "openjarvis.memory.profile_migration.shutil.copy2", mutate_after_copy
+        "openjarvis.memory.profile_migration._copy_fd_bytes", mutate_after_copy
     )
 
     LegacyProfileMigrator(archive).stage(user_path, memory_path)
@@ -256,29 +258,92 @@ def test_staging_rejects_backup_destination_collision_without_overwrite(
     assert archive.find_candidates() == []
 
 
-def test_copy_boundary_symlink_swap_cannot_overwrite_victim(tmp_path, monkeypatch):
+def test_source_replacement_at_copy_boundary_uses_opened_descriptor(
+    tmp_path,
+    monkeypatch,
+):
     archive = PersonalMemoryArchive(tmp_path / "personal.db")
     user_path, memory_path = _legacy_files(tmp_path)
-    victim = tmp_path / "victim.txt"
-    victim.write_text("must remain untouched", encoding="utf-8")
-    original_copy2 = __import__("shutil").copy2
+    attacker = tmp_path / "attacker.txt"
+    attacker.write_text("- ATTACKER CONTENT", encoding="utf-8")
+    original_copy = migration_module._copy_fd_bytes
+    swapped = False
 
-    def attempt_swap(source, target, *args, **kwargs):
-        try:
-            Path(target).unlink(missing_ok=True)
-            Path(target).symlink_to(victim)
-        except OSError:
-            pass
-        return original_copy2(source, target, *args, **kwargs)
+    def replace_source(source_fd, target_fd):
+        nonlocal swapped
+        if not swapped:
+            user_path.unlink()
+            user_path.symlink_to(attacker)
+            swapped = True
+        original_copy(source_fd, target_fd)
 
     monkeypatch.setattr(
-        "openjarvis.memory.profile_migration.shutil.copy2", attempt_swap
+        "openjarvis.memory.profile_migration._copy_fd_bytes", replace_source
     )
 
     result = LegacyProfileMigrator(archive).stage(user_path, memory_path)
 
-    assert victim.read_text(encoding="utf-8") == "must remain untouched"
-    assert result.backup_paths[0].read_bytes() == user_path.read_bytes()
+    assert b"Prefers concise replies" in result.backup_paths[0].read_bytes()
+    assert b"ATTACKER CONTENT" not in result.backup_paths[0].read_bytes()
+
+
+def test_source_ancestor_replacement_does_not_read_attacker_file(
+    tmp_path,
+    monkeypatch,
+):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    user_path = profile_dir / "USER.md"
+    user_path.write_text("- ORIGINAL PROFILE", encoding="utf-8")
+    attacker_dir = tmp_path / "attacker"
+    attacker_dir.mkdir()
+    (attacker_dir / "USER.md").write_text("- ATTACKER PROFILE", encoding="utf-8")
+    original_copy = migration_module._copy_fd_bytes
+    swapped = False
+
+    def replace_ancestor(source_fd, target_fd):
+        nonlocal swapped
+        if not swapped:
+            profile_dir.rename(tmp_path / "original-profile")
+            profile_dir.symlink_to(attacker_dir, target_is_directory=True)
+            swapped = True
+        original_copy(source_fd, target_fd)
+
+    monkeypatch.setattr(migration_module, "_copy_fd_bytes", replace_ancestor)
+
+    result = LegacyProfileMigrator(archive).stage(user_path, tmp_path / "MEMORY.md")
+
+    assert result.backup_paths[0].read_text(encoding="utf-8") == "- ORIGINAL PROFILE"
+
+
+def test_backup_ancestor_replacement_cannot_write_attacker_tree(
+    tmp_path,
+    monkeypatch,
+):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    archive = PersonalMemoryArchive(state_dir / "personal.db")
+    user_path = tmp_path / "USER.md"
+    user_path.write_text("- ORIGINAL PROFILE", encoding="utf-8")
+    attacker_dir = tmp_path / "attacker-state"
+    attacker_dir.mkdir()
+    sentinel = attacker_dir / "sentinel"
+    sentinel.write_text("untouched", encoding="utf-8")
+    original_copy = migration_module._copy_fd_bytes
+
+    def replace_ancestor(source_fd, target_fd):
+        state_dir.rename(tmp_path / "original-state")
+        state_dir.symlink_to(attacker_dir, target_is_directory=True)
+        original_copy(source_fd, target_fd)
+
+    monkeypatch.setattr(migration_module, "_copy_fd_bytes", replace_ancestor)
+
+    with pytest.raises(ValueError, match="identity"):
+        LegacyProfileMigrator(archive).stage(user_path, tmp_path / "MEMORY.md")
+
+    assert sentinel.read_text(encoding="utf-8") == "untouched"
+    assert list(attacker_dir.iterdir()) == [sentinel]
 
 
 def test_snapshot_permissions_are_private(tmp_path):
@@ -296,6 +361,141 @@ def test_snapshot_permissions_are_private(tmp_path):
     assert all(
         stat.S_IMODE(path.stat().st_mode) == 0o600 for path in result.backup_paths
     )
+
+
+def test_snapshot_preserves_source_mtime(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    timestamp_ns = 1_700_000_000_123_456_789
+    os.utime(user_path, ns=(timestamp_ns, timestamp_ns))
+
+    result = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    assert result.backup_paths[0].stat().st_mtime_ns == timestamp_ns
+
+
+def test_unsupported_platform_refuses_before_backup_artifacts(tmp_path, monkeypatch):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    monkeypatch.setattr(
+        migration_module,
+        "_secure_snapshot_primitives_available",
+        lambda: False,
+    )
+
+    with pytest.raises(ValueError, match="not supported"):
+        LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    assert not (tmp_path / ".canonical-profile-backups").exists()
+
+
+def _fd_count() -> int:
+    gc.collect()
+    return len(os.listdir("/dev/fd"))
+
+
+@pytest.mark.parametrize(
+    "failure_hook",
+    ("copy", "identity", "fsync", "fstat", "chmod", "cleanup"),
+)
+def test_snapshot_failure_closes_fds_and_leaves_private_modes(
+    tmp_path,
+    monkeypatch,
+    failure_hook,
+):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    if failure_hook == "copy":
+        monkeypatch.setattr(
+            migration_module,
+            "_copy_fd_bytes",
+            lambda *_args: (_ for _ in ()).throw(OSError("injected copy failure")),
+        )
+    elif failure_hook == "identity":
+        monkeypatch.setattr(
+            migration_module,
+            "_verify_backup_path_identity",
+            lambda *_args: (_ for _ in ()).throw(OSError("identity failure")),
+        )
+    elif failure_hook == "fsync":
+        monkeypatch.setattr(
+            migration_module.os,
+            "fsync",
+            lambda *_args: (_ for _ in ()).throw(OSError("fsync failure")),
+        )
+    elif failure_hook == "fstat":
+        original_fstat = migration_module.os.fstat
+        calls = 0
+
+        def fail_fstat(fd):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError("fstat failure")
+            return original_fstat(fd)
+
+        monkeypatch.setattr(migration_module.os, "fstat", fail_fstat)
+    elif failure_hook == "chmod":
+        original_fchmod = migration_module.os.fchmod
+        failed = False
+
+        def fail_chmod(fd, mode):
+            nonlocal failed
+            if mode == 0o600 and not failed:
+                failed = True
+                raise OSError("chmod failure")
+            return original_fchmod(fd, mode)
+
+        monkeypatch.setattr(migration_module.os, "fchmod", fail_chmod)
+    else:
+        original_close = migration_module._close_fd
+        failed = False
+
+        def fail_cleanup(fd):
+            nonlocal failed
+            original_close(fd)
+            if not failed:
+                failed = True
+                raise OSError("cleanup failure")
+
+        monkeypatch.setattr(migration_module, "_close_fd", fail_cleanup)
+
+    before = _fd_count()
+    with pytest.raises((OSError, ValueError)):
+        LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    assert _fd_count() == before
+    backup_root = tmp_path / ".canonical-profile-backups"
+    if backup_root.exists():
+        assert stat.S_IMODE(backup_root.stat().st_mode) == 0o700
+        for path in backup_root.rglob("*"):
+            expected = 0o700 if path.is_dir() else 0o600
+            assert stat.S_IMODE(path.stat().st_mode) == expected
+
+
+def test_directory_chmod_failure_is_repaired_before_refusal(tmp_path, monkeypatch):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    backup_root = tmp_path / ".canonical-profile-backups"
+    backup_root.mkdir(mode=0o777)
+    backup_root.chmod(0o777)
+    original_fchmod = migration_module.os.fchmod
+    failed = False
+
+    def fail_once(fd, mode):
+        nonlocal failed
+        if mode == 0o700 and not failed:
+            failed = True
+            raise OSError("injected directory chmod failure")
+        return original_fchmod(fd, mode)
+
+    monkeypatch.setattr(migration_module.os, "fchmod", fail_once)
+    before = _fd_count()
+
+    with pytest.raises(OSError, match="chmod failure"):
+        LegacyProfileMigrator(archive).stage(user_path, memory_path)
+
+    assert _fd_count() == before
+    assert stat.S_IMODE(backup_root.stat().st_mode) == 0o700
 
 
 def test_invalid_utf8_staging_is_atomic(tmp_path):

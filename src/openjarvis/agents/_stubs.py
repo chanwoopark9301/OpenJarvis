@@ -57,6 +57,7 @@ class BaseAgent(ABC):
 
     agent_id: str
     accepts_tools: bool = False
+    accepts_prompt_builder: bool = True
     # Plain conversational agents may opt into the managed runtime's generic
     # function-calling loop.  Specialized agents keep their own execution
     # class even when process-wide MCP tools are available.
