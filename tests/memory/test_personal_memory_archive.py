@@ -46,6 +46,26 @@ def test_recent_exchanges_are_bounded_and_end_before_current(tmp_path):
     assert [item.id for item in recent] == ["exchange-1", "exchange-2"]
 
 
+def test_recent_exchanges_use_id_to_order_same_timestamp_records(tmp_path):
+    """Earlier IDs at the current timestamp must remain available as context."""
+    PersonalMemoryArchive, _ = _archive_api()
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    for index in range(1, 5):
+        archive.record_exchange(
+            exchange_id=f"exchange-{index}",
+            user_text=f"user {index}",
+            assistant_text=f"assistant {index}",
+            source="cli.chat",
+            session_id="session-1",
+        )
+    with sqlite3.connect(archive.path) as connection:
+        connection.execute("UPDATE conversation_exchanges SET created_at = 1")
+
+    recent = archive.recent_exchanges("exchange-3", limit=6)
+
+    assert [item.id for item in recent] == ["exchange-1", "exchange-2"]
+
+
 def test_replaying_exchange_id_keeps_the_first_archived_conversation(tmp_path):
     """Changing an already-recorded exchange ID must not rewrite its evidence."""
     PersonalMemoryArchive, _ = _archive_api()

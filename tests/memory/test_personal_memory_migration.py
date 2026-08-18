@@ -67,6 +67,28 @@ def _create_v1_archive(path) -> None:
         )
 
 
+def _snapshot_linked_v4_records(path) -> dict[str, dict[str, object]]:
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        candidate = connection.execute(
+            "SELECT * FROM memory_candidates WHERE id = 'old-candidate'"
+        ).fetchone()
+        exchange = connection.execute(
+            "SELECT * FROM conversation_exchanges WHERE id = 'old-exchange'"
+        ).fetchone()
+    assert candidate is not None
+    assert exchange is not None
+    return {"candidate": dict(candidate), "exchange": dict(exchange)}
+
+
+def _assert_snapshot_is_preserved(
+    before: dict[str, dict[str, object]],
+    after: dict[str, dict[str, object]],
+) -> None:
+    for table, expected in before.items():
+        assert {column: after[table][column] for column in expected} == expected
+
+
 def test_existing_candidate_archive_migrates_in_place(tmp_path):
     """Opening a v1 database must preserve evidence while adding v2 tables."""
     path = tmp_path / "personal.db"
@@ -148,20 +170,27 @@ def test_existing_v4_candidate_archive_adds_blank_evidence_excerpt_idempotently(
               ADD COLUMN subject TEXT NOT NULL DEFAULT 'user';
             ALTER TABLE memory_candidates
               ADD COLUMN target_claim_id TEXT NOT NULL DEFAULT '';
+            ALTER TABLE conversation_exchanges
+              ADD COLUMN candidate_extractor_version TEXT NOT NULL DEFAULT '';
             """
         )
 
+    before = _snapshot_linked_v4_records(path)
     archive = PersonalMemoryArchive(path)
+    after_first_open = _snapshot_linked_v4_records(path)
 
     candidate = archive.get_candidate("old-candidate")
     assert candidate is not None
     assert archive.schema_version() == 5
     assert candidate.content == "old user text"
     assert candidate.evidence_excerpt == ""
+    _assert_snapshot_is_preserved(before, after_first_open)
 
     reopened = PersonalMemoryArchive(path)
+    after_second_open = _snapshot_linked_v4_records(path)
     assert reopened.schema_version() == 5
     assert reopened.get_candidate("old-candidate").evidence_excerpt == ""
+    _assert_snapshot_is_preserved(before, after_second_open)
 
 
 def test_job_idempotency_key_prevents_duplicate_work(tmp_path):

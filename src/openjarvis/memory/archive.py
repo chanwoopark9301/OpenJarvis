@@ -813,9 +813,16 @@ class PersonalMemoryArchive:
             scope_value = current[scope_column]
             rows = connection.execute(
                 f"SELECT * FROM conversation_exchanges "
-                f"WHERE {scope_column} = ? AND created_at < ? "
+                f"WHERE {scope_column} = ? AND (created_at < ? "
+                f"OR (created_at = ? AND id < ?)) "
                 f"ORDER BY created_at DESC, id DESC LIMIT ?",
-                (scope_value, current["created_at"], max(0, int(limit))),
+                (
+                    scope_value,
+                    current["created_at"],
+                    current["created_at"],
+                    exchange_id,
+                    max(0, int(limit)),
+                ),
             ).fetchall()
         return [self._exchange_from_row(row) for row in reversed(rows)]
 
