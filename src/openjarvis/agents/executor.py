@@ -388,16 +388,18 @@ class AgentExecutor:
             ", ".join(resolved_toolkit.by_name) or "none",
         )
 
-        execution_agent_cls = agent_cls
-        if tool_instances and not agent_accepts_tools and supports_tool_fallback:
+        from openjarvis.agents.execution_selection import select_execution_agent_class
+
+        execution_agent_cls = select_execution_agent_class(
+            agent_cls,
+            has_tools=bool(tool_instances),
+        )
+        if execution_agent_cls is not agent_cls:
             # Managed SSE already runs configured tools through a native
             # function-calling loop regardless of the selected class. Use the
             # same capability for immediate/scheduled ticks instead of
             # silently discarding the resolved toolkit for SimpleAgent and
             # other explicitly compatible non-tool classes.
-            from openjarvis.agents.orchestrator import OrchestratorAgent
-
-            execution_agent_cls = OrchestratorAgent
             logger.info(
                 "Agent %s: %s does not accept tools; using %s for this "
                 "tool-enabled tick",
