@@ -4,7 +4,9 @@ from openjarvis.agents.simple import SimpleAgent
 
 
 def test_simple_agent_uses_native_tool_loop_when_tools_exist():
-    assert select_execution_agent_class(SimpleAgent, has_tools=True) is OrchestratorAgent
+    assert (
+        select_execution_agent_class(SimpleAgent, has_tools=True) is OrchestratorAgent
+    )
 
 
 def test_simple_agent_stays_simple_without_tools():
