@@ -112,9 +112,7 @@ class ContextComposer:
         """Compose evaluated memory plus a separate latest-user continuity overlay."""
         claims = self.archive.get_active_claims()
         constraints = tuple(
-            claim.content
-            for claim in claims
-            if claim.kind in DIRECT_RULE_KINDS
+            claim.content for claim in claims if claim.kind in DIRECT_RULE_KINDS
         )[: self.max_constraints]
         current_states = tuple(
             claim.content
@@ -146,9 +144,7 @@ class ContextComposer:
         raw_evidence: tuple[str, ...] = ()
         pending_question = self.archive.next_pending_question()
         pending_insight = (
-            self.archive.get_insight_candidate(
-                str(pending_question["subject_id"])
-            )
+            self.archive.get_insight_candidate(str(pending_question["subject_id"]))
             if pending_question is not None
             else None
         )
@@ -185,6 +181,7 @@ class ContextComposer:
     @staticmethod
     def _is_relevant(query: str, content: str) -> bool:
         """Use a conservative local lexical gate before adding private context."""
+
         def tokenize(value: str) -> set[str]:
             return {
                 token
@@ -253,9 +250,7 @@ def compose_configured_personal_context(
             raw_evidence=(),
             unresolved=(),
             user_overlay="",
-            sections=(
-                ContextSection("direct_constraints", shadow_constraints),
-            ),
+            sections=(ContextSection("direct_constraints", shadow_constraints),),
         )
     return context
 
