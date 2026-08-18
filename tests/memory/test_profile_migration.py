@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import openjarvis.memory.archive as archive_module
 import openjarvis.memory.profile_migration as migration_module
 from openjarvis.core.config import (
     JarvisConfig,
@@ -121,6 +122,35 @@ def test_activation_stops_static_dynamic_profile_injection(tmp_path):
     assert effective.soul_path == original_files.soul_path
     assert effective.user_path == ""
     assert effective.memory_path == ""
+
+
+def test_activation_attests_full_temporal_content_identity(tmp_path):
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    backups = LegacyProfileMigrator(archive).stage(user_path, memory_path).backup_paths
+
+    activate_canonical_profile(archive, backup_paths=backups)
+
+    attestation = json.loads(
+        archive.get_metadata("canonical_profile_active_backup_identities")
+    )
+    assert attestation["version"] == 2
+    expected_fields = {
+        "path",
+        "device",
+        "inode",
+        "uid",
+        "mode",
+        "size",
+        "mtime_ns",
+        "ctime_ns",
+    }
+    assert set(attestation["root"]) == expected_fields
+    assert all(
+        set(identity) == expected_fields
+        for entry in attestation["entries"]
+        for identity in (entry["directory"], entry["file"])
+    )
 
 
 def test_deactivation_preserves_current_static_files_and_audits_cutover(tmp_path):
@@ -245,7 +275,7 @@ def test_deactivation_revalidates_earlier_entry_after_later_hash(
     with pytest.raises(ValueError, match="backup"):
         deactivate_canonical_profile(archive, backup_paths=staged.backup_paths)
 
-    assert hash_count == 2
+    assert hash_count >= 2
     assert archive.get_metadata("canonical_profile_active", "0") == "1"
     assert archive.get_metadata("canonical_profile_deactivated_at", "") == ""
     assert archive.decision_count(subject_id="canonical_profile") == 1
@@ -419,6 +449,185 @@ def test_deactivation_rehashes_after_validation_before_cutover(
     assert archive.get_metadata("canonical_profile_active", "0") == "1"
     assert archive.get_metadata("canonical_profile_deactivated_at", "") == ""
     assert archive.decision_count(subject_id="canonical_profile") == 1
+
+
+@pytest.mark.parametrize("target_kind", ("file", "snapshot", "root"))
+def test_deactivation_reopens_paths_after_every_precommit_hash(
+    tmp_path,
+    monkeypatch,
+    target_kind,
+):
+    """A pathname replaced during the final hash pass must fail closed."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    staged = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    activate_canonical_profile(archive, backup_paths=staged.backup_paths)
+    original_user = user_path.read_bytes()
+    original_memory = memory_path.read_bytes()
+    backup = staged.backup_paths[0]
+    original_mark = archive.mark_canonical_profile_inactive
+    original_hash = migration_module._hash_open_file
+    replaced = False
+
+    def mark_with_hash_race(**kwargs):
+        hash_count = 0
+
+        def replace_after_first_hash(fd):
+            nonlocal hash_count, replaced
+            hash_count += 1
+            digest = original_hash(fd)
+            if hash_count != 1:
+                return digest
+            replaced = True
+            if target_kind == "file":
+                content = backup.read_bytes()
+                backup.rename(backup.with_name(f"{backup.name}.original"))
+                backup.write_bytes(content)
+                backup.chmod(0o600)
+            elif target_kind == "snapshot":
+                snapshot = backup.parent
+                content = backup.read_bytes()
+                snapshot.rename(snapshot.with_name(f"{snapshot.name}.original"))
+                snapshot.mkdir(mode=0o700)
+                replacement = snapshot / backup.name
+                replacement.write_bytes(content)
+                replacement.chmod(0o600)
+            else:
+                root = backup.parent.parent
+                replacements = [
+                    (path.parent.name, path.name, path.read_bytes())
+                    for path in staged.backup_paths
+                ]
+                root.rename(root.with_name(f"{root.name}.original"))
+                root.mkdir(mode=0o700)
+                for snapshot_name, backup_name, content in replacements:
+                    snapshot = root / snapshot_name
+                    snapshot.mkdir(mode=0o700, exist_ok=True)
+                    replacement = snapshot / backup_name
+                    replacement.write_bytes(content)
+                    replacement.chmod(0o600)
+            return digest
+
+        monkeypatch.setattr(
+            migration_module,
+            "_hash_open_file",
+            replace_after_first_hash,
+        )
+        return original_mark(**kwargs)
+
+    monkeypatch.setattr(
+        archive,
+        "mark_canonical_profile_inactive",
+        mark_with_hash_race,
+    )
+
+    with pytest.raises(ValueError, match="backup"):
+        deactivate_canonical_profile(archive, backup_paths=staged.backup_paths)
+
+    assert replaced is True
+    assert archive.get_metadata("canonical_profile_active", "0") == "1"
+    assert archive.get_metadata("canonical_profile_deactivated_at", "") == ""
+    assert archive.decision_count(subject_id="canonical_profile") == 1
+    assert user_path.read_bytes() == original_user
+    assert memory_path.read_bytes() == original_memory
+
+
+def test_deactivation_revalidates_after_uncommitted_audit_write(
+    tmp_path,
+    monkeypatch,
+):
+    """The last filesystem check must follow all uncommitted DB writes."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    staged = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    activate_canonical_profile(archive, backup_paths=staged.backup_paths)
+    original_user = user_path.read_bytes()
+    original_memory = memory_path.read_bytes()
+    first_backup = staged.backup_paths[0]
+    original_uuid4 = archive_module.uuid.uuid4
+    mutated = False
+
+    def mutate_during_audit_write():
+        nonlocal mutated
+        if not mutated:
+            first_backup.write_bytes(first_backup.read_bytes() + b"!")
+            first_backup.chmod(0o600)
+            mutated = True
+        return original_uuid4()
+
+    monkeypatch.setattr(archive_module.uuid, "uuid4", mutate_during_audit_write)
+
+    with pytest.raises(ValueError, match="backup"):
+        deactivate_canonical_profile(archive, backup_paths=staged.backup_paths)
+
+    assert mutated is True
+    assert archive.get_metadata("canonical_profile_active", "0") == "1"
+    assert archive.get_metadata("canonical_profile_deactivated_at", "") == ""
+    assert archive.decision_count(subject_id="canonical_profile") == 1
+    assert user_path.read_bytes() == original_user
+    assert memory_path.read_bytes() == original_memory
+
+
+def test_deactivation_rechecks_earlier_content_after_later_precommit_hash(
+    tmp_path,
+    monkeypatch,
+):
+    """Later hashes must not leave earlier pinned content unchecked."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    staged = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    activate_canonical_profile(archive, backup_paths=staged.backup_paths)
+    original_user = user_path.read_bytes()
+    original_memory = memory_path.read_bytes()
+    first_backup = staged.backup_paths[0]
+    original_mark = archive.mark_canonical_profile_inactive
+    original_hash = migration_module._hash_open_file
+    mutated = False
+
+    def mark_with_hash_race(**kwargs):
+        hash_count = 0
+
+        def mutate_first_during_second_hash(fd):
+            nonlocal hash_count, mutated
+            hash_count += 1
+            if hash_count == 2:
+                original = first_backup.read_bytes()
+                original_stat = first_backup.stat()
+                replacement = (b"!" if original[:1] != b"!" else b"?") + original[1:]
+                first_backup.write_bytes(replacement)
+                os.utime(
+                    first_backup,
+                    ns=(
+                        original_stat.st_atime_ns,
+                        original_stat.st_mtime_ns + 1_000_000_000,
+                    ),
+                )
+                first_backup.chmod(0o600)
+                mutated = True
+            return original_hash(fd)
+
+        monkeypatch.setattr(
+            migration_module,
+            "_hash_open_file",
+            mutate_first_during_second_hash,
+        )
+        return original_mark(**kwargs)
+
+    monkeypatch.setattr(
+        archive,
+        "mark_canonical_profile_inactive",
+        mark_with_hash_race,
+    )
+
+    with pytest.raises(ValueError, match="backup"):
+        deactivate_canonical_profile(archive, backup_paths=staged.backup_paths)
+
+    assert mutated is True
+    assert archive.get_metadata("canonical_profile_active", "0") == "1"
+    assert archive.get_metadata("canonical_profile_deactivated_at", "") == ""
+    assert archive.decision_count(subject_id="canonical_profile") == 1
+    assert user_path.read_bytes() == original_user
+    assert memory_path.read_bytes() == original_memory
 
 
 def test_deactivation_requires_exact_active_manifest_and_backup_order(tmp_path):

@@ -379,6 +379,9 @@ def _private_identity(
         "inode": int(observed.st_ino),
         "uid": int(observed.st_uid),
         "mode": int(stat.S_IMODE(observed.st_mode)),
+        "size": int(observed.st_size),
+        "mtime_ns": int(observed.st_mtime_ns),
+        "ctime_ns": int(observed.st_ctime_ns),
     }
 
 
@@ -428,11 +431,7 @@ class _BackupValidation:
     entries: tuple[_PinnedBackup, ...]
     identities_json: str
 
-    def _check_identities(
-        self,
-        reopened_root_fd: int,
-        reopened_entries: list[tuple[int, int]],
-    ) -> None:
+    def _check_pinned_identities(self) -> None:
         _require_same_private_identity(
             self.backup_root,
             self.root_fd,
@@ -440,6 +439,27 @@ class _BackupValidation:
             expected_mode=0o700,
             directory=True,
         )
+        for pinned in self.entries:
+            _require_same_private_identity(
+                pinned.backup.parent,
+                pinned.snapshot_fd,
+                pinned.snapshot_identity,
+                expected_mode=0o700,
+                directory=True,
+            )
+            _require_same_private_identity(
+                pinned.backup,
+                pinned.backup_fd,
+                pinned.backup_identity,
+                expected_mode=0o600,
+                directory=False,
+            )
+
+    def _check_reopened_identities(
+        self,
+        reopened_root_fd: int,
+        reopened_entries: list[tuple[int, int]],
+    ) -> None:
         _require_same_private_identity(
             self.backup_root,
             reopened_root_fd,
@@ -454,24 +474,10 @@ class _BackupValidation:
         ):
             _require_same_private_identity(
                 pinned.backup.parent,
-                pinned.snapshot_fd,
-                pinned.snapshot_identity,
-                expected_mode=0o700,
-                directory=True,
-            )
-            _require_same_private_identity(
-                pinned.backup.parent,
                 snapshot_fd,
                 pinned.snapshot_identity,
                 expected_mode=0o700,
                 directory=True,
-            )
-            _require_same_private_identity(
-                pinned.backup,
-                pinned.backup_fd,
-                pinned.backup_identity,
-                expected_mode=0o600,
-                directory=False,
             )
             _require_same_private_identity(
                 pinned.backup,
@@ -482,8 +488,13 @@ class _BackupValidation:
             )
 
     def revalidate(self) -> None:
-        """Freshly resolve and fully check every pinned recovery object."""
+        """Rehash pinned files, then freshly resolve every recovery path."""
         try:
+            for pinned in self.entries:
+                if _hash_open_file(pinned.backup_fd) != pinned.expected_sha256:
+                    raise ValueError(
+                        "profile backup snapshot does not match staged manifest"
+                    )
             with ExitStack() as stack:
                 reopened_root_fd = _open_directory_chain(self.backup_root, stack)
                 reopened_entries: list[tuple[int, int]] = []
@@ -506,13 +517,8 @@ class _BackupValidation:
                     )
                     reopened_entries.append((snapshot_fd, backup_fd))
 
-                self._check_identities(reopened_root_fd, reopened_entries)
-                for pinned in self.entries:
-                    if _hash_open_file(pinned.backup_fd) != pinned.expected_sha256:
-                        raise ValueError(
-                            "profile backup snapshot does not match staged manifest"
-                        )
-                self._check_identities(reopened_root_fd, reopened_entries)
+                self._check_reopened_identities(reopened_root_fd, reopened_entries)
+                self._check_pinned_identities()
         except ValueError:
             raise
         except OSError as exc:
@@ -607,7 +613,7 @@ def _validate_staged_backups(
                     }
                 )
             identities = {
-                "version": 1,
+                "version": 2,
                 "root": root_identity,
                 "entries": identity_entries,
             }

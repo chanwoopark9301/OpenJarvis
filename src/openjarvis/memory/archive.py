@@ -654,8 +654,6 @@ class PersonalMemoryArchive:
             ).fetchone()
             if staged is None or str(staged["value"]) != manifest_json:
                 raise ValueError("canonical profile staging manifest changed")
-            if precommit_check is not None:
-                precommit_check()
             for key, value in (
                 ("canonical_profile_active", "1"),
                 ("canonical_profile_activated_at", str(now)),
@@ -689,6 +687,8 @@ class PersonalMemoryArchive:
                     now,
                 ),
             )
+            if precommit_check is not None:
+                precommit_check()
 
     def mark_canonical_profile_inactive(
         self,
@@ -728,8 +728,6 @@ class PersonalMemoryArchive:
                 != backup_identities_json
             ):
                 raise ValueError("canonical profile backup identity changed")
-            if precommit_check is not None:
-                precommit_check()
             for key, value in (
                 ("canonical_profile_active", "0"),
                 ("canonical_profile_deactivated_at", str(now)),
@@ -759,6 +757,8 @@ class PersonalMemoryArchive:
                     now,
                 ),
             )
+            if precommit_check is not None:
+                precommit_check()
 
     def record_shadow_composition(
         self,
