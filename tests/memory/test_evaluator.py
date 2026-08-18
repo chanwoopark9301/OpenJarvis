@@ -266,9 +266,14 @@ def test_correction_supersedes_active_direct_claim_with_same_subject(tmp_path):
     assert archive.evidence_texts(active_claim.evidence_ids) == ("공박사라고.",)
 
 
+@pytest.mark.parametrize(
+    "older_kind",
+    (CandidateKind.ROLE_PREFERENCE, CandidateKind.FACT),
+)
 def test_delayed_older_direct_claim_cannot_replace_newer_active_correction(
     tmp_path,
     monkeypatch,
+    older_kind,
 ):
     """Retry order must not let older source evidence reverse the latest name."""
     clock = [10.0]
@@ -280,7 +285,7 @@ def test_delayed_older_direct_claim_cannot_replace_newer_active_correction(
         user_text="Call yourself 조비서.",
         assistant_text="Okay.",
         draft=CandidateDraft(
-            CandidateKind.ROLE_PREFERENCE,
+            older_kind,
             "The assistant name is 조비서.",
             1.0,
             1.0,

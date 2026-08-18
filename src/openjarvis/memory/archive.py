@@ -13,6 +13,7 @@ from typing import Any, Sequence
 
 from openjarvis.memory.personal_models import (
     DIRECT_RULE_KINDS,
+    DIRECT_USER_SOURCES,
     AdaptationOperation,
     CandidateDraft,
     CandidateKind,
@@ -2321,7 +2322,11 @@ class PersonalMemoryArchive:
                 dict.fromkeys(str(value) for value in superseded_claim_ids)
             )
             superseded = requested_superseded
-            if candidate.kind in DIRECT_RULE_KINDS and candidate.subject != "user":
+            if (
+                candidate.kind in atomic_claim_kinds
+                and candidate.source in DIRECT_USER_SOURCES
+                and candidate.subject != "user"
+            ):
                 atomic_values = tuple(sorted(kind.value for kind in atomic_claim_kinds))
                 placeholders = ",".join("?" for _ in atomic_values)
                 active_rows = connection.execute(
@@ -2364,15 +2369,20 @@ class PersonalMemoryArchive:
                     candidate.created_at,
                     candidate.id,
                 )
-                chronology_keys = (
-                    active_source_keys
-                    if candidate.kind is CandidateKind.CORRECTION
-                    else {
+                if candidate.kind is CandidateKind.CORRECTION:
+                    chronology_keys = active_source_keys
+                elif candidate.kind in DIRECT_RULE_KINDS:
+                    chronology_keys = {
                         claim_id: source_key
                         for claim_id, source_key in active_source_keys.items()
                         if active_kinds[claim_id] in DIRECT_RULE_KINDS
                     }
-                )
+                else:
+                    chronology_keys = {
+                        claim_id: source_key
+                        for claim_id, source_key in active_source_keys.items()
+                        if active_kinds[claim_id] is CandidateKind.CORRECTION
+                    }
                 newer_claim_ids = tuple(
                     sorted(
                         claim_id
