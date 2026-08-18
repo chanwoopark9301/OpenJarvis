@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 from typing import List, Optional
@@ -37,63 +36,19 @@ def _personal_memory_status(config, personal_mode: str) -> str:
     return "active"
 
 
-def _build_assistant_preflight(config, engine, engine_key: str, model: str):
-    """Build the generic assistant preflight with a local-only planner."""
-    from openjarvis.cli._assistant_preflight import AssistantPreflight
-    from openjarvis.cli._request_plan import RequestPlanner
-    from openjarvis.memory.candidate_extractor import (
-        is_local_personal_memory_engine,
-    )
-    from openjarvis.tools.web_search import WebSearchTool
+def _build_chat_agent_context(
+    history: list[Message], dynamic_messages: list[Message]
+):
+    """Build an agent context from dynamic memory and prior dialogue."""
+    from openjarvis.agents._stubs import AgentContext
 
-    class _UnavailablePlanner:
-        def plan(self, user_text, recent_messages):
-            return None
-
-    planner = (
-        RequestPlanner(engine, model)
-        if is_local_personal_memory_engine(config, engine_key)
-        else _UnavailablePlanner()
-    )
-    return AssistantPreflight(
-        planner,
-        WebSearchTool(max_results=5),
-        max_results=5,
-    )
-
-
-def _safe_search_notice(search_result) -> str:
-    """Render a safe diagnostic when grounded answer generation fails."""
-    source_lines = "\n".join(f"- {source}" for source in search_result.sources)
-    query_lines = "\n".join(f"- {query}" for query in search_result.queries)
-    query_section = f"\n\n검색한 내용:\n{query_lines}" if query_lines else ""
-    return (
-        "인터넷 자료는 찾았지만, 만든 답변의 사실을 출처와 직접 연결해 "
-        "확인하지 못했어. 확인되지 않은 내용은 보여주지 않을게."
-        f"{query_section}\n\n확인한 출처:\n{source_lines}"
-    )
-
-
-def _render_grounded_search_answer(content: str, search_result) -> str | None:
-    """Validate each generic answer block and render all usable content."""
-    from openjarvis.cli._grounded_response import (
-        parse_grounded_json,
-        render_grounded_response,
-        validate_grounded_response,
-    )
-
-    try:
-        response = parse_grounded_json(content)
-    except ValueError:
-        return None
-    validated = validate_grounded_response(response, search_result.evidence)
-    if not validated.blocks:
-        return None
-    return render_grounded_response(
-        validated,
-        search_result.evidence,
-        style=search_result.response_style,
-    )
+    context = AgentContext()
+    for message in dynamic_messages:
+        context.conversation.add(message)
+    for message in history:
+        if message.role != Role.SYSTEM:
+            context.conversation.add(message)
+    return context
 
 
 @click.command()
@@ -184,10 +139,16 @@ def chat(
             from openjarvis.core.registry import AgentRegistry
 
             if AgentRegistry.contains(agent_key):
-                agent_cls = AgentRegistry.get(agent_key)
+                configured_cls = AgentRegistry.get(agent_key)
                 kwargs: dict = {"bus": bus}
+                tool_instances = []
 
-                if getattr(agent_cls, "accepts_tools", False):
+                if (
+                    getattr(configured_cls, "accepts_tools", False)
+                    or getattr(
+                        configured_cls, "supports_managed_tool_fallback", False
+                    )
+                ):
                     tool_names_list = resolve_tool_names(
                         tools,
                         getattr(config.tools, "enabled", None),
@@ -198,7 +159,6 @@ def chat(
                         from openjarvis.core.registry import ToolRegistry
                         from openjarvis.tools._stubs import BaseTool
 
-                        tool_instances = []
                         for tname in tool_names_list:
                             if ToolRegistry.contains(tname):
                                 tcls = ToolRegistry.get(tname)
@@ -208,8 +168,22 @@ def chat(
                                     tool_instances.append(tcls())
                                 elif isinstance(tcls, BaseTool):
                                     tool_instances.append(tcls)
-                        if tool_instances:
-                            kwargs["tools"] = tool_instances
+                from openjarvis.agents.execution_selection import (
+                    select_execution_agent_class,
+                )
+
+                execution_cls = select_execution_agent_class(
+                    configured_cls,
+                    has_tools=bool(tool_instances),
+                )
+                logger.debug(
+                    "Chat agent %r selected execution class %s",
+                    agent_key,
+                    execution_cls.__name__,
+                )
+
+                if getattr(execution_cls, "accepts_tools", False):
+                    kwargs["tools"] = tool_instances
                     kwargs["max_turns"] = config.agent.max_turns
 
                     def _confirm(prompt: str) -> bool:
@@ -227,7 +201,7 @@ def chat(
 
                 if (
                     "prompt_builder"
-                    in _inspect.signature(agent_cls.__init__).parameters
+                    in _inspect.signature(execution_cls.__init__).parameters
                 ):
                     from openjarvis.prompt.builder import SystemPromptBuilder
 
@@ -237,7 +211,7 @@ def chat(
                         system_prompt_config=config.system_prompt,
                     )
 
-                agent = agent_cls(engine, model, **kwargs)
+                agent = execution_cls(engine, model, **kwargs)
         except Exception as exc:
             console.print(f"[yellow]Agent '{agent_key}' failed: {exc}[/yellow]")
 
@@ -304,13 +278,6 @@ def chat(
 
         memory_backend = _get_memory_backend(config)
 
-    assistant_preflight = _build_assistant_preflight(
-        config,
-        engine,
-        engine_name,
-        model,
-    )
-
     # Conversation state
     if not system_prompt:
         from openjarvis.prompt.builder import SystemPromptBuilder
@@ -325,8 +292,6 @@ def chat(
     history: List[Message] = []
     if system_prompt:
         history.append(Message(role=Role.SYSTEM, content=system_prompt))
-    pending_clarification = False
-
     # REPL loop
     while True:
         for note in _notifications.diff(get_status()):
@@ -350,7 +315,6 @@ def chat(
             history = []
             if system_prompt:
                 history.append(Message(role=Role.SYSTEM, content=system_prompt))
-            pending_clarification = False
             console.print("[dim]History cleared.[/dim]")
             continue
         elif cmd == "/model":
@@ -381,14 +345,6 @@ def chat(
         # Add user message
         history.append(Message(role=Role.USER, content=user_input))
 
-        assistant_result = assistant_preflight.prepare(
-            user_input,
-            tuple(history[:-1][-6:]),
-            pending_clarification=pending_clarification,
-        )
-        pending_clarification = (
-            assistant_result.triggered and assistant_result.mode == "clarify"
-        )
         agent_context_messages: list[Message] = []
         generation_history = history
         if config.agent.context_from_memory:
@@ -439,56 +395,12 @@ def chat(
             except Exception:
                 logger.debug("Failed to inject memory context", exc_info=True)
 
-        search_context_message = None
-        if assistant_result.success:
-            from openjarvis.cli._grounded_response import build_grounded_prompt
-
-            search_context_message = Message(
-                role=Role.SYSTEM,
-                content=build_grounded_prompt(
-                    user_text=user_input,
-                    goal=assistant_result.goal,
-                    response_style=assistant_result.response_style,
-                    context=assistant_result.context,
-                ),
-                metadata={"external_search_context": True},
-            )
-            if agent is not None:
-                agent_context_messages.append(search_context_message)
-            else:
-                generation_history = [
-                    *generation_history[:-1],
-                    search_context_message,
-                    generation_history[-1],
-                ]
-
         # Generate response even when optional memory context is unavailable.
         try:
-            if assistant_result.triggered and not assistant_result.success:
-                content = (
-                    assistant_result.clarifying_question or assistant_result.error
+            if agent is not None:
+                agent_context = _build_chat_agent_context(
+                    history[:-1], agent_context_messages
                 )
-            elif assistant_result.success:
-                result = engine.generate(
-                    [
-                        search_context_message,
-                        Message(role=Role.USER, content=user_input),
-                    ],
-                    model=model,
-                )
-                content = (
-                    result.get("content", "")
-                    if isinstance(result, dict)
-                    else str(result)
-                )
-            elif agent is not None:
-                agent_context = None
-                if agent_context_messages:
-                    from openjarvis.agents._stubs import AgentContext
-
-                    agent_context = AgentContext()
-                    for context_message in agent_context_messages:
-                        agent_context.conversation.add(context_message)
                 response = agent.run(user_input, context=agent_context)
                 content = (
                     response.content if hasattr(response, "content") else str(response)
@@ -499,54 +411,6 @@ def chat(
                     result.get("content", "")
                     if isinstance(result, dict)
                     else str(result)
-                )
-
-            if assistant_result.success:
-                grounded_content = _render_grounded_search_answer(
-                    content,
-                    assistant_result,
-                )
-                if grounded_content is None:
-                    from openjarvis.cli._grounded_response import (
-                        repair_grounded_json,
-                    )
-
-                    repaired_response = repair_grounded_json(
-                        engine,
-                        model,
-                        content,
-                        valid_source_ids=tuple(
-                            record.id for record in assistant_result.evidence
-                        ),
-                    )
-                    if repaired_response is not None:
-                        repaired_content = json.dumps(
-                            {
-                                "lead": repaired_response.lead,
-                                "blocks": [
-                                    {
-                                        "kind": block.kind,
-                                        "text": block.text,
-                                        "supports": [
-                                            {
-                                                "source_id": support.source_id,
-                                                "excerpt": support.excerpt,
-                                            }
-                                            for support in block.supports
-                                        ],
-                                    }
-                                    for block in repaired_response.blocks
-                                ],
-                                "follow_up": repaired_response.follow_up,
-                            },
-                            ensure_ascii=False,
-                        )
-                        grounded_content = _render_grounded_search_answer(
-                            repaired_content,
-                            assistant_result,
-                        )
-                content = grounded_content or _safe_search_notice(
-                    assistant_result
                 )
 
             history.append(Message(role=Role.ASSISTANT, content=content))

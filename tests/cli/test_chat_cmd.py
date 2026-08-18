@@ -67,6 +67,54 @@ class _ToolChatAgent(ToolUsingAgent):
         return AgentResult(content=result.content, tool_results=[result], turns=1)
 
 
+class _ContextSpyChatAgent(BaseAgent):
+    agent_id = "context_spy_chat_agent"
+    contexts: list[AgentContext | None] = []
+
+    def run(self, input, context: AgentContext | None = None, **kwargs):
+        type(self).contexts.append(context)
+        return AgentResult(content="첫 답변", turns=1)
+
+
+def run_chat_with_spy_agent(input_text: str):
+    _ContextSpyChatAgent.contexts = []
+    engine = MagicMock()
+    engine.engine_id = "mock"
+    config = JarvisConfig()
+    config.intelligence.default_model = "test-model"
+    AgentRegistry.register_value("context_spy_chat_agent", _ContextSpyChatAgent)
+
+    with (
+        patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+        patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
+        patch("openjarvis.intelligence.register_builtin_models"),
+    ):
+        result = CliRunner().invoke(
+            chat,
+            ["--agent", "context_spy_chat_agent", "--model", "test-model"],
+            input=input_text,
+        )
+
+    return result, _ContextSpyChatAgent
+
+
+def test_agent_receives_prior_user_and_assistant_turns() -> None:
+    result, spy = run_chat_with_spy_agent(
+        "내 이름은 찬우야.\n내 이름이 뭐야?\n/quit\n"
+    )
+
+    assert result.exit_code == 0
+    second_context = spy.contexts[1].conversation.messages
+    assert [
+        (message.role.value, message.content)
+        for message in second_context
+        if message.role.value != "system"
+    ] == [
+        ("user", "내 이름은 찬우야."),
+        ("assistant", "첫 답변"),
+    ]
+
+
 class TestChatCommand:
     """Test the Click command definition and help output."""
 
