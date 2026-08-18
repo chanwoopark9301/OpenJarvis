@@ -44,6 +44,32 @@ class _CanonicalSubjectGuidanceEngine:
         }
 
 
+class _ExternalRequestGuidanceEngine:
+    """Model double that needs a general personal-evidence boundary."""
+
+    def generate(self, messages, **kwargs):
+        system_prompt = messages[0].content.casefold()
+        has_guidance = (
+            "external information" in system_prompt
+            and "not personal memory" in system_prompt
+            and "empty candidates array" in system_prompt
+        )
+        if has_guidance:
+            return {"content": _response()}
+        return {
+            "content": _response(
+                _candidate(
+                    content="The user asked for current weather information.",
+                    importance=0.2,
+                    confidence=1.0,
+                    temporal_scope="current",
+                    subject="user.request.current_information",
+                    evidence_excerpt="오늘 과천시 날씨를 알려달라고.",
+                )
+            )
+        }
+
+
 def _extractor_api():
     try:
         from openjarvis.memory.candidate_extractor import (
@@ -244,6 +270,18 @@ def test_greeting_returns_no_candidates():
     extractor = PersonalCandidateExtractor(_FakeEngine(_response()), "qwen3.5:9b")
 
     assert extractor.extract(_exchange("안녕?")) == []
+    assert extractor.last_error_code == ""
+
+
+def test_current_external_information_request_is_not_personal_memory():
+    """Ephemeral world-information requests should complete with no proposal."""
+    PersonalCandidateExtractor, _, _ = _extractor_api()
+    extractor = PersonalCandidateExtractor(
+        _ExternalRequestGuidanceEngine(),
+        "qwen3.5:9b",
+    )
+
+    assert extractor.extract(_exchange("오늘 과천시 날씨를 알려달라고.")) == []
     assert extractor.last_error_code == ""
 
 
