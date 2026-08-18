@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from openjarvis.cli import cli
@@ -266,6 +268,187 @@ def test_deactivate_canonical_profile_cli_preserves_live_profile_files(
     assert memory_path.read_text(encoding="utf-8") == "CURRENT PRIVATE MEMORY"
     archive = PersonalMemoryArchive(config.personal_memory.archive_path)
     assert archive.get_metadata("canonical_profile_active", "1") == "0"
+
+
+_CORRUPT_MANIFEST_CASES = (
+    "missing_source_path",
+    "missing_backup_path",
+    "missing_sha256",
+    "source_path_not_string",
+    "backup_path_not_string",
+    "sha256_not_string",
+    "sha256_wrong_length",
+    "sha256_not_hex",
+    "entries_not_list",
+    "version_not_integer",
+    "version_boolean",
+    "version_float",
+    "top_level_not_object",
+    "entry_not_object",
+    "unexpected_top_level_key",
+    "source_path_empty",
+    "backup_path_empty",
+    "source_path_not_absolute",
+    "backup_path_not_absolute",
+    "source_path_contains_nul",
+    "backup_path_contains_nul",
+    "duplicate_source_path",
+    "duplicate_backup_path",
+    "duplicate_backup_path_alias",
+    "duplicate_source_parent_alias",
+    "duplicate_backup_parent_alias",
+    "pathologically_nested_json",
+)
+_PRIVATE_MANIFEST_MARKER = "private-cli-manifest-marker"
+
+
+def _corrupt_staging_manifest(archive, corruption: str) -> None:
+    manifest = json.loads(archive.get_metadata("canonical_profile_staging_manifest"))
+    if corruption == "pathologically_nested_json":
+        archive.set_metadata(
+            "canonical_profile_staging_manifest",
+            "[" * 10_000 + "0" + "]" * 10_000,
+        )
+        return
+    if corruption == "top_level_not_object":
+        archive.set_metadata(
+            "canonical_profile_staging_manifest",
+            json.dumps([_PRIVATE_MANIFEST_MARKER]),
+        )
+        return
+    if corruption == "entry_not_object":
+        manifest["entries"][0] = _PRIVATE_MANIFEST_MARKER
+        archive.set_metadata(
+            "canonical_profile_staging_manifest",
+            json.dumps(manifest, separators=(",", ":")),
+        )
+        return
+    entry = manifest["entries"][0]
+    entry["source_path"] = f"/{_PRIVATE_MANIFEST_MARKER}"
+    if corruption == "missing_source_path":
+        entry.pop("source_path")
+    elif corruption == "missing_backup_path":
+        entry.pop("backup_path")
+    elif corruption == "missing_sha256":
+        entry.pop("sha256")
+    elif corruption == "source_path_not_string":
+        entry["source_path"] = {"private": _PRIVATE_MANIFEST_MARKER}
+    elif corruption == "backup_path_not_string":
+        entry["backup_path"] = [_PRIVATE_MANIFEST_MARKER]
+    elif corruption == "sha256_not_string":
+        entry["sha256"] = 7
+    elif corruption == "sha256_wrong_length":
+        entry["sha256"] = "a" * 63
+    elif corruption == "sha256_not_hex":
+        entry["sha256"] = "z" * 64
+    elif corruption == "entries_not_list":
+        manifest["entries"] = {"private": _PRIVATE_MANIFEST_MARKER}
+    elif corruption == "version_not_integer":
+        manifest["version"] = "1"
+    elif corruption == "version_boolean":
+        manifest["version"] = True
+    elif corruption == "version_float":
+        manifest["version"] = 1.0
+    elif corruption == "unexpected_top_level_key":
+        manifest["private"] = _PRIVATE_MANIFEST_MARKER
+    elif corruption == "source_path_empty":
+        entry["source_path"] = ""
+    elif corruption == "backup_path_empty":
+        entry["backup_path"] = ""
+    elif corruption == "source_path_not_absolute":
+        entry["source_path"] = _PRIVATE_MANIFEST_MARKER
+    elif corruption == "backup_path_not_absolute":
+        entry["backup_path"] = _PRIVATE_MANIFEST_MARKER
+    elif corruption == "source_path_contains_nul":
+        entry["source_path"] = f"/{_PRIVATE_MANIFEST_MARKER}\0suffix"
+    elif corruption == "backup_path_contains_nul":
+        entry["backup_path"] = f"/{_PRIVATE_MANIFEST_MARKER}\0suffix"
+    elif corruption == "duplicate_source_path":
+        manifest["entries"][1]["source_path"] = entry["source_path"]
+    elif corruption == "duplicate_backup_path":
+        manifest["entries"][1]["backup_path"] = entry["backup_path"]
+        manifest["entries"][1]["sha256"] = entry["sha256"]
+    elif corruption == "duplicate_backup_path_alias":
+        backup = Path(entry["backup_path"])
+        alias = backup.parent / "." / backup.name
+        manifest["entries"][1]["backup_path"] = f"{alias.parent}/./{alias.name}"
+        manifest["entries"][1]["sha256"] = entry["sha256"]
+    elif corruption == "duplicate_source_parent_alias":
+        source = Path(entry["source_path"])
+        manifest["entries"][1]["source_path"] = f"/alias-segment/../{source.name}"
+    elif corruption == "duplicate_backup_parent_alias":
+        backup = Path(entry["backup_path"])
+        manifest["entries"][1]["backup_path"] = (
+            f"{backup.parent}/../{backup.parent.name}/{backup.name}"
+        )
+        manifest["entries"][1]["sha256"] = entry["sha256"]
+    else:  # pragma: no cover - test fixture contract
+        raise AssertionError(f"unknown corruption: {corruption}")
+    archive.set_metadata(
+        "canonical_profile_staging_manifest",
+        json.dumps(manifest, separators=(",", ":")),
+    )
+
+
+@pytest.mark.parametrize("operation", ("activate", "deactivate"))
+@pytest.mark.parametrize("corruption", _CORRUPT_MANIFEST_CASES)
+def test_canonical_profile_cli_rejects_corrupt_staging_manifest(
+    tmp_path,
+    monkeypatch,
+    operation,
+    corruption,
+):
+    """The CLI must translate trusted-metadata errors without content leaks."""
+    from openjarvis.core.config import JarvisConfig
+    from openjarvis.memory.archive import PersonalMemoryArchive
+
+    config = JarvisConfig()
+    config.personal_memory.archive_path = str(tmp_path / "personal.db")
+    config.memory_files.user_path = str(tmp_path / "USER.md")
+    config.memory_files.memory_path = str(tmp_path / "MEMORY.md")
+    user_path = Path(config.memory_files.user_path)
+    memory_path = Path(config.memory_files.memory_path)
+    user_path.write_text("- private original user", encoding="utf-8")
+    memory_path.write_text("- private original memory", encoding="utf-8")
+    mod = importlib.import_module("openjarvis.cli.memory_cmd")
+    monkeypatch.setattr(mod, "load_config", lambda: config)
+    runner = CliRunner()
+    assert runner.invoke(cli, ["memory", "stage-canonical-profile"]).exit_code == 0
+    archive = PersonalMemoryArchive(config.personal_memory.archive_path)
+    if operation == "deactivate":
+        assert (
+            runner.invoke(cli, ["memory", "activate-canonical-profile"]).exit_code == 0
+        )
+    user_path.write_text("CURRENT PRIVATE USER", encoding="utf-8")
+    memory_path.write_text("CURRENT PRIVATE MEMORY", encoding="utf-8")
+    active_before = archive.get_metadata("canonical_profile_active", "0")
+    decisions_before = archive.decision_count(subject_id="canonical_profile")
+    backup_path = json.loads(
+        archive.get_metadata("canonical_profile_staging_manifest")
+    )["entries"][0]["backup_path"]
+    _corrupt_staging_manifest(archive, corruption)
+
+    result = runner.invoke(
+        cli,
+        ["memory", f"{operation}-canonical-profile"],
+    )
+
+    assert result.exit_code == 1
+    expected_error = (
+        "trusted staged manifest is unreadable"
+        if corruption == "pathologically_nested_json"
+        else "trusted staged manifest is invalid"
+    )
+    assert f"Error: {expected_error}" in result.output
+    assert _PRIVATE_MANIFEST_MARKER not in result.output
+    assert backup_path not in result.output
+    assert "CURRENT PRIVATE USER" not in result.output
+    assert "CURRENT PRIVATE MEMORY" not in result.output
+    assert archive.get_metadata("canonical_profile_active", "0") == active_before
+    assert archive.get_metadata("canonical_profile_deactivated_at", "") == ""
+    assert archive.decision_count(subject_id="canonical_profile") == decisions_before
+    assert user_path.read_text(encoding="utf-8") == "CURRENT PRIVATE USER"
+    assert memory_path.read_text(encoding="utf-8") == "CURRENT PRIVATE MEMORY"
 
 
 def test_activate_canonical_profile_cli_refuses_without_staging(

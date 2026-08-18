@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 
@@ -428,6 +427,7 @@ def activate_canonical_profile_command(backup_paths: tuple[Path, ...]) -> None:
     from openjarvis.memory.archive import PersonalMemoryArchive
     from openjarvis.memory.profile_migration import (
         activate_canonical_profile,
+        resolve_staged_profile_manifest,
         validate_local_personal_archive,
     )
 
@@ -437,19 +437,12 @@ def activate_canonical_profile_command(backup_paths: tuple[Path, ...]) -> None:
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     archive = PersonalMemoryArchive(config.personal_memory.archive_path)
-    selected_backups = backup_paths
-    if not selected_backups:
-        try:
-            manifest = json.loads(
-                archive.get_metadata("canonical_profile_staging_manifest", "{}")
-            )
-            entries = manifest.get("entries", []) if isinstance(manifest, dict) else []
-            stored = [entry["backup_path"] for entry in entries]
-        except (TypeError, ValueError, json.JSONDecodeError):
-            stored = []
-        if isinstance(stored, list):
-            selected_backups = tuple(Path(str(path)) for path in stored)
     try:
+        selected_backups = (
+            backup_paths
+            if backup_paths
+            else resolve_staged_profile_manifest(archive).backup_paths
+        )
         activate_canonical_profile(archive, backup_paths=selected_backups)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -469,6 +462,7 @@ def deactivate_canonical_profile_command(backup_paths: tuple[Path, ...]) -> None
     from openjarvis.memory.archive import PersonalMemoryArchive
     from openjarvis.memory.profile_migration import (
         deactivate_canonical_profile,
+        resolve_staged_profile_manifest,
         validate_local_personal_archive,
     )
 
@@ -478,19 +472,12 @@ def deactivate_canonical_profile_command(backup_paths: tuple[Path, ...]) -> None
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     archive = PersonalMemoryArchive(config.personal_memory.archive_path)
-    selected_backups = backup_paths
-    if not selected_backups:
-        try:
-            manifest = json.loads(
-                archive.get_metadata("canonical_profile_staging_manifest", "{}")
-            )
-            entries = manifest.get("entries", []) if isinstance(manifest, dict) else []
-            stored = [entry["backup_path"] for entry in entries]
-        except (TypeError, ValueError, json.JSONDecodeError):
-            stored = []
-        if isinstance(stored, list):
-            selected_backups = tuple(Path(str(path)) for path in stored)
     try:
+        selected_backups = (
+            backup_paths
+            if backup_paths
+            else resolve_staged_profile_manifest(archive).backup_paths
+        )
         deactivate_canonical_profile(archive, backup_paths=selected_backups)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc

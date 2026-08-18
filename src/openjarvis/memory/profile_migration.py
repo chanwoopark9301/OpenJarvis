@@ -22,6 +22,7 @@ from openjarvis.memory.personal_models import (
 )
 
 _BULLET = re.compile(r"^\s*[-*+]\s+(.+?)\s*$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _BACKUP_METADATA_KEY = "canonical_profile_backup_paths"
 _STAGING_MANIFEST_KEY = "canonical_profile_staging_manifest"
 _ACTIVE_IDENTITIES_KEY = "canonical_profile_active_backup_identities"
@@ -34,6 +35,37 @@ class ProfileMigrationResult:
     backup_paths: tuple[Path, ...]
     imported: int
     skipped: int
+
+
+@dataclass(frozen=True, slots=True)
+class StagedProfileManifestEntry:
+    source_path: str
+    backup_path: str
+    sha256: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "source_path": self.source_path,
+            "backup_path": self.backup_path,
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class StagedProfileManifest:
+    """Validated, ordered recovery metadata from the trusted local archive."""
+
+    entries: tuple[StagedProfileManifestEntry, ...]
+
+    @property
+    def backup_paths(self) -> tuple[Path, ...]:
+        return tuple(Path(entry.backup_path) for entry in self.entries)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "version": 1,
+            "entries": [entry.as_dict() for entry in self.entries],
+        }
 
 
 class LegacyProfileMigrator:
@@ -53,6 +85,10 @@ class LegacyProfileMigrator:
         sources = tuple(
             Path(path).expanduser().absolute() for path in (user_path, memory_path)
         )
+        # Fail before creating private snapshots when existing trusted metadata is
+        # corrupt. Re-read after copying so a concurrent valid staging operation
+        # is merged instead of being overwritten by this preflight snapshot.
+        resolve_staged_profile_manifest(self.archive)
         backup_dir = self.archive.path.parent / ".canonical-profile-backups"
         snapshots: list[tuple[Path, Path, bytes]] = []
         with ExitStack() as backup_stack:
@@ -80,11 +116,8 @@ class LegacyProfileMigrator:
                     snapshot.decode("utf-8")
                     snapshots.append((source, backup, snapshot))
 
-        old_manifest = _read_manifest(self.archive)
-        merged = {
-            str(entry["source_path"]): entry
-            for entry in old_manifest.get("entries", [])
-        }
+        old_manifest = resolve_staged_profile_manifest(self.archive)
+        merged = {entry.source_path: entry.as_dict() for entry in old_manifest.entries}
         records: list[tuple[str, str, CandidateDraft]] = []
         for source, backup, snapshot in snapshots:
             snapshot_hash = hashlib.sha256(snapshot).hexdigest()
@@ -330,25 +363,68 @@ def _copy_private_snapshot(
     return backup, bytes(snapshot)
 
 
-def _read_manifest(archive: PersonalMemoryArchive) -> dict:
+def resolve_staged_profile_manifest(
+    archive: PersonalMemoryArchive,
+) -> StagedProfileManifest:
+    """Parse trusted staging metadata once into validated ordered entries."""
     raw = archive.get_metadata(_STAGING_MANIFEST_KEY, "")
     if not raw:
-        return {"version": 1, "entries": []}
+        return StagedProfileManifest(entries=())
     try:
         manifest = json.loads(raw)
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise ValueError("trusted staged manifest is unreadable") from exc
     entries = manifest.get("entries") if isinstance(manifest, dict) else None
     if (
         not isinstance(manifest, dict)
+        or set(manifest) != {"version", "entries"}
+        or type(manifest.get("version")) is not int
         or manifest.get("version") != 1
         or not isinstance(entries, list)
     ):
         raise ValueError("trusted staged manifest is invalid")
     required = {"source_path", "backup_path", "sha256"}
-    if any(not isinstance(entry, dict) or set(entry) != required for entry in entries):
-        raise ValueError("trusted staged manifest is invalid")
-    return manifest
+    resolved_entries: list[StagedProfileManifestEntry] = []
+    source_paths: set[Path] = set()
+    backup_paths: set[Path] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != required:
+            raise ValueError("trusted staged manifest is invalid")
+        source_path = entry["source_path"]
+        backup_path = entry["backup_path"]
+        sha256 = entry["sha256"]
+        if (
+            not all(
+                isinstance(value, str) for value in (source_path, backup_path, sha256)
+            )
+            or _SHA256_HEX.fullmatch(sha256) is None
+        ):
+            raise ValueError("trusted staged manifest is invalid")
+        normalized_source_path = os.path.normpath(source_path)
+        normalized_backup_path = os.path.normpath(backup_path)
+        source = Path(normalized_source_path)
+        backup = Path(normalized_backup_path)
+        if (
+            not source_path
+            or "\0" in source_path
+            or not source.is_absolute()
+            or not backup_path
+            or "\0" in backup_path
+            or not backup.is_absolute()
+            or source in source_paths
+            or backup in backup_paths
+        ):
+            raise ValueError("trusted staged manifest is invalid")
+        source_paths.add(source)
+        backup_paths.add(backup)
+        resolved_entries.append(
+            StagedProfileManifestEntry(
+                source_path=source_path,
+                backup_path=backup_path,
+                sha256=sha256,
+            )
+        )
+    return StagedProfileManifest(entries=tuple(resolved_entries))
 
 
 def _manifest_json(manifest: dict) -> str:
@@ -528,14 +604,14 @@ class _BackupValidation:
 @contextmanager
 def _validate_staged_backups(
     archive: PersonalMemoryArchive,
-    manifest: dict,
+    manifest: StagedProfileManifest,
     backup_paths: tuple[Path, ...],
 ) -> Iterator[_BackupValidation]:
     """Pin exact private snapshots through their transaction precommit check."""
     if not _secure_snapshot_primitives_available():
         raise ValueError("secure profile backup validation is not supported")
-    entries = manifest["entries"]
-    expected_backups = tuple(Path(entry["backup_path"]) for entry in entries)
+    entries = manifest.entries
+    expected_backups = manifest.backup_paths
     resolved_backups = tuple(
         Path(path).expanduser().absolute() for path in backup_paths
     )
@@ -591,7 +667,7 @@ def _validate_staged_backups(
                     expected_mode=0o600,
                     directory=False,
                 )
-                if _hash_open_file(backup_fd) != entry["sha256"]:
+                if _hash_open_file(backup_fd) != entry.sha256:
                     raise ValueError(
                         "profile backup snapshot does not match staged manifest"
                     )
@@ -602,7 +678,7 @@ def _validate_staged_backups(
                         backup_fd=backup_fd,
                         snapshot_identity=snapshot_identity,
                         backup_identity=backup_identity,
-                        expected_sha256=str(entry["sha256"]),
+                        expected_sha256=entry.sha256,
                     )
                 )
                 identity_entries.append(
@@ -667,8 +743,8 @@ def activate_canonical_profile(
         raise ValueError("a local personal-memory archive is required")
     validate_local_personal_archive(archive.path)
 
-    manifest = _read_manifest(archive)
-    manifest_json = _manifest_json(manifest)
+    manifest = resolve_staged_profile_manifest(archive)
+    manifest_json = _manifest_json(manifest.as_dict())
     with _validate_staged_backups(archive, manifest, backup_paths) as validation:
         archive.mark_canonical_profile_active(
             manifest_json=manifest_json,
@@ -687,8 +763,8 @@ def deactivate_canonical_profile(
     if not isinstance(archive, PersonalMemoryArchive):
         raise ValueError("a local personal-memory archive is required")
     validate_local_personal_archive(archive.path)
-    manifest = _read_manifest(archive)
-    manifest_json = _manifest_json(manifest)
+    manifest = resolve_staged_profile_manifest(archive)
+    manifest_json = _manifest_json(manifest.as_dict())
     with _validate_staged_backups(archive, manifest, backup_paths) as validation:
         active_identities = archive.get_metadata(_ACTIVE_IDENTITIES_KEY, "")
         if not active_identities or active_identities != validation.identities_json:
@@ -706,7 +782,10 @@ def deactivate_canonical_profile(
 __all__ = [
     "LegacyProfileMigrator",
     "ProfileMigrationResult",
+    "StagedProfileManifest",
+    "StagedProfileManifestEntry",
     "activate_canonical_profile",
     "deactivate_canonical_profile",
+    "resolve_staged_profile_manifest",
     "validate_local_personal_archive",
 ]

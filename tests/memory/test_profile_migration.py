@@ -722,6 +722,195 @@ def _staging_manifest(archive: PersonalMemoryArchive) -> dict:
     return json.loads(archive.get_metadata("canonical_profile_staging_manifest"))
 
 
+_CORRUPT_MANIFEST_CASES = (
+    "missing_source_path",
+    "missing_backup_path",
+    "missing_sha256",
+    "source_path_not_string",
+    "backup_path_not_string",
+    "sha256_not_string",
+    "sha256_wrong_length",
+    "sha256_not_hex",
+    "entries_not_list",
+    "version_not_integer",
+    "version_boolean",
+    "version_float",
+    "top_level_not_object",
+    "entry_not_object",
+    "unexpected_top_level_key",
+    "source_path_empty",
+    "backup_path_empty",
+    "source_path_not_absolute",
+    "backup_path_not_absolute",
+    "source_path_contains_nul",
+    "backup_path_contains_nul",
+    "duplicate_source_path",
+    "duplicate_backup_path",
+    "duplicate_backup_path_alias",
+    "duplicate_source_parent_alias",
+    "duplicate_backup_parent_alias",
+    "pathologically_nested_json",
+)
+_PRIVATE_MANIFEST_MARKER = "private-manifest-marker"
+
+
+def _corrupt_staging_manifest(
+    archive: PersonalMemoryArchive,
+    corruption: str,
+) -> None:
+    manifest = _staging_manifest(archive)
+    if corruption == "pathologically_nested_json":
+        archive.set_metadata(
+            "canonical_profile_staging_manifest",
+            "[" * 10_000 + "0" + "]" * 10_000,
+        )
+        return
+    if corruption == "top_level_not_object":
+        archive.set_metadata(
+            "canonical_profile_staging_manifest",
+            json.dumps([_PRIVATE_MANIFEST_MARKER]),
+        )
+        return
+    if corruption == "entry_not_object":
+        manifest["entries"][0] = _PRIVATE_MANIFEST_MARKER
+        archive.set_metadata(
+            "canonical_profile_staging_manifest",
+            json.dumps(manifest, separators=(",", ":")),
+        )
+        return
+    entry = manifest["entries"][0]
+    entry["source_path"] = f"/{_PRIVATE_MANIFEST_MARKER}"
+    if corruption == "missing_source_path":
+        entry.pop("source_path")
+    elif corruption == "missing_backup_path":
+        entry.pop("backup_path")
+    elif corruption == "missing_sha256":
+        entry.pop("sha256")
+    elif corruption == "source_path_not_string":
+        entry["source_path"] = {"private": _PRIVATE_MANIFEST_MARKER}
+    elif corruption == "backup_path_not_string":
+        entry["backup_path"] = [_PRIVATE_MANIFEST_MARKER]
+    elif corruption == "sha256_not_string":
+        entry["sha256"] = 7
+    elif corruption == "sha256_wrong_length":
+        entry["sha256"] = "a" * 63
+    elif corruption == "sha256_not_hex":
+        entry["sha256"] = "z" * 64
+    elif corruption == "entries_not_list":
+        manifest["entries"] = {"private": _PRIVATE_MANIFEST_MARKER}
+    elif corruption == "version_not_integer":
+        manifest["version"] = "1"
+    elif corruption == "version_boolean":
+        manifest["version"] = True
+    elif corruption == "version_float":
+        manifest["version"] = 1.0
+    elif corruption == "unexpected_top_level_key":
+        manifest["private"] = _PRIVATE_MANIFEST_MARKER
+    elif corruption == "source_path_empty":
+        entry["source_path"] = ""
+    elif corruption == "backup_path_empty":
+        entry["backup_path"] = ""
+    elif corruption == "source_path_not_absolute":
+        entry["source_path"] = _PRIVATE_MANIFEST_MARKER
+    elif corruption == "backup_path_not_absolute":
+        entry["backup_path"] = _PRIVATE_MANIFEST_MARKER
+    elif corruption == "source_path_contains_nul":
+        entry["source_path"] = f"/{_PRIVATE_MANIFEST_MARKER}\0suffix"
+    elif corruption == "backup_path_contains_nul":
+        entry["backup_path"] = f"/{_PRIVATE_MANIFEST_MARKER}\0suffix"
+    elif corruption == "duplicate_source_path":
+        manifest["entries"][1]["source_path"] = entry["source_path"]
+    elif corruption == "duplicate_backup_path":
+        manifest["entries"][1]["backup_path"] = entry["backup_path"]
+        manifest["entries"][1]["sha256"] = entry["sha256"]
+    elif corruption == "duplicate_backup_path_alias":
+        backup = Path(entry["backup_path"])
+        alias = backup.parent / "." / backup.name
+        manifest["entries"][1]["backup_path"] = f"{alias.parent}/./{alias.name}"
+        manifest["entries"][1]["sha256"] = entry["sha256"]
+    elif corruption == "duplicate_source_parent_alias":
+        source = Path(entry["source_path"])
+        manifest["entries"][1]["source_path"] = f"/alias-segment/../{source.name}"
+    elif corruption == "duplicate_backup_parent_alias":
+        backup = Path(entry["backup_path"])
+        manifest["entries"][1]["backup_path"] = (
+            f"{backup.parent}/../{backup.parent.name}/{backup.name}"
+        )
+        manifest["entries"][1]["sha256"] = entry["sha256"]
+    else:  # pragma: no cover - test fixture contract
+        raise AssertionError(f"unknown corruption: {corruption}")
+    archive.set_metadata(
+        "canonical_profile_staging_manifest",
+        json.dumps(manifest, separators=(",", ":")),
+    )
+
+
+@pytest.mark.parametrize("operation", ("activate", "deactivate"))
+@pytest.mark.parametrize("corruption", _CORRUPT_MANIFEST_CASES)
+def test_canonical_profile_api_rejects_corrupt_staging_manifest(
+    tmp_path,
+    operation,
+    corruption,
+):
+    """Malformed trusted metadata must remain a non-content ValueError."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    staged = LegacyProfileMigrator(archive).stage(user_path, memory_path)
+    if operation == "deactivate":
+        activate_canonical_profile(archive, backup_paths=staged.backup_paths)
+    user_path.write_text("CURRENT PRIVATE USER", encoding="utf-8")
+    memory_path.write_text("CURRENT PRIVATE MEMORY", encoding="utf-8")
+    active_before = archive.get_metadata("canonical_profile_active", "0")
+    decisions_before = archive.decision_count(subject_id="canonical_profile")
+    _corrupt_staging_manifest(archive, corruption)
+
+    command = (
+        activate_canonical_profile
+        if operation == "activate"
+        else deactivate_canonical_profile
+    )
+    with pytest.raises(ValueError) as caught:
+        command(archive, backup_paths=staged.backup_paths)
+
+    expected_error = (
+        "trusted staged manifest is unreadable"
+        if corruption == "pathologically_nested_json"
+        else "trusted staged manifest is invalid"
+    )
+    assert str(caught.value) == expected_error
+    assert _PRIVATE_MANIFEST_MARKER not in str(caught.value)
+    assert str(staged.backup_paths[0]) not in str(caught.value)
+    assert archive.get_metadata("canonical_profile_active", "0") == active_before
+    assert archive.get_metadata("canonical_profile_deactivated_at", "") == ""
+    assert archive.decision_count(subject_id="canonical_profile") == decisions_before
+    assert user_path.read_text(encoding="utf-8") == "CURRENT PRIVATE USER"
+    assert memory_path.read_text(encoding="utf-8") == "CURRENT PRIVATE MEMORY"
+
+
+def test_staging_rejects_corrupt_manifest_before_creating_snapshots(tmp_path):
+    """Trusted metadata must be parsed before staging writes recovery files."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    user_path, memory_path = _legacy_files(tmp_path)
+    migrator = LegacyProfileMigrator(archive)
+    migrator.stage(user_path, memory_path)
+    _corrupt_staging_manifest(archive, "missing_backup_path")
+    manifest_before = archive.get_metadata("canonical_profile_staging_manifest")
+    candidates_before = len(archive.find_candidates())
+    backup_root = tmp_path / ".canonical-profile-backups"
+    snapshots_before = {path.name for path in backup_root.iterdir()}
+    user_before = user_path.read_bytes()
+    memory_before = memory_path.read_bytes()
+
+    with pytest.raises(ValueError, match="trusted staged manifest is invalid"):
+        migrator.stage(user_path, memory_path)
+
+    assert {path.name for path in backup_root.iterdir()} == snapshots_before
+    assert archive.get_metadata("canonical_profile_staging_manifest") == manifest_before
+    assert len(archive.find_candidates()) == candidates_before
+    assert user_path.read_bytes() == user_before
+    assert memory_path.read_bytes() == memory_before
+
+
 def test_activation_requires_backups_from_the_trusted_staging_manifest(tmp_path):
     archive = PersonalMemoryArchive(tmp_path / "personal.db")
     user_path, memory_path = _legacy_files(tmp_path)
