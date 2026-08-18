@@ -68,7 +68,7 @@ default_model = "qwen3.5:4b"       # Fast and lightweight
 # default_model = "llama3.1:8b"    # Alternative model
 
 [agent]
-default_agent = "simple"            # Single-turn, no tools
+default_agent = "simple"            # Lightweight chat; managed tools when enabled
 
 [server]
 host = "0.0.0.0"
