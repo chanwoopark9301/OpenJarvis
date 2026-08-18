@@ -287,12 +287,12 @@ def test_startup_reprocesses_an_old_zero_candidate_completion(tmp_path):
                 """,
                 (exchange.id,),
             ).fetchone()
-        assert row == (2, "personal-memory-v6")
+        assert row == (2, "personal-memory-v8")
     finally:
         service.stop()
 
 
-def test_startup_reprocesses_v5_zero_candidate_with_v6_lifecycle(tmp_path):
+def test_startup_reprocesses_v5_zero_candidate_with_v8_lifecycle(tmp_path):
     """The changed proposer contract must not inherit a v5 empty completion."""
     extractor = _FakeExtractor()
     service = _service(tmp_path, EventBus(), extractor)
@@ -334,10 +334,10 @@ def test_startup_reprocesses_v5_zero_candidate_with_v6_lifecycle(tmp_path):
                 """,
                 (exchange.id,),
             ).fetchall()
-        assert exchange_row == (2, "personal-memory-v6")
+        assert exchange_row == (2, "personal-memory-v8")
         assert run_rows == [
             ("personal-memory-v5",),
-            ("personal-memory-v6",),
+            ("personal-memory-v8",),
         ]
     finally:
         service.stop()

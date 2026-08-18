@@ -37,7 +37,7 @@ CHECK_CONSOLIDATION = "check_consolidation"
 REFLECT_CONFLICTS = "reflect_conflicts"
 VALIDATE_INSIGHT = "validate_insight"
 IMPORT_LEGACY = "import_legacy"
-PERSONAL_CANDIDATE_EXTRACTOR_VERSION = "personal-memory-v6"
+PERSONAL_CANDIDATE_EXTRACTOR_VERSION = "personal-memory-v8"
 
 
 class PersonalMemoryService:

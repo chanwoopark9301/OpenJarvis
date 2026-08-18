@@ -44,6 +44,37 @@ class _CanonicalSubjectGuidanceEngine:
         }
 
 
+class _PerspectiveGuidanceEngine:
+    """Model double that otherwise assigns second-person identity to the user."""
+
+    def generate(self, messages, **kwargs):
+        system_prompt = messages[0].content.casefold()
+        has_guidance = (
+            "second-person" in system_prompt
+            and "refer to the assistant" in system_prompt
+            and "grammatical possessor" in system_prompt
+            and "any direct assignment" in system_prompt
+            and "role preference rather than a fact" in system_prompt
+        )
+        return {
+            "content": _response(
+                _candidate(
+                    kind="role_preference" if has_guidance else "fact",
+                    content=(
+                        "The assistant name is 공박사."
+                        if has_guidance
+                        else "The user's name is 공박사."
+                    ),
+                    importance=1.0,
+                    confidence=1.0,
+                    temporal_scope="until_changed",
+                    subject="assistant.name" if has_guidance else "user.name",
+                    evidence_excerpt="너의 이름은 공박사야.",
+                )
+            )
+        }
+
+
 class _ExternalRequestGuidanceEngine:
     """Model double that needs a general personal-evidence boundary."""
 
@@ -183,6 +214,24 @@ def test_bare_correction_receives_stable_subject_guidance():
 
     assert drafts[0].kind.value == "correction"
     assert drafts[0].subject == "assistant.name"
+
+
+def test_second_person_identity_uses_the_assistant_entity_in_any_language():
+    """Without perspective guidance, a model can invert user and assistant names."""
+    PersonalCandidateExtractor, _, _ = _extractor_api()
+    drafts = PersonalCandidateExtractor(
+        _PerspectiveGuidanceEngine(),
+        "qwen3.5:9b",
+    ).extract(
+        _exchange(
+            "너의 이름은 공박사야.",
+            "네, 저는 공박사입니다.",
+        )
+    )
+
+    assert drafts[0].kind.value == "role_preference"
+    assert drafts[0].subject == "assistant.name"
+    assert drafts[0].content == "The assistant name is 공박사."
 
 
 def test_evidence_excerpt_copied_only_from_assistant_text_is_rejected():
