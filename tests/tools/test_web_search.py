@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.tools.web_search import WebSearchTool
 
@@ -74,7 +76,8 @@ class TestWebSearchTool:
         assert "No query" in result.content
         assert result.metadata["mode"] == "search"
         assert result.metadata["engine"] == "tavily"
-        assert result.metadata["content_available"] is True
+        assert result.metadata["content_available"] is False
+        assert result.metadata["query"] == ""
         assert result.metadata["retrieved_at"]
 
     def test_execute_no_query_param(self):
@@ -138,6 +141,7 @@ class TestWebSearchTool:
         assert result.metadata["content_available"] is True
         assert result.metadata["retrieved_at"]
         assert result.metadata["source"].startswith("https://api.open-meteo.com/")
+        assert result.metadata["query"] == "경기도 과천시 현재 날씨 기온 강수"
         assert "경기도 과천시 현재 날씨" in result.content
         assert "기온 24.7°C" in result.content
         assert "체감 기온 29.4°C" in result.content
@@ -229,6 +233,7 @@ class TestWebSearchTool:
         assert result.metadata["mode"] == "search"
         assert result.metadata["engine"] == "tavily"
         assert result.metadata["content_available"] is True
+        assert result.metadata["query"] == "test query"
         assert result.metadata["retrieved_at"]
         assert result.content.startswith("UNTRUSTED PUBLIC WEB DATA.")
 
@@ -301,6 +306,7 @@ class TestWebSearchTool:
         assert result.metadata["engine"] == "duckduckgo"
         assert result.metadata["mode"] == "search"
         assert result.metadata["content_available"] is True
+        assert result.metadata["query"] == "test query"
         assert result.metadata["retrieved_at"]
         assert result.content.startswith("UNTRUSTED PUBLIC WEB DATA.")
 
@@ -416,6 +422,7 @@ class TestWebSearchTool:
         assert result.metadata["mode"] == "search"
         assert result.metadata["engine"] == "tavily"
         assert result.metadata["content_available"] is False
+        assert result.metadata["query"] == "obscure query"
         assert result.metadata["retrieved_at"]
 
     def test_tool_id(self):
@@ -501,6 +508,35 @@ class TestWebSearchTool:
         tool = WebSearchTool(api_key="test-key")
         result = tool.execute(query="test query")
         assert "Summary: Fallback snippet text." in result.content
+
+    def test_tavily_ignores_blank_provider_records(self, monkeypatch):
+        import builtins
+
+        mock_client = MagicMock()
+        mock_client.search.return_value = {"results": [{}, {"title": "  "}]}
+        mock_tavily_module = MagicMock()
+        mock_tavily_module.TavilyClient.return_value = mock_client
+        original_import = builtins.__import__
+
+        def _mock_import(name, *args, **kwargs):
+            if name == "tavily":
+                return mock_tavily_module
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _mock_import)
+
+        result = WebSearchTool(api_key="test-key").execute(query="blank records")
+
+        assert result.content == "No results found."
+        assert result.metadata["num_results"] == 0
+        assert result.metadata["content_available"] is False
+        assert result.metadata["query"] == "blank records"
+
+    def test_non_location_weather_queries_skip_structured_weather_lookup(self):
+        from openjarvis.tools.web_search import _KOREAN_WEATHER_QUERY
+
+        for query in ("내일 날씨", "오늘 날씨", "이번 주 날씨", "전국 날씨"):
+            assert _KOREAN_WEATHER_QUERY.search(query) is None
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +661,61 @@ class TestUrlFetching:
         assert "PDF" in content
         assert "cannot be read" in content
 
+    def test_fetch_url_blocks_private_redirect_target(self, monkeypatch):
+        import httpx
+
+        import openjarvis.tools.web_search as web_search
+
+        redirect = MagicMock()
+        redirect.status_code = 302
+        redirect.headers = {
+            "location": "http://127.0.0.1/admin",
+            "content-type": "text/html",
+        }
+        redirect.url = httpx.URL("https://public.example/start")
+        redirect.text = "<html><body>Not a redirect target</body></html>"
+        monkeypatch.setattr(httpx, "get", MagicMock(return_value=redirect))
+        monkeypatch.setattr(
+            web_search,
+            "check_ssrf",
+            MagicMock(side_effect=[None, "private IP blocked"]),
+        )
+
+        with pytest.raises(ValueError, match="private IP blocked"):
+            WebSearchTool._fetch_url("https://public.example/start")
+
+        assert httpx.get.call_count == 1
+
+    def test_fetch_url_follows_validated_public_redirect(self, monkeypatch):
+        import httpx
+
+        import openjarvis.tools.web_search as web_search
+
+        redirect = MagicMock()
+        redirect.status_code = 302
+        redirect.headers = {"location": "/article"}
+        redirect.url = httpx.URL("https://public.example/start")
+        final = MagicMock()
+        final.status_code = 200
+        final.headers = {"content-type": "text/html"}
+        final.url = httpx.URL("https://public.example/article")
+        final.text = "<html><body>Public article</body></html>"
+        final.raise_for_status = MagicMock()
+        get = MagicMock(side_effect=[redirect, final])
+        ssrf = MagicMock(return_value=None)
+        monkeypatch.setattr(httpx, "get", get)
+        monkeypatch.setattr(web_search, "check_ssrf", ssrf)
+
+        content = WebSearchTool._fetch_url("https://public.example/start")
+
+        assert "Public article" in content
+        assert get.call_count == 2
+        assert get.call_args_list[0].kwargs["follow_redirects"] is False
+        assert ssrf.call_args_list == [
+            (("https://public.example/start",), {}),
+            (("https://public.example/article",), {}),
+        ]
+
 
 class TestExecuteWithUrl:
     def _mock_ssrf(self, monkeypatch):
@@ -651,9 +742,32 @@ class TestExecuteWithUrl:
         assert result.metadata.get("mode") == "fetch"
         assert result.metadata["engine"] == "http"
         assert result.metadata["source"] == "https://example.com/article"
+        assert result.metadata["query"] == "https://example.com/article"
         assert result.metadata["content_available"] is True
         assert result.metadata["retrieved_at"]
         assert result.content.startswith("UNTRUSTED PUBLIC WEB DATA.")
+
+    def test_execute_with_normalized_url_uses_actual_source(self, monkeypatch):
+        import httpx
+
+        self._mock_ssrf(monkeypatch)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.url = httpx.URL("https://arxiv.org/abs/2310.03714")
+        mock_resp.text = "<html><body>Paper abstract</body></html>"
+        mock_resp.headers = {"content-type": "text/html"}
+        mock_resp.raise_for_status = MagicMock()
+        get = MagicMock(return_value=mock_resp)
+        monkeypatch.setattr(httpx, "get", get)
+
+        query = "https://arxiv.org/pdf/2310.03714"
+        result = WebSearchTool(api_key="test-key").execute(query=query)
+
+        assert result.success is True
+        assert result.metadata["url"] == query
+        assert result.metadata["query"] == query
+        assert result.metadata["source"] == "https://arxiv.org/abs/2310.03714"
+        assert get.call_args.args[0] == "https://arxiv.org/abs/2310.03714"
 
     def test_execute_with_embedded_url(self, monkeypatch):
         """When query contains a URL within text, detect and fetch it."""
@@ -687,7 +801,8 @@ class TestExecuteWithUrl:
         assert "private IP blocked" in result.content
         assert result.metadata["mode"] == "fetch"
         assert result.metadata["engine"] == "http"
-        assert result.metadata["content_available"] is True
+        assert result.metadata["content_available"] is False
+        assert result.metadata["query"] == "http://169.254.169.254/metadata"
         assert result.metadata["retrieved_at"]
 
     def test_execute_url_fetch_failure(self, monkeypatch):
@@ -707,5 +822,27 @@ class TestExecuteWithUrl:
         assert "Failed to fetch URL" in result.content
         assert result.metadata["mode"] == "fetch"
         assert result.metadata["engine"] == "http"
-        assert result.metadata["content_available"] is True
+        assert result.metadata["content_available"] is False
+        assert result.metadata["query"] == "https://example.com/broken"
         assert result.metadata["retrieved_at"]
+
+    def test_execute_empty_fetched_page_is_not_available_content(self, monkeypatch):
+        import httpx
+
+        self._mock_ssrf(monkeypatch)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.url = httpx.URL("https://example.com/empty")
+        mock_resp.text = "<html><body>   </body></html>"
+        mock_resp.headers = {"content-type": "text/html"}
+        mock_resp.raise_for_status = MagicMock()
+        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+
+        result = WebSearchTool(api_key="test-key").execute(
+            query="https://example.com/empty"
+        )
+
+        assert result.success is True
+        assert result.content == "No content found at URL."
+        assert result.metadata["content_available"] is False
+        assert result.metadata["query"] == "https://example.com/empty"
