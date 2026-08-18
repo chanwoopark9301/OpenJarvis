@@ -238,16 +238,29 @@ jarvis memory deactivate-canonical-profile
 
 The command repeats the exact ordered-manifest, SHA-256, `0700` directory,
 `0600` file, owner, non-symlink, regular-file, and descriptor-identity checks.
-It also requires every backup identity to match the activation attestation.
-Only then does one archive transaction clear the canonical marker and append a
-non-content audit decision. Current `USER.md` and `MEMORY.md` bytes are never
-restored or overwritten; those current sources simply become eligible for
-static injection again. Missing, modified, replaced, or permission-weakened
-backups fail closed and leave both canonical metadata and audit state unchanged.
+Attestation schema version 2 covers device, inode, uid, mode, size, and
+nanosecond mtime/ctime for the root, each snapshot directory, and every file.
+An installation activated by an older schema must rerun the activation command
+against its unchanged exact manifest and backups before using deactivation.
+
 All root, snapshot-directory, and file descriptors remain pinned across the
-cutover. After every manifest hash finishes, the whole set is freshly reopened
-and fully revalidated; the hashes and identities are checked again inside the
-SQLite transaction immediately before metadata and audit writes.
+cutover. Each validation pass hashes every pinned file first, freshly reopens
+every absolute root/snapshot/file path without following symlinks, compares all
+attested fields, and finally repeats a global full-field check of every pinned
+descriptor. In the cutover transaction, metadata and the non-content audit row
+are first staged as uncommitted changes; this validation then runs as the last
+application check, and failure rolls the transaction back. Only a successful
+check permits commit. Current `USER.md` and `MEMORY.md` bytes are never restored
+or overwritten; those current sources simply become eligible for static
+injection again. Mutations observed by the checks fail closed and leave both
+canonical metadata and audit state unchanged.
+
+POSIX filesystem state and SQLite do not share a kernel-level transaction.
+There is therefore an unavoidable interval between the last filesystem
+observation and SQLite commit, and multiple paths can only be observed
+sequentially. This command narrows that boundary; it does not claim protection
+against a same-user actor that can keep mutating private backups after the last
+observation.
 
 Preserve the archive, manifest, and snapshots after deactivation. This command
 is a safe authority rollback, not an automatic file restore. Do not use
