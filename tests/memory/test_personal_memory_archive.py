@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 
@@ -13,6 +15,35 @@ def _archive_api():
     except ImportError:
         pytest.fail("personal memory archive API is missing")
     return PersonalMemoryArchive, CandidateDraft
+
+
+def _seed_three_ordered_exchanges(tmp_path):
+    PersonalMemoryArchive, _ = _archive_api()
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    for index in range(1, 4):
+        archive.record_exchange(
+            exchange_id=f"exchange-{index}",
+            user_text=f"user {index}",
+            assistant_text=f"assistant {index}",
+            source="cli.chat",
+            session_id="session-1",
+        )
+    with sqlite3.connect(archive.path) as connection:
+        for index in range(1, 4):
+            connection.execute(
+                "UPDATE conversation_exchanges SET created_at = ? WHERE id = ?",
+                (float(index), f"exchange-{index}"),
+            )
+    return archive
+
+
+def test_recent_exchanges_are_bounded_and_end_before_current(tmp_path):
+    """Dialogue context must not include its current or future exchange."""
+    archive = _seed_three_ordered_exchanges(tmp_path)
+
+    recent = archive.recent_exchanges("exchange-3", limit=2)
+
+    assert [item.id for item in recent] == ["exchange-1", "exchange-2"]
 
 
 def test_replaying_exchange_id_keeps_the_first_archived_conversation(tmp_path):
@@ -98,6 +129,36 @@ def test_completed_candidate_keeps_a_link_to_its_exact_conversation(tmp_path):
 
     assert candidates[0].exchange_id == "exchange-3"
     assert candidates[0].status == "pending"
+
+
+def test_completed_candidate_keeps_its_exact_user_evidence_excerpt(tmp_path):
+    """Candidate content alone must not replace the user's original wording."""
+    PersonalMemoryArchive, CandidateDraft = _archive_api()
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    archive.record_exchange(
+        exchange_id="exchange-evidence",
+        user_text="공박사라고 불러 주세요.",
+        assistant_text="알겠습니다.",
+        source="cli.chat",
+    )
+    assert archive.claim_candidate_job("exchange-evidence") is not None
+
+    candidate = archive.complete_candidate_job(
+        "exchange-evidence",
+        [
+            CandidateDraft(
+                "correction",
+                "The assistant name is 공박사.",
+                1,
+                1,
+                evidence_excerpt="공박사라고 불러 주세요.",
+            )
+        ],
+        engine_id="ollama",
+        extractor_version="v1",
+    )[0]
+
+    assert candidate.evidence_excerpt == "공박사라고 불러 주세요."
 
 
 def test_completed_candidate_preserves_rule_provenance_and_scope(tmp_path):

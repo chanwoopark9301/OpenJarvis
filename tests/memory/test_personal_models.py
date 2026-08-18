@@ -53,6 +53,20 @@ def test_existing_string_candidate_api_remains_compatible():
     assert draft.source is models.EvidenceSource.USER_DIRECT
 
 
+def test_candidate_keeps_exact_user_evidence_excerpt():
+    """Dropping the source wording would make proposal review unauditable."""
+    draft = models.CandidateDraft(
+        "correction",
+        "The assistant name is 공박사.",
+        1,
+        1,
+        subject="assistant.name",
+        evidence_excerpt="공박사라고.",
+    )
+
+    assert draft.evidence_excerpt == "공박사라고."
+
+
 def test_evidence_mass_keeps_axes_separate_and_immutable():
     """A future summed score must not replace independent support and counter mass."""
     mass = models.EvidenceMass(

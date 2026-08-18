@@ -156,6 +156,7 @@ class CandidateDraft:
     temporal_scope: str = "unspecified"
     subject: str = "user"
     target_claim_id: str = ""
+    evidence_excerpt: str = ""
 
     def __post_init__(self) -> None:
         try:
@@ -200,6 +201,7 @@ class MemoryCandidate:
     temporal_scope: str = "unspecified"
     subject: str = "user"
     target_claim_id: str = ""
+    evidence_excerpt: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", CandidateKind(self.kind))

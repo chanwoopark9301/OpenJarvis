@@ -29,7 +29,7 @@ from openjarvis.memory.personal_models import (
     SchemaMaturity,
 )
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _RELEASE_ATTESTATION_GATES = frozenset(
     {
         "assistant_only_rejection",
@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
   exchange_id TEXT NOT NULL REFERENCES conversation_exchanges(id),
   kind TEXT NOT NULL,
   content TEXT NOT NULL,
+  evidence_excerpt TEXT NOT NULL DEFAULT '',
   importance REAL NOT NULL,
   confidence REAL NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
@@ -323,6 +324,7 @@ class PersonalMemoryArchive:
                 "temporal_scope": "TEXT NOT NULL DEFAULT 'unspecified'",
                 "subject": "TEXT NOT NULL DEFAULT 'user'",
                 "target_claim_id": "TEXT NOT NULL DEFAULT ''",
+                "evidence_excerpt": "TEXT NOT NULL DEFAULT ''",
             }
             for name, declaration in candidate_migrations.items():
                 if name not in candidate_columns:
@@ -455,6 +457,7 @@ class PersonalMemoryArchive:
             exchange_id=str(row["exchange_id"]),
             kind=str(row["kind"]),  # database values are created from CandidateDraft
             content=str(row["content"]),
+            evidence_excerpt=str(row["evidence_excerpt"]),
             importance=float(row["importance"]),
             confidence=float(row["confidence"]),
             status=str(row["status"]),
@@ -790,6 +793,31 @@ class PersonalMemoryArchive:
                 "SELECT * FROM conversation_exchanges WHERE id = ?", (exchange_id,)
             ).fetchone()
         return self._exchange_from_row(row) if row is not None else None
+
+    def recent_exchanges(
+        self,
+        exchange_id: str,
+        *,
+        limit: int = 6,
+    ) -> list[ConversationExchange]:
+        """Return earlier exchanges in the current session or source scope."""
+        with self._lock, self._connect() as connection:
+            current = connection.execute(
+                "SELECT created_at, session_id, source "
+                "FROM conversation_exchanges WHERE id = ?",
+                (exchange_id,),
+            ).fetchone()
+            if current is None:
+                return []
+            scope_column = "session_id" if current["session_id"] else "source"
+            scope_value = current[scope_column]
+            rows = connection.execute(
+                f"SELECT * FROM conversation_exchanges "
+                f"WHERE {scope_column} = ? AND created_at < ? "
+                f"ORDER BY created_at DESC, id DESC LIMIT ?",
+                (scope_value, current["created_at"], max(0, int(limit))),
+            ).fetchall()
+        return [self._exchange_from_row(row) for row in reversed(rows)]
 
     def get_latest_unevaluated_user_text(self) -> str:
         """Return only the user's newest raw text awaiting candidate extraction."""
@@ -2276,10 +2304,11 @@ class PersonalMemoryArchive:
                 connection.execute(
                     """
                     INSERT INTO memory_candidates (
-                        id, exchange_id, kind, content, importance, confidence, status,
+                        id, exchange_id, kind, content, evidence_excerpt, importance,
+                        confidence, status,
                         engine_id, extractor_version, source, temporal_scope, subject,
                         target_claim_id, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(exchange_id, kind, content) DO NOTHING
                     """,
                     (
@@ -2287,6 +2316,7 @@ class PersonalMemoryArchive:
                         exchange_id,
                         draft.kind,
                         draft.content,
+                        draft.evidence_excerpt,
                         draft.importance,
                         draft.confidence,
                         engine_id,

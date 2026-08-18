@@ -74,9 +74,10 @@ def test_existing_candidate_archive_migrates_in_place(tmp_path):
 
     archive = PersonalMemoryArchive(path)
 
-    assert archive.schema_version() == 4
+    assert archive.schema_version() == 5
     assert archive.get_exchange("old-exchange").user_text == "old user text"
     assert archive.get_candidate("old-candidate").source.value == "legacy_import"
+    assert archive.get_candidate("old-candidate").evidence_excerpt == ""
     recovered = archive.recover_pending_candidate_jobs()
     assert [job.subject_id for job in recovered] == ["old-candidate"]
     assert {
@@ -121,7 +122,46 @@ def test_v2_pending_user_direct_candidate_is_quarantined_on_v3_upgrade(tmp_path)
     assert reopened.recover_pending_candidate_jobs() == []
     assert reopened.pending_job_ids(limit=10) == []
     assert reopened.decision_count(subject_id=candidate.id) == 1
-    assert reopened.schema_version() == 4
+    assert reopened.schema_version() == 5
+
+
+def test_existing_v4_candidate_archive_adds_blank_evidence_excerpt_idempotently(
+    tmp_path,
+):
+    """A v4 archive must retain its candidate when v5 adds exact evidence."""
+    path = tmp_path / "personal.db"
+    _create_v1_archive(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE archive_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO archive_metadata(key, value) VALUES ('schema_version', '4')"
+        )
+        connection.executescript(
+            """
+            ALTER TABLE memory_candidates
+              ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy_import';
+            ALTER TABLE memory_candidates
+              ADD COLUMN temporal_scope TEXT NOT NULL DEFAULT 'unspecified';
+            ALTER TABLE memory_candidates
+              ADD COLUMN subject TEXT NOT NULL DEFAULT 'user';
+            ALTER TABLE memory_candidates
+              ADD COLUMN target_claim_id TEXT NOT NULL DEFAULT '';
+            """
+        )
+
+    archive = PersonalMemoryArchive(path)
+
+    candidate = archive.get_candidate("old-candidate")
+    assert candidate is not None
+    assert archive.schema_version() == 5
+    assert candidate.content == "old user text"
+    assert candidate.evidence_excerpt == ""
+
+    reopened = PersonalMemoryArchive(path)
+    assert reopened.schema_version() == 5
+    assert reopened.get_candidate("old-candidate").evidence_excerpt == ""
 
 
 def test_job_idempotency_key_prevents_duplicate_work(tmp_path):
