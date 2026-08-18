@@ -108,7 +108,13 @@ class ContextComposer:
         self.max_episodes = max(0, max_episodes)
         self.max_raw_evidence = max(0, max_raw_evidence)
 
-    def compose(self, current_user_text: str) -> ComposedMemoryContext:
+    def compose(
+        self,
+        current_user_text: str,
+        *,
+        dialogue_source: str = "",
+        dialogue_session_id: str = "",
+    ) -> ComposedMemoryContext:
         """Compose evaluated memory plus a separate latest-user continuity overlay."""
         claims = self.archive.get_active_claims()
         constraints = tuple(
@@ -170,11 +176,18 @@ class ContextComposer:
             episodes=episodes,
             raw_evidence=raw_evidence,
             unresolved=unresolved,
-            user_overlay=self.archive.get_latest_unevaluated_user_text(),
+            user_overlay=self.archive.get_latest_unevaluated_user_text(
+                source=dialogue_source,
+                session_id=dialogue_session_id,
+            ),
             sections=sections,
             recent_pending_user_messages=tuple(
                 exchange.user_text
-                for exchange in self.archive.recent_incomplete_exchanges(limit=6)
+                for exchange in self.archive.recent_incomplete_exchanges(
+                    source=dialogue_source,
+                    session_id=dialogue_session_id,
+                    limit=6,
+                )
             ),
         )
 
@@ -200,6 +213,8 @@ def compose_configured_personal_context(
     *,
     engine_key: str,
     archive: PersonalMemoryArchive | None = None,
+    dialogue_source: str = "",
+    dialogue_session_id: str = "",
 ) -> ComposedMemoryContext | None:
     """Compose only when both storage and the response engine are local."""
     personal = getattr(config, "personal_memory", None)
@@ -225,7 +240,11 @@ def compose_configured_personal_context(
         max_schemas=getattr(personal, "context_schemas", 8),
         max_episodes=getattr(personal, "context_episodes", 5),
         max_raw_evidence=getattr(personal, "context_raw_evidence", 3),
-    ).compose(current_user_text)
+    ).compose(
+        current_user_text,
+        dialogue_source=dialogue_source,
+        dialogue_session_id=dialogue_session_id,
+    )
     if mode == "shadow" and not canonical_profile_active:
         selected_archive.record_shadow_composition(
             latency_ms=(time.perf_counter() - started) * 1000,

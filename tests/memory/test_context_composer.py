@@ -206,9 +206,14 @@ def test_latest_unevaluated_text_is_a_user_overlay_not_a_system_rule(tmp_path):
         user_text="I might want to run tomorrow.",
         assistant_text="You are definitely a runner.",
         source="test",
+        session_id="main",
     )
 
-    context = ContextComposer(archive).compose("What did I just say?")
+    context = ContextComposer(archive).compose(
+        "What did I just say?",
+        dialogue_source="test",
+        dialogue_session_id="main",
+    )
 
     assert context.user_overlay == "I might want to run tomorrow."
     assert "definitely a runner" not in context.render()
@@ -224,6 +229,7 @@ def test_recent_incomplete_user_messages_are_bounded_and_chronological(tmp_path)
             user_text=f"user message {index}",
             assistant_text=f"assistant instruction {index}",
             source="cli.chat",
+            session_id="main",
         )
     with sqlite3.connect(archive.path) as connection:
         for index in range(1, 9):
@@ -232,13 +238,74 @@ def test_recent_incomplete_user_messages_are_bounded_and_chronological(tmp_path)
                 (float(index), f"pending-{index}"),
             )
 
-    context = ContextComposer(archive).compose("continue")
+    context = ContextComposer(archive).compose(
+        "continue",
+        dialogue_source="cli.chat",
+        dialogue_session_id="main",
+    )
 
     assert context.recent_pending_user_messages == tuple(
         f"user message {index}" for index in range(3, 9)
     )
     assert "assistant instruction" not in " ".join(context.recent_pending_user_messages)
     assert "user message" not in context.render()
+
+
+def test_pending_dialogue_is_scoped_while_canonical_claims_remain_global(tmp_path):
+    """Raw restart dialogue must stay in one source/session boundary."""
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    _accept_claim(
+        archive,
+        index=1,
+        kind=CandidateKind.CONSTRAINT,
+        content="Do not proactively mention study plans.",
+        temporal_scope="until_changed",
+        subject="assistant_behavior",
+    )
+    exchanges = (
+        ("cli-old", "older CLI turn", "assistant-only old", "cli.chat", "main"),
+        ("server", "SERVER PRIVATE TURN", "server reply", "server.chat", "main"),
+        (
+            "managed",
+            "MANAGED AGENT PRIVATE TURN",
+            "managed reply",
+            "managed_agent",
+            "main",
+        ),
+        ("other-cli", "OTHER CLI SESSION", "other reply", "cli.chat", "other"),
+        ("cli-new", "newer CLI turn", "assistant-only new", "cli.chat", "main"),
+    )
+    for exchange_id, user_text, assistant_text, source, session_id in exchanges:
+        archive.record_exchange(
+            exchange_id=exchange_id,
+            user_text=user_text,
+            assistant_text=assistant_text,
+            source=source,
+            session_id=session_id,
+        )
+    with sqlite3.connect(archive.path) as connection:
+        for created_at, exchange in enumerate(exchanges, start=10):
+            connection.execute(
+                "UPDATE conversation_exchanges SET created_at = ? WHERE id = ?",
+                (float(created_at), exchange[0]),
+            )
+
+    context = ContextComposer(archive).compose(
+        "continue",
+        dialogue_source="cli.chat",
+        dialogue_session_id="main",
+    )
+
+    assert context.recent_pending_user_messages == (
+        "older CLI turn",
+        "newer CLI turn",
+    )
+    assert context.user_overlay == "newer CLI turn"
+    assert context.constraints == ("Do not proactively mention study plans.",)
+    assert "assistant-only" not in " ".join(context.recent_pending_user_messages)
+    assert "SERVER PRIVATE TURN" not in context.render()
+    assert "MANAGED AGENT PRIVATE TURN" not in context.render()
+    assert "OTHER CLI SESSION" not in context.render()
 
 
 def test_pending_messages_with_equal_timestamps_use_stable_exchange_order(tmp_path):
@@ -249,11 +316,16 @@ def test_pending_messages_with_equal_timestamps_use_stable_exchange_order(tmp_pa
             user_text=exchange_id,
             assistant_text="assistant text",
             source="cli.chat",
+            session_id="main",
         )
     with sqlite3.connect(archive.path) as connection:
         connection.execute("UPDATE conversation_exchanges SET created_at = 10")
 
-    context = ContextComposer(archive).compose("continue")
+    context = ContextComposer(archive).compose(
+        "continue",
+        dialogue_source="cli.chat",
+        dialogue_session_id="main",
+    )
 
     assert context.recent_pending_user_messages == (
         "pending-a",

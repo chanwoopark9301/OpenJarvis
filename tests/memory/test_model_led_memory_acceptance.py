@@ -255,9 +255,14 @@ def test_pending_natural_dialogue_is_context_not_a_direct_rule(tmp_path):
         user_text="오늘은 그냥 이런저런 이야기를 하고 싶어.",
         assistant_text="좋아, 편하게 이야기하자.",
         source="cli.chat",
+        session_id="default",
     )
 
-    context = ContextComposer(PersonalMemoryArchive(archive_path)).compose("계속하자.")
+    context = ContextComposer(PersonalMemoryArchive(archive_path)).compose(
+        "계속하자.",
+        dialogue_source="cli.chat",
+        dialogue_session_id="default",
+    )
 
     assert context.constraints == ()
     assert context.recent_pending_user_messages == (

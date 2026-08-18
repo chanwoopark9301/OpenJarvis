@@ -25,6 +25,8 @@ from openjarvis.memory import record_and_publish_completed_exchange
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_CHAT_SESSION_ID = "default"
+
 
 def _supports_prompt_builder_injection(agent_cls: object) -> bool:
     """Require an explicit capability and an explicit constructor parameter."""
@@ -155,6 +157,12 @@ def _deduplicate_pending_dialogue(
         "(overrides config). Pass 'none' to disable all persona files."
     ),
 )
+@click.option(
+    "--session-id",
+    default=_DEFAULT_CHAT_SESSION_ID,
+    show_default=True,
+    help="Stable conversation key used for restart continuity.",
+)
 def chat(
     engine_key: str | None,
     model_name: str | None,
@@ -162,6 +170,7 @@ def chat(
     tools: str | None,
     system_prompt: str | None,
     persona_name: str | None,
+    session_id: str,
 ) -> None:
     """Start an interactive multi-turn chat session.
 
@@ -173,6 +182,7 @@ def chat(
       /history      — show conversation history
     """
     console = Console(stderr=True)
+    chat_session_id = session_id.strip() or _DEFAULT_CHAT_SESSION_ID
 
     config = load_config()
     bus = EventBus(record_history=False)
@@ -499,6 +509,8 @@ def chat(
                         config,
                         user_input,
                         engine_key=engine_name,
+                        dialogue_source="cli.chat",
+                        dialogue_session_id=chat_session_id,
                         archive=(
                             personal_memory_service.archive
                             if personal_memory_service is not None
@@ -541,6 +553,9 @@ def chat(
                 agent_context = _build_chat_agent_context(
                     history[:-1], agent_context_messages
                 )
+                agent_context.metadata.update(
+                    {"source": "cli.chat", "session_id": chat_session_id}
+                )
                 prepare_tool_security_context = getattr(
                     agent,
                     "prepare_tool_security_context",
@@ -571,6 +586,7 @@ def chat(
                 user_input,
                 content,
                 source="cli.chat",
+                session_id=chat_session_id,
             )
         except KeyboardInterrupt:
             console.print("\n[dim]Generation interrupted.[/dim]")

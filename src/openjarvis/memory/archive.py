@@ -1066,37 +1066,49 @@ class PersonalMemoryArchive:
             ).fetchall()
         return [self._exchange_from_row(row) for row in reversed(rows)]
 
-    def get_latest_unevaluated_user_text(self) -> str:
-        """Return only the user's newest raw text awaiting candidate extraction."""
+    def get_latest_unevaluated_user_text(
+        self,
+        *,
+        source: str,
+        session_id: str,
+    ) -> str:
+        """Return the newest pending user text in one conversation scope."""
+        if not source or not session_id:
+            return ""
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 """
                 SELECT user_text FROM conversation_exchanges
                 WHERE candidate_state != 'complete'
+                  AND source = ? AND session_id = ?
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
-                """
+                """,
+                (source, session_id),
             ).fetchone()
         return str(row["user_text"]) if row is not None else ""
 
     def recent_incomplete_exchanges(
         self,
         *,
+        source: str,
+        session_id: str,
         limit: int = 6,
     ) -> list[ConversationExchange]:
-        """Return newest durable incomplete user exchanges in chronological order."""
+        """Return pending user exchanges from one source and session only."""
         count = max(0, int(limit))
-        if count == 0:
+        if count == 0 or not source or not session_id:
             return []
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM conversation_exchanges
                 WHERE candidate_state != 'complete' AND TRIM(user_text) != ''
+                  AND source = ? AND session_id = ?
                 ORDER BY created_at DESC, id DESC
                 LIMIT ?
                 """,
-                (count,),
+                (source, session_id, count),
             ).fetchall()
         return [self._exchange_from_row(row) for row in reversed(rows)]
 

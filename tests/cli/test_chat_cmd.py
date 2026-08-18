@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 from unittest import mock
 from unittest.mock import MagicMock, patch
@@ -352,6 +353,122 @@ def test_direct_chat_deduplicates_pending_against_live_history() -> None:
     assert pending == ["other pending"]
 
 
+def test_cli_restart_dialogue_uses_only_matching_source_and_session(tmp_path) -> None:
+    """A restarted CLI conversation must not inherit another execution scope."""
+    from openjarvis.memory.archive import PersonalMemoryArchive
+
+    class _ArchiveBackedPersonalMemoryService:
+        def __init__(self, archive: PersonalMemoryArchive) -> None:
+            self.archive = archive
+
+        def start(self) -> None:
+            pass
+
+        def stop(self, timeout: float = 2.0) -> None:
+            pass
+
+        def archive_exchange(self, **kwargs):
+            return self.archive.record_exchange(
+                exchange_id="current-turn",
+                **kwargs,
+            )
+
+        def enqueue_exchange(self, exchange_id: str) -> bool:
+            return False
+
+    archive = PersonalMemoryArchive(tmp_path / "personal.db")
+    archive.set_metadata("release_ready", "1")
+    records = (
+        ("cli-old", "older CLI turn", "assistant-only old", "cli.chat", "main"),
+        ("server", "SERVER PRIVATE TURN", "server reply", "server.chat", "main"),
+        (
+            "managed",
+            "MANAGED AGENT PRIVATE TURN",
+            "managed reply",
+            "managed_agent",
+            "main",
+        ),
+        ("other", "OTHER CLI SESSION", "other reply", "cli.chat", "other"),
+        ("cli-new", "newer CLI turn", "assistant-only new", "cli.chat", "main"),
+    )
+    for exchange_id, user_text, assistant_text, source, session_id in records:
+        archive.record_exchange(
+            exchange_id=exchange_id,
+            user_text=user_text,
+            assistant_text=assistant_text,
+            source=source,
+            session_id=session_id,
+        )
+    with sqlite3.connect(archive.path) as connection:
+        for created_at, record in enumerate(records, start=1):
+            connection.execute(
+                "UPDATE conversation_exchanges SET created_at = ? WHERE id = ?",
+                (float(created_at), record[0]),
+            )
+
+    service = _ArchiveBackedPersonalMemoryService(archive)
+    _ContextSpyChatAgent.contexts = []
+    engine = MagicMock()
+    engine.engine_id = "ollama"
+    config = JarvisConfig()
+    config.intelligence.default_model = "test-model"
+    config.agent.context_from_memory = True
+    config.personal_memory.enabled = True
+    config.personal_memory.mode = "active"
+    config.personal_memory.archive_path = str(archive.path)
+    AgentRegistry.register_value("context_spy_chat_agent", _ContextSpyChatAgent)
+
+    with (
+        patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+        patch("openjarvis.engine.get_engine", return_value=("ollama", engine)),
+        patch("openjarvis.intelligence.register_builtin_models"),
+        patch("openjarvis.memory.build_memory_service", return_value=None),
+        patch(
+            "openjarvis.memory.build_personal_memory_service",
+            return_value=service,
+        ),
+        patch("openjarvis.cli.ask._get_memory_backend", return_value=None),
+    ):
+        result = CliRunner().invoke(
+            chat,
+            [
+                "--agent",
+                "context_spy_chat_agent",
+                "--model",
+                "test-model",
+                "--session-id",
+                "main",
+            ],
+            input="current request\n/quit\n",
+        )
+
+    assert result.exit_code == 0
+    assert _ContextSpyChatAgent.contexts[0].metadata == {
+        "source": "cli.chat",
+        "session_id": "main",
+    }
+    archived_current = archive.get_exchange("current-turn")
+    assert archived_current is not None
+    assert (archived_current.source, archived_current.session_id) == (
+        "cli.chat",
+        "main",
+    )
+    pending = [
+        message
+        for message in _ContextSpyChatAgent.contexts[0].conversation.messages
+        if message.metadata.get("personal_memory_context") == "recent_dialogue"
+    ]
+    assert [(message.role, message.content) for message in pending] == [
+        (Role.USER, "older CLI turn"),
+        (Role.USER, "newer CLI turn"),
+    ]
+    combined = " ".join(message.content for message in pending)
+    assert "assistant-only" not in combined
+    assert "SERVER PRIVATE TURN" not in combined
+    assert "MANAGED AGENT PRIVATE TURN" not in combined
+    assert "OTHER CLI SESSION" not in combined
+
+
 class TestChatCommand:
     """Test the Click command definition and help output."""
 
@@ -368,6 +485,7 @@ class TestChatCommand:
         assert "--agent" in result.output
         assert "--tools" in result.output
         assert "--system" in result.output
+        assert "--session-id" in result.output
 
     def test_slash_commands_listed(self) -> None:
         result = CliRunner().invoke(chat, ["--help"])

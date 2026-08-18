@@ -151,6 +151,14 @@ not evidence for a new candidate, and never include assistant text. This
 continuity window allows an immediate restart to preserve the context needed
 for a short follow-up while unfinished extraction remains retryable.
 
+This raw continuity window is scoped by the conjunction of archive `source`
+and `session_id`; canonical accepted claims remain available globally. CLI
+chat records use `source=cli.chat` and a stable session key. The default key is
+`default`, so an ordinary CLI restart continues the same pending dialogue;
+`jarvis chat --session-id <key>` selects an independent CLI conversation.
+Server chat, managed-agent exchanges, and every other CLI session are excluded
+even when their pending work lives in the same personal-memory database.
+
 All personal context composition requires an allowlisted local response engine.
 If `agent.context_from_memory=false`, collection may continue but personal
 context is not injected.
