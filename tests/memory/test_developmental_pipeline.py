@@ -21,7 +21,7 @@ class _Extractor:
     engine_id = "ollama"
     last_error_code = ""
 
-    def extract(self, exchange):
+    def extract(self, exchange, *, recent_exchanges=()):
         return [
             CandidateDraft(
                 CandidateKind.FACT,

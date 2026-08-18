@@ -18,8 +18,10 @@ class _FakeExtractor:
         self.drafts = drafts or []
         self.gate = gate
         self.started = threading.Event()
+        self.calls = []
 
-    def extract(self, exchange):
+    def extract(self, exchange, *, recent_exchanges=()):
+        self.calls.append((exchange, tuple(recent_exchanges)))
         self.started.set()
         if self.gate is not None:
             self.gate.wait(timeout=2.0)
@@ -36,7 +38,7 @@ class _InvalidOutputExtractor:
         self.second_call = threading.Event()
         self.last_error_code = "invalid_output"
 
-    def extract(self, exchange):
+    def extract(self, exchange, *, recent_exchanges=()):
         self.calls += 1
         if self.calls > 1:
             self.second_call.set()
@@ -152,6 +154,50 @@ def test_archive_write_failure_does_not_publish_a_completion_event():
     assert bus.history == []
 
 
+def test_worker_passes_six_chronological_recent_exchanges_to_extractor(tmp_path):
+    """Dropping archive context would make short follow-up corrections ambiguous."""
+    extractor = _FakeExtractor()
+    service = _service(tmp_path, EventBus(), extractor)
+    for index in range(1, 9):
+        service.archive.record_exchange(
+            exchange_id=f"exchange-{index}",
+            user_text=f"user {index}",
+            assistant_text=f"assistant {index}",
+            source="test",
+            session_id="session-1",
+        )
+    with sqlite3.connect(service.archive.path) as connection:
+        for index in range(1, 9):
+            connection.execute(
+                "UPDATE conversation_exchanges SET created_at = ? WHERE id = ?",
+                (float(index), f"exchange-{index}"),
+            )
+
+    service.start()
+    try:
+        assert service.enqueue_exchange("exchange-8") is True
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            matching_calls = [
+                call for call in extractor.calls if call[0].id == "exchange-8"
+            ]
+            if matching_calls:
+                break
+            time.sleep(0.01)
+
+        assert len(matching_calls) == 1
+        assert [item.id for item in matching_calls[0][1]] == [
+            "exchange-2",
+            "exchange-3",
+            "exchange-4",
+            "exchange-5",
+            "exchange-6",
+            "exchange-7",
+        ]
+    finally:
+        service.stop()
+
+
 def test_full_queue_leaves_an_archived_exchange_available_for_retry(tmp_path):
     """Queue pressure may delay work but must not erase the archived exchange."""
     bus = EventBus()
@@ -241,7 +287,7 @@ def test_startup_reprocesses_an_old_zero_candidate_completion(tmp_path):
                 """,
                 (exchange.id,),
             ).fetchone()
-        assert row == (2, "personal-memory-v4")
+        assert row == (2, "personal-memory-v5")
     finally:
         service.stop()
 

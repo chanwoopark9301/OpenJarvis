@@ -37,7 +37,7 @@ CHECK_CONSOLIDATION = "check_consolidation"
 REFLECT_CONFLICTS = "reflect_conflicts"
 VALIDATE_INSIGHT = "validate_insight"
 IMPORT_LEGACY = "import_legacy"
-PERSONAL_CANDIDATE_EXTRACTOR_VERSION = "personal-memory-v4"
+PERSONAL_CANDIDATE_EXTRACTOR_VERSION = "personal-memory-v5"
 
 
 class PersonalMemoryService:
@@ -301,7 +301,11 @@ class PersonalMemoryService:
                     if exchange is None:
                         self._archive.complete_job(claimed_job.id)
                         continue
-                    drafts = self._extractor.extract(exchange)
+                    recent = self._archive.recent_exchanges(exchange.id, limit=6)
+                    drafts = self._extractor.extract(
+                        exchange,
+                        recent_exchanges=tuple(recent),
+                    )
                     error_code = str(
                         getattr(self._extractor, "last_error_code", "") or ""
                     )
