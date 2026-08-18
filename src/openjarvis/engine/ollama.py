@@ -168,7 +168,11 @@ class OllamaEngine(AsyncHTTPEngineMixin, InferenceEngine):
             if isinstance(response_format, ResponseFormat):
                 payload["format"] = "json"
             elif isinstance(response_format, dict):
-                payload["format"] = "json"
+                if response_format.get("type") == "json_schema":
+                    wrapped = response_format.get("json_schema") or {}
+                    payload["format"] = wrapped.get("schema") or "json"
+                else:
+                    payload["format"] = "json"
         try:
             resp = self._client.post("/api/chat", json=payload)
             if resp.status_code == 400 and tools:

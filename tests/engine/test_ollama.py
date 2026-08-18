@@ -34,6 +34,42 @@ def engine() -> OllamaEngine:
     return OllamaEngine(host="http://testhost:11434")
 
 
+def test_generate_passes_json_schema_to_ollama() -> None:
+    """A json_schema response format must reach Ollama as its inner schema."""
+    schema = {
+        "type": "object",
+        "properties": {"candidates": {"type": "array"}},
+        "required": ["candidates"],
+    }
+    sent_payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent_payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": "{}"}},
+        )
+
+    engine = OllamaEngine(host="http://testhost:11434")
+    engine._client.close()
+    engine._client = httpx.Client(
+        base_url="http://testhost:11434", transport=httpx.MockTransport(handler)
+    )
+    try:
+        engine.generate(
+            [Message(role=Role.USER, content="Find memory candidates")],
+            model="qwen3.5:9b",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "memory_candidates", "schema": schema},
+            },
+        )
+    finally:
+        engine._client.close()
+
+    assert sent_payloads[0]["format"] == schema
+
+
 @requires_respx
 class TestOllamaGenerate:
     def test_generate_returns_content(self, engine: OllamaEngine) -> None:
